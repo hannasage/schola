@@ -12,6 +12,7 @@ The code uses only the Python standard library.
 It needs Python 3.10 or later. The two test files passed on 3.10, 3.11, 3.12, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
 The tests use the explicit range list for address checks and do not depend on the `ipaddress` tables of one Python version.
 Nothing calls these adapters yet. No route, screen, or agent loop uses them in this step.
+Step E4 added the local adapter, a subclass of the API adapter. `docs/local-adapter.md` describes it.
 
 ## Terms
 
@@ -319,7 +320,6 @@ The operating system and Python's default context decide which certificate autho
 ## Not built in this step
 
 - The command line bridge. Nobody checked whether provider terms allow it.
-- The local adapter (step E4). This adapter already accepts a loopback endpoint with no key. Nobody checked which local runtimes work.
 - Key storage. Where keys live on each platform is an open decision.
 - The default token cap. The cap is required until that decision is made.
 - The offer rate limit, the policy evaluator, and the agent loop (steps E5 and E6).

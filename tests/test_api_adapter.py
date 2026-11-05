@@ -78,11 +78,17 @@ class Provider:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = 'HTTP/1.1'
 
-            def do_POST(self):
+            def handle_request(self, method):
                 length = int(self.headers.get('Content-Length') or 0)
                 body = self.rfile.read(length)
-                provider.requests.append({'method': 'POST', 'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()}, 'body': body})
+                provider.requests.append({'method': method, 'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()}, 'body': body})
                 provider.responder(self, body)
+
+            def do_POST(self):
+                self.handle_request('POST')
+
+            def do_GET(self):
+                self.handle_request('GET')
 
             def log_message(self, *args):
                 pass
@@ -2055,6 +2061,150 @@ class TlsTests(Case):
         weak.append(context)
         for context in weak:
             self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+
+
+class TransportSeamTests(Case):
+    """The shared transport (`_roundtrip`) and its hook (`_classify_error`) that a subclass reuses. The API adapter's own calls must not change."""
+
+    def parse_text(self, body, hold):
+        return None, body.decode('utf-8')
+
+    def test_a_get_goes_out_with_no_body_and_no_content_type_and_still_has_the_key(self):
+        provider = self.provider(reply_json({'ok': True}))
+        adapter = self.adapter(provider)
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text)
+        self.assertIsNone(error)
+        self.assertEqual(reply, '{"ok": true}')
+        sent = provider.requests[0]
+        self.assertEqual((sent['method'], sent['path'], sent['body']), ('GET', '/v1/models', b''))
+        self.assertNotIn('content-type', sent['headers'])
+        self.assertNotIn('content-length', sent['headers'])
+        self.assertEqual(sent['headers']['accept'], 'application/json')
+        self.assertEqual(sent['headers']['authorization'], 'Bearer ' + SECRET)
+
+    def test_a_post_still_has_a_json_body_and_content_type(self):
+        provider = self.provider()
+        self.adapter(provider).complete(call())
+        sent = provider.requests[0]
+        self.assertEqual((sent['method'], sent['path']), ('POST', '/v1/chat/completions'))
+        self.assertEqual(sent['headers']['content-type'], 'application/json')
+        self.assertEqual(int(sent['headers']['content-length']), len(sent['body']))
+
+    def test_a_roundtrip_with_no_hold_charges_nothing_for_any_billed_failure(self):
+        for responder in (reply_raw(b'not json'), reply_raw(b'[1]'), reply_json({'error': {'code': 500}}), reply_raw(b'x' * 5000)):
+            with self.subTest():
+                adapter = self.adapter(self.provider(responder), max_response_bytes=2000)
+                error, reply = adapter._roundtrip('GET', '/models', None, 0, adapter._parse)
+                self.assertIsNone(reply)
+                self.assertEqual(error.tokens_charged, 0)
+
+    def test_a_roundtrip_can_take_its_own_read_and_total_limits(self):
+        provider = self.provider(lambda handler, body: time.sleep(3))
+        adapter = self.adapter(provider)
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.5, 0.5))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_a_short_total_also_shortens_a_long_connect_time_so_a_hung_lookup_cannot_outlast_it(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=60, read_timeout=60, total_timeout=60,
+                             resolver=lambda host, port, *a, **k: release.wait(30))
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.5, 0.5))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_the_model_name_rule_is_one_function(self):
+        for good in ('m', 'llama3.2:latest', 'hf.co/u/m:Q4', 'a@b+c#d~e-f_g', 'x' * 200):
+            self.assertTrue(api_adapter.model_name_ok(good), good)
+        for bad in ('', 'x' * 201, 'a b', 'a\n', 'é', None, 5, b'm', ['m']):
+            self.assertFalse(api_adapter.model_name_ok(bad), bad)
+            self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', bad, ApiKey(SECRET))
+
+    def test_a_roundtrip_deadline_alone_ends_a_body_that_drips_when_the_timer_does_nothing(self):
+        def drip(handler, body):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.end_headers()
+            try:
+                for _ in range(100):
+                    handler.wfile.write(b' ')
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(drip), connect_timeout=30, read_timeout=30, total_timeout=60)
+        with mock.patch('api_adapter.threading.Timer', NeverFires):
+            for _ in range(2):
+                started = time.monotonic()
+                error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.6, 0.6))
+                self.assertEqual(error.code, 'timeout')
+                self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_the_read_and_total_limits_of_a_roundtrip_are_not_mixed_up(self):
+        def slow_body(handler, body):
+            data = b'{"ok": true}'
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Content-Length', str(len(data)))
+            handler.end_headers()
+            try:
+                for index in range(len(data)):  # each wait is short, the whole reply takes about 1.2 seconds
+                    handler.wfile.write(data[index:index + 1])
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(slow_body), connect_timeout=30, read_timeout=30, total_timeout=60)
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.6, 8))
+        self.assertIsNone(error, error)
+        self.assertEqual(reply, '{"ok": true}')
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(8, 0.5))
+        self.assertEqual(error.code, 'timeout')
+
+    def test_the_timer_follows_the_total_of_the_roundtrip_when_headers_drip_in(self):
+        def responder(handler, body):
+            handler.wfile.write(b'HTTP/1.1 200 OK\r\n')
+            try:
+                for index in range(100):
+                    handler.wfile.write(f'X-Slow-{index}: y\r\n'.encode())
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(responder), connect_timeout=30, read_timeout=30, total_timeout=60)
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(30, 0.6))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_the_api_adapter_words_a_refused_connection_as_before(self):
+        adapter = ApiAdapter(f'http://127.0.0.1:{free_port()}/v1', 'm', ApiKey(SECRET))
+        error = self.assertCode('endpoint_unreachable', adapter.complete, call(), retryable=True)
+        self.assertEqual(str(error), 'Schola could not reach the endpoint.')
+
+    def test_a_connect_that_fails_for_any_reason_but_time_is_a_connect_failure_and_a_slow_one_is_still_a_timeout(self):
+        adapter = ApiAdapter('http://127.0.0.1:1/v1', 'm', ApiKey(SECRET))
+        for error in (ConnectionRefusedError(), OSError(99, 'Cannot assign requested address'), PermissionError()):
+            with self.subTest(error=type(error).__name__), mock.patch('socket.create_connection', side_effect=error):
+                self.assertCode('endpoint_unreachable', adapter.complete, call(), retryable=True)
+                with self.assertRaises(api_adapter.ConnectFailed):
+                    api_adapter._PinnedConnection('127.0.0.1', 1, ['127.0.0.1'], None, 1, 1, time.monotonic() + 5).connect()
+        with mock.patch('socket.create_connection', side_effect=socket.timeout('timed out')):
+            self.assertCode('timeout', adapter.complete, call(), retryable=True)
+
+    def test_a_subclass_can_reword_a_network_error_and_nothing_else(self):
+        class Reworded(ApiAdapter):
+            def _classify_error(self, caught):
+                if isinstance(caught, api_adapter.ConnectFailed):
+                    return ModelAdapterError('Fixed sentence.', 'endpoint_unreachable', retryable=True)
+                return super()._classify_error(caught)
+        down = Reworded(f'http://127.0.0.1:{free_port()}/v1', 'm', ApiKey(SECRET))
+        self.assertEqual(str(self.assertCode('endpoint_unreachable', down.complete, call())), 'Fixed sentence.')
+        slow = Reworded(self.provider(lambda handler, body: time.sleep(3)).url(), 'm', ApiKey(SECRET), connect_timeout=0.5, read_timeout=0.5, total_timeout=0.5)
+        self.assertCode('timeout', slow.complete, call())
 
 
 if __name__ == '__main__':

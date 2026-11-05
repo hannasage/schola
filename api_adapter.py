@@ -198,6 +198,10 @@ def _raise_tls_floor(context):
             pass
 
 
+class ConnectFailed(OSError):
+    """Every address refused the connection (no timeout). It is an `OSError`, so it is `endpoint_unreachable` unless a subclass of the adapter words it better."""
+
+
 class _PinnedConnection(http.client.HTTPConnection):
     """A connection that goes to an address the adapter already checked, and keeps the host name for the Host header and TLS.
 
@@ -253,7 +257,9 @@ class _PinnedConnection(http.client.HTTPConnection):
                 continue
             break
         else:
-            raise last
+            if isinstance(last, TimeoutError):
+                raise last
+            raise ConnectFailed('no connection')
         self.sock = self._live = sock  # set at once, so the timer can close a socket that is still in the handshake
         if self._context is not None:
             # A failure here leaves the raw socket in `self.sock`, and `close()` of the connection closes it.
@@ -261,6 +267,11 @@ class _PinnedConnection(http.client.HTTPConnection):
             sock = self._context.wrap_socket(sock, server_hostname=self.host)
             self.sock = self._live = sock
         self.arm()
+
+
+def model_name_ok(model):
+    """True when `model` is a model name Schola accepts: 1 to 200 characters from letters, digits, and . _ : / @ + # ~ -"""
+    return isinstance(model, str) and len(model) <= MAX_MODEL_CHARS and bool(_MODEL.fullmatch(model))
 
 
 def _first_fields(items):
@@ -283,6 +294,15 @@ def _parse_int(text):
 
 def _reject_constant(text):
     raise ValueError('not JSON')
+
+
+def _load(body):
+    """The JSON object in a reply body, or None when the body is not one object (bad text, a number of over 18 digits, NaN, too deep)."""
+    try:
+        document = json.loads(body.decode('utf-8'), parse_int=_parse_int, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return None
+    return document if isinstance(document, dict) else None
 
 
 def _usage(document):
@@ -427,7 +447,7 @@ class ApiAdapter(ma.ModelAdapter):
                 raise ma._invalid('Send an API key.')
         elif not isinstance(api_key, ma.ApiKey):
             raise ma._invalid('Send the API key as an ApiKey.')
-        if not isinstance(model, str) or len(model) > MAX_MODEL_CHARS or not _MODEL.fullmatch(model):
+        if not model_name_ok(model):
             raise ma._invalid('The model name must be 1 to 200 characters from letters, digits, and . _ : / @ + # ~ -')
         if max_tokens_field not in TOKEN_FIELDS:
             raise ma._invalid('max_tokens_field must be max_tokens or max_completion_tokens.')
@@ -462,8 +482,8 @@ class ApiAdapter(ma.ModelAdapter):
     # The address
     # ------------------------------------------------------------------
 
-    def _lookup(self):
-        """Resolve the host within the connect time. The lookup is the first step, and the connect time is never above the total.
+    def _lookup(self, wait=None):
+        """Resolve the host within the connect time (or `wait`). The lookup is the first step, and the connect time is never above the total.
 
         A lookup that outlasts the connect time is abandoned on its own thread.
         """
@@ -478,7 +498,7 @@ class ApiAdapter(ma.ModelAdapter):
 
         thread = threading.Thread(target=work, daemon=True)
         thread.start()
-        thread.join(self._connect_timeout)
+        thread.join(self._connect_timeout if wait is None else wait)
         if thread.is_alive():
             raise _timeout()
         if 'found' not in outcome:
@@ -488,10 +508,10 @@ class ApiAdapter(ma.ModelAdapter):
             raise _bad('The name lookup gave an answer that Schola cannot read.')
         return found
 
-    def _addresses(self):
+    def _addresses(self, wait=None):
         """The addresses to connect to, checked. Every address the host resolves to must pass, or the call is refused."""
         host = self._endpoint.host
-        listed = [host] if _ip(host) is not None else self._lookup()
+        listed = [host] if _ip(host) is not None else self._lookup(wait)
         if not listed:
             raise ModelAdapterError('Schola could not find the endpoint host.', 'endpoint_unreachable')
         checked = []
@@ -512,9 +532,10 @@ class ApiAdapter(ma.ModelAdapter):
                     self._token_field: request.max_output_tokens, 'stream': False}
         return json.dumps(document, ensure_ascii=True, separators=(',', ':')).encode('ascii')
 
-    def _headers(self):
-        headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
-                   'User-Agent': _USER_AGENT, 'Connection': 'close'}
+    def _headers(self, has_body=True):
+        headers = {'Accept': 'application/json', 'User-Agent': _USER_AGENT, 'Connection': 'close'}
+        if has_body:
+            headers['Content-Type'] = 'application/json'
         if self._api_key is not None:
             headers['Authorization'] = 'Bearer ' + self._api_key.reveal_for_transport()
         return headers
@@ -525,18 +546,31 @@ class ApiAdapter(ma.ModelAdapter):
             raise error  # raised here, outside any handler, so it chains nothing
         return raw
 
+    def _classify_error(self, caught):
+        """The typed error for a network or protocol exception, or None. A subclass can word one case better; it must not leak."""
+        return _classify(caught)
+
     def _exchange(self, request):
-        """Do the call. Return (error, reply). This never raises for a network or protocol problem.
+        """The chat call: a POST of the request. Return (error, reply)."""
+        return self._roundtrip('POST', '/chat/completions', lambda: self._body(request), request.hold_tokens, self._parse)
+
+    def _roundtrip(self, method, path, body, hold, parse, limits=None):
+        """Do one call. Return (error, reply). This never raises for a network or protocol problem.
+
+        `body` is a function that gives the request body, or None for a call with no body. `parse(bytes, hold)` turns a 200 reply
+        into (error, reply). `hold` is what a billed failure charges: a call that spends no tokens passes 0.
+        `limits` is (read time, total time), or None for the adapter's own. The connect time never goes above the total.
 
         One monotonic deadline covers the name lookup, each connection try, the TLS handshake, the send, and the reply.
         A request that was sent and then timed out was probably billed, so that timeout charges the whole hold.
         """
-        deadline = time.monotonic() + self._total_timeout
+        read_timeout, total_timeout = (self._read_timeout, self._total_timeout) if limits is None else limits
+        connect_timeout = min(self._connect_timeout, total_timeout)
+        deadline = time.monotonic() + total_timeout
         expired = threading.Event()
         connection = timer = None
         error = raw = None
         sent = waited = False
-        hold = request.hold_tokens
 
         def expire():
             expired.set()
@@ -549,22 +583,22 @@ class ApiAdapter(ma.ModelAdapter):
                         pass
 
         try:
-            timer = threading.Timer(self._total_timeout, expire)
+            timer = threading.Timer(total_timeout, expire)
             timer.daemon = True
             timer.start()
-            addresses = self._addresses()
+            addresses = self._addresses(connect_timeout)
             endpoint = self._endpoint
             connection = _PinnedConnection(endpoint.host, endpoint.port, addresses, self._ssl_context if endpoint.scheme == 'https' else None,
-                                           self._connect_timeout, self._read_timeout, deadline)
-            connection.request('POST', endpoint.path + '/chat/completions', self._body(request), self._headers())
+                                           connect_timeout, read_timeout, deadline)
+            connection.request(method, endpoint.path + path, None if body is None else body(), self._headers(body is not None))
             sent = True
-            error, raw = self._read(connection, connection.getresponse(), hold)
+            error, raw = self._read(connection, connection.getresponse(), hold, parse)
         except MemoryError:
             raise
         except ModelAdapterError as caught:
             error = caught
         except Exception as caught:
-            error = _classify(caught)
+            error = self._classify_error(caught)
             if error is None:
                 error = self._unexpected(caught)
             elif isinstance(caught, TimeoutError):
@@ -580,7 +614,7 @@ class ApiAdapter(ma.ModelAdapter):
             return _timeout(hold if sent else 0), None
         return error, raw
 
-    def _read(self, connection, response, hold):
+    def _read(self, connection, response, hold, parse):
         failure = _status_error(response.status)
         if failure is not None:
             return failure, None  # the body of an error reply is never read; nothing is charged
@@ -614,14 +648,11 @@ class ApiAdapter(ma.ModelAdapter):
             return _billed(_classify(caught) or _bad(), None, hold), None
         if declared is not None and total != declared:
             return _billed(_bad('The provider reply ended early.'), None, hold), None
-        return self._parse(b''.join(pieces), hold)
+        return parse(b''.join(pieces), hold)
 
     def _parse(self, body, hold):
-        try:
-            document = json.loads(body.decode('utf-8'), parse_int=_parse_int, parse_constant=_reject_constant)
-        except (ValueError, RecursionError):
-            return _billed(_bad(), None, hold), None
-        if not isinstance(document, dict):
+        document = _load(body)
+        if document is None:
             return _billed(_bad(), None, hold), None
         usage = _usage(document)
         if document.get('error') is not None:
