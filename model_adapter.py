@@ -65,6 +65,9 @@ class ModelAdapterError(Exception):
     def payload(self):
         return {'error': str(self), 'code': self.code, 'retryable': self.retryable}
 
+    def __reduce__(self):
+        return (self.__class__, (str(self), self.code, self.retryable))
+
 
 def _invalid(message):
     return ModelAdapterError(message, 'invalid_request')
@@ -85,7 +88,7 @@ class ApiKey:
     __slots__ = ('_ApiKey__value',)
 
     def __init__(self, value):
-        if not isinstance(value, str) or not value or len(value) > MAX_KEY_CHARS or not _KEY_CHARACTERS.fullmatch(value):
+        if not isinstance(value, str) or len(value) > MAX_KEY_CHARS or not _KEY_CHARACTERS.fullmatch(value):
             # The message must not echo the value, so nothing from `value` goes in.
             raise _invalid('An API key must be 1 to 1024 visible ASCII characters with no spaces.')
         object.__setattr__(self, '_ApiKey__value', value)
@@ -119,8 +122,6 @@ class ApiKey:
             return NotImplemented
         return self.__value == other.__value
 
-    __hash__ = None
-
     def __setattr__(self, name, value):
         raise AttributeError('An API key cannot be changed.')
 
@@ -153,20 +154,19 @@ class TokenBudget:
     def cap(self):
         return self._cap
 
+    # The reads below take no lock. Reading one whole number is a single step, and a reader never needs two numbers that agree.
+
     @property
     def spent(self):
-        with self._lock:
-            return self._spent
+        return self._spent
 
     @property
     def remaining(self):
-        with self._lock:
-            return max(0, self._cap - self._spent)
+        return max(0, self._cap - self._spent)
 
     @property
     def exhausted(self):
-        with self._lock:
-            return self._spent >= self._cap
+        return self._spent >= self._cap
 
     def __repr__(self):
         return f'TokenBudget(cap={self._cap}, spent={self.spent})'
@@ -192,6 +192,14 @@ class TokenBudget:
 # Requests and results
 # ----------------------------------------------------------------------
 
+def _encodable(text):
+    try:
+        text.encode('utf-8')
+    except UnicodeError:
+        return False
+    return True
+
+
 @dataclasses.dataclass(frozen=True)
 class Message:
     role: str
@@ -204,10 +212,8 @@ class Message:
             raise _invalid('A message needs text.')
         if len(self.text) > MAX_MESSAGE_CHARS:
             raise _invalid(f'A message may hold at most {MAX_MESSAGE_CHARS} characters.')
-        try:
-            self.text.encode('utf-8')
-        except UnicodeError:
-            raise _invalid('A message must be valid Unicode text.') from None
+        if not _encodable(self.text):
+            raise _invalid('A message must be valid Unicode text.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -311,9 +317,10 @@ def _is_windows(path):
 
 
 def _normal(path):
+    """(cleaned path, separator). Windows paths ignore case and accept both slashes."""
     if _is_windows(path):
-        return 'windows', ntpath.normcase(ntpath.normpath(path)), '\\'
-    return 'posix', posixpath.normpath(path), '/'
+        return ntpath.normcase(ntpath.normpath(path)), '\\'
+    return posixpath.normpath(path), '/'
 
 
 def _roots(allowed_paths):
@@ -322,21 +329,16 @@ def _roots(allowed_paths):
         raise _invalid('Send allowed_paths as a list of absolute paths.')
     roots = []
     for root in allowed_paths:
-        try:
-            text = os.fspath(root)
-        except TypeError:
-            raise _invalid('An allowed path must be text or a path.') from None
-        if not isinstance(text, str) or '\x00' in text or not (text.startswith('/') or _is_windows(text)):
+        text = os.fspath(root) if isinstance(root, (str, os.PathLike)) else None
+        if not isinstance(text, str) or not (text.startswith('/') or _is_windows(text)):
             raise _invalid('An allowed path must be an absolute path.')
         roots.append(_normal(text))
     return tuple(roots)
 
 
 def _inside(candidate, roots):
-    flavor, path, separator = _normal(candidate)
-    for root_flavor, root, _ in roots:
-        if root_flavor != flavor:
-            continue
+    path, _ = _normal(candidate)
+    for root, separator in roots:
         if path == root or path.startswith(root.rstrip(separator) + separator):
             return True
     return False
@@ -351,7 +353,6 @@ def _file_url_path(url):
 def _paths_in(text):
     for url in _FILE_URL.findall(text):
         yield _file_url_path(url)
-    text = _URL.sub(' ', text)
     for pattern in (_POSIX_PATH, _HOME_PATH, _DRIVE_PATH, _UNC_PATH):
         for match in pattern.finditer(text):
             yield match.group(0).rstrip('.:!')
@@ -364,8 +365,8 @@ def _has_traversal(text):
 def context_guard(messages, allowed_paths=(), secrets=()):
     """Refuse a message that carries a key-shaped string, a held key, or a path outside the allow-list.
 
-    This is a small guard on what reaches a model. It is not the filter of section 6.3 of the engine
-    amendment: choosing what goes into a message is work for the policy and agent steps (E5 and E6).
+    This is a small guard on what reaches a model. It does not choose what goes into a message. That choice
+    is work for the policy and agent steps (E5 and E6).
     The guard looks at text only. It finds absolute paths (POSIX, home, Windows, UNC, and `file:` URLs) and `..`
     segments. It does not follow links and it does not check relative paths. It can refuse text that only looks like a
     key or a path. The error names the message number and never repeats the text.

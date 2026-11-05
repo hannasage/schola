@@ -77,6 +77,11 @@ class ErrorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ModelAdapterError('x', 'made_up')
 
+    def test_an_error_survives_pickling(self):
+        error = ModelAdapterError('Slow.', 'timeout', retryable=False)
+        restored = pickle.loads(pickle.dumps(error))
+        self.assertEqual((str(restored), restored.code, restored.retryable), ('Slow.', 'timeout', False))
+
     def test_payload_has_the_message_the_code_and_retryable(self):
         error = ModelAdapterError('Slow.', 'timeout')
         self.assertEqual(error.payload(), {'error': 'Slow.', 'code': 'timeout', 'retryable': True})
@@ -130,6 +135,19 @@ class ApiKeyTests(unittest.TestCase):
             with self.assertRaises(TypeError) as context:
                 pickle.dumps(self.key, protocol)
             self.assertHidden(str(context.exception))
+
+    def test_the_reduce_methods_refuse_when_called_directly(self):
+        with self.assertRaises(TypeError):
+            self.key.__reduce__()
+        with self.assertRaises(TypeError):
+            self.key.__reduce_ex__(2)
+
+    def test_the_stored_value_cannot_be_replaced_or_deleted(self):
+        with self.assertRaises(AttributeError):
+            self.key._ApiKey__value = 'other-value'
+        with self.assertRaises(AttributeError):
+            del self.key._ApiKey__value
+        self.assertEqual(self.key.reveal_for_transport(), SECRET)
 
     def test_json_never_writes_the_value(self):
         with self.assertRaises(TypeError) as context:
@@ -265,6 +283,28 @@ class TokenBudgetTests(unittest.TestCase):
         second.join(5)
         self.assertEqual(len(outcomes), 2)
         self.assertEqual(budget.spent, 30)
+
+    def test_every_change_to_the_counters_holds_the_lock(self):
+        class Probe:
+            def __init__(self):
+                self.entries = 0
+
+            def __enter__(self):
+                self.entries += 1
+
+            def __exit__(self, *details):
+                return False
+
+        budget = TokenBudget(1000)
+        budget._lock = probe = Probe()
+        budget._begin(10)
+        self.assertEqual(probe.entries, 1)
+        budget._abort(10)
+        self.assertEqual(probe.entries, 2)
+        budget._begin(10)
+        budget._finish(10, 4)
+        self.assertEqual(probe.entries, 4)
+        self.assertEqual(budget.spent, 4)
 
     def test_many_threads_never_lose_a_charge(self):
         budget = TokenBudget(10 ** 9)
@@ -436,6 +476,25 @@ class CompleteTests(unittest.TestCase):
         refused(self, 'invalid_request', FakeAdapter().complete, request(budget, text='read /etc/passwd', max_output_tokens=100))
         FakeAdapter().complete(request(budget, max_output_tokens=100))
 
+    def test_an_interrupt_frees_the_reservation_and_passes_through(self):
+        budget = TokenBudget(100)
+        with self.assertRaises(KeyboardInterrupt):
+            FakeAdapter(error=KeyboardInterrupt()).complete(request(budget, max_output_tokens=100))
+        self.assertEqual(budget.spent, 0)
+        FakeAdapter().complete(request(budget, max_output_tokens=100))
+
+    def test_a_reply_that_only_looks_like_a_raw_completion_is_refused(self):
+        import types
+        look_alike = types.SimpleNamespace(text='x', usage=None, stop_reason='end')
+        refused(self, 'bad_response', FakeAdapter(look_alike).complete, request())
+        usage_like = RawCompletion('x', types.SimpleNamespace(total=5), 'end')
+        refused(self, 'bad_response', FakeAdapter(usage_like).complete, request())
+
+    def test_bad_allowed_paths_are_refused_when_the_adapter_is_made(self):
+        for paths in ('/', ['relative'], [''], ('/ok', 'bad'), {'/ok': 1}.keys(), (path for path in ['/ok']), None):
+            with self.subTest(paths=paths):
+                refused(self, 'invalid_request', FakeAdapter, allowed_paths=paths)
+
     def test_the_base_class_has_no_transport(self):
         budget = TokenBudget(100)
         with self.assertRaises(NotImplementedError):
@@ -536,7 +595,46 @@ class ContextGuardTests(unittest.TestCase):
             refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], allowed_paths=[root])
 
     def test_a_string_in_place_of_a_list_of_roots_is_refused(self):
-        refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], allowed_paths='/work/module')
+        for text in ('/work/module', '/', b'/work'):
+            refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], allowed_paths=text)
+
+    def test_roots_must_be_a_list_a_tuple_or_a_set(self):
+        for roots in ((root for root in ['/work']), {'/work': 1}, None, 5):
+            refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], allowed_paths=roots)
+        for roots in (['/work'], ('/work',), {'/work'}, frozenset({'/work'})):
+            self.check('see /work/a', allowed_paths=roots)
+
+    def test_secrets_must_be_api_keys_in_the_guard_too(self):
+        refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], secrets=['plain'])
+
+    def test_the_path_error_names_the_message_number(self):
+        messages = [Message('user', 'fine'), Message('user', 'also fine'), Message('user', 'read /root/.ssh')]
+        error = refused(self, 'invalid_request', ma.context_guard, messages)
+        self.assertIn('Message 3 ', str(error))
+        messages = [Message('user', 'fine'), Message('user', 'AKIAABCDEFGHIJKLMNOP')]
+        self.assertIn('Message 2 ', str(refused(self, 'invalid_request', ma.context_guard, messages)))
+
+    def test_unc_paths_ignore_case(self):
+        self.check('open \\\\server\\share\\a.txt', allowed_paths=['\\\\Server\\Share'])
+        self.assertRefused('open \\\\server\\other\\a.txt', allowed_paths=['\\\\Server\\Share'])
+
+    def test_a_file_url_drops_its_host(self):
+        self.check('see file://localhost/work/module/a.py and file:///work/module/b.py', allowed_paths=['/work/module'])
+        self.assertRefused('see file://localhost/etc/passwd', allowed_paths=['/work/module'])
+        self.assertRefused('see file://', allowed_paths=['/work/module'])
+
+    def test_a_trailing_full_stop_is_not_part_of_the_path(self):
+        self.check('The folder is /work/module.', allowed_paths=['/work/module'])
+        self.check('Is it /work/module? Yes: /work/module!', allowed_paths=['/work/module'])
+
+    def test_double_slash_comments_are_not_paths(self):
+        for text in ('x = 1 //comment', '//comment', 'a //b //c', 'see ///three'):
+            with self.subTest(text=text):
+                self.check(text)
+
+    def test_a_url_with_dot_dot_is_not_a_traversal(self):
+        self.check('see https://example.com/a/../b for details')
+        self.assertRefused('see file:///work/module/../../etc/passwd', allowed_paths=['/work/module'])
 
     def test_urls_are_not_paths(self):
         self.check('see https://example.com/etc/passwd and http://127.0.0.1:8080/a/b')
