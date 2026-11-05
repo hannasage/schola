@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
 from local_store import LocalStore, StoreError, finite_json, strict_keys, validate_origin
 import check_routes
+import event_routes
 import lesson_routes
 from lesson_store import LessonStore
 
@@ -125,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def respond(self, code, body, kind="application/json"):
+    def respond(self, code, body, kind="application/json", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         elif isinstance(body, str):
@@ -136,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https:; object-src 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
@@ -185,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(500, {"error": "Cannot access saved data. Keep your edits and check that the data folder is writable.", "code": "storage_unavailable", "retryable": True})
         return self.respond(400, {"error": str(error), "code": "invalid_request", "retryable": False})
 
-    def lesson_response(self, call):
+    def lesson_response(self, call, fault="Schola hit an unexpected problem and could not finish. Check your lessons before you try again."):
         """Run a lesson route. A named problem keeps its status. Anything else is a server fault: 500, no detail."""
         try:
             return self.respond(*call())
@@ -195,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(error)
         except Exception:  # noqa: BLE001 - any other fault, including bad stored data, must answer in JSON
             traceback.print_exc(file=sys.stderr)
-            return self.respond(500, {"error": "Schola hit an unexpected problem and could not finish. Check your lessons before you try again.", "code": "internal_error", "retryable": False})
+            return self.respond(500, {"error": fault, "code": "internal_error", "retryable": False})
 
     def forbidden(self):
         return self.respond(403, {"error": "Use the local application address.", "code": "forbidden_origin", "retryable": False})
@@ -205,6 +208,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def lessons(self):
         return LessonStore(self.server.data_dir)
+
+    def events(self):
+        return event_routes.log_for(self.server)
+
+    def event_response(self, method, path, call):
+        return self.lesson_response(call, event_routes.fault_message(method, path))
 
     def drain(self, size):
         """Read and drop the body of a request that is too big, so the client can still read the answer.
@@ -227,6 +236,13 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.connection.settimeout(self.timeout)
 
+    def declared_length(self):
+        """The Content-Length as a number, 0 when the header is missing. A header that is not a number is a bad request."""
+        try:
+            return int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise StoreError("Invalid content length.", "invalid_request") from None
+
     def body(self, limit=2_000_000):
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
             raise StoreError("Expected JSON.", "unsupported_media_type", 415)
@@ -237,7 +253,7 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < size <= limit:
             if size > limit:
                 self.drain(size)
-            raise StoreError({2_000_000: "Backup must be smaller than 2 MB.", lesson_routes.BODY_LIMIT: "Lesson files must be smaller than 5 MB."}.get(limit, "This request must be smaller than 64 KB."), "payload_too_large", 413)
+            raise StoreError({2_000_000: "Backup must be smaller than 2 MB.", lesson_routes.BODY_LIMIT: "Lesson files must be smaller than 5 MB.", event_routes.BODY_LIMIT: "Events and reflections must be smaller than 256 KB."}.get(limit, "This request must be smaller than 64 KB."), "payload_too_large", 413)
         try:
             raw = self.rfile.read(size)
         except TimeoutError:
@@ -254,6 +270,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.forbidden()
         path = urlsplit(self.path).path
         try:
+            if path in event_routes.GET_ROUTES or event_routes.is_reflection_path(path):
+                return self.event_response("GET", path, lambda: event_routes.handle_get(self.server, self.events(), path, self.headers, self.query()))
             if path in check_routes.GET_ROUTES:
                 return self.lesson_response(lambda: check_routes.handle_get(self.server, self.lessons(), path, self.headers))
             if path in lesson_routes.GET_ROUTES:
@@ -313,10 +331,16 @@ class Handler(BaseHTTPRequestHandler):
         route = urlsplit(self.path).path
         lesson = route in lesson_routes.POST_ROUTES
         check = route in check_routes.POST_ROUTES
-        if not lesson and not check and route not in ("/api/import", "/api/import/preview", "/api/recovery"):
+        event = route in event_routes.POST_ROUTES
+        if not lesson and not check and not event and route not in ("/api/import", "/api/import/preview", "/api/recovery"):
             return self.not_found()
         try:
-            payload = self.body(lesson_routes.BODY_LIMIT if lesson else check_routes.BODY_LIMIT if check else 2_000_000)
+            if event:
+                # Refuse an unknown caller before reading what it sends.
+                event_routes.check_caller(self.server, self.headers)
+            payload = self.body(lesson_routes.BODY_LIMIT if lesson else check_routes.BODY_LIMIT if check else event_routes.BODY_LIMIT if event else 2_000_000)
+            if event:
+                return self.event_response("POST", route, lambda: event_routes.handle_post(self.server, self.events(), route, payload, self.headers))
             if check:
                 return self.lesson_response(lambda: check_routes.handle_post(self.server, self.lessons(), route, payload, self.headers))
             if lesson:
@@ -334,6 +358,20 @@ class Handler(BaseHTTPRequestHandler):
             operation = self.store().preview_import if urlsplit(self.path).path == "/api/import/preview" else self.store().import_record
             record = operation(payload["source"], origin, payload["status"], payload.get("targetRecordId"), payload.get("expectedRevision"), scope)
             return self.respond(200 if urlsplit(self.path).path.endswith("/preview") or payload.get("targetRecordId") is not None else 201, record)
+        except (OSError, ValueError, TypeError, RecursionError) as error:
+            return self.fail(error)
+
+    def do_DELETE(self):
+        if not self.allowed():
+            return self.forbidden()
+        path = urlsplit(self.path).path
+        if path not in event_routes.DELETE_ROUTES:
+            return self.not_found()
+        try:
+            event_routes.check_caller(self.server, self.headers)
+            # A delete may come with no body. The store then asks for the confirmation it needs.
+            payload = {} if self.declared_length() == 0 else self.body(event_routes.BODY_LIMIT)
+            return self.event_response("DELETE", path, lambda: event_routes.handle_delete(self.server, self.events(), path, payload, self.headers))
         except (OSError, ValueError, TypeError, RecursionError) as error:
             return self.fail(error)
 
