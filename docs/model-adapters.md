@@ -263,7 +263,15 @@ The status table:
 
 ### TLS
 
-TLS is the encryption that `https` uses. For `https`, the adapter uses a context that checks certificates and host names and allows TLS 1.2 or later only. It refuses a context that does not. It checks the context again at connect time. A change made after the adapter was built does not open a hole. A failed check gives `endpoint_unreachable` and is not retryable.
+TLS is the encryption that `https` uses. For `https`, the adapter uses a context that checks certificates and host names and allows TLS 1.2 or later only.
+
+- With no `ssl_context`, the adapter builds the default context. A lowest version below TLS 1.2 goes up to TLS 1.2.
+- You can pass your own context. The adapter refuses a context that skips the certificate check or the host name check. It also refuses a context whose highest version is below TLS 1.2.
+- Some systems report a plain context with no lowest version at all (`MINIMUM_SUPPORTED`). The adapter does not refuse such a context. It raises the lowest version to TLS 1.2 on the context you passed in. Your context changes.
+- To set it yourself: `context = ssl.create_default_context(); context.minimum_version = ssl.TLSVersion.TLSv1_2`.
+- A lowest version above TLS 1.2 stays as it is.
+
+The adapter checks the context again at connect time. A change made after the adapter was built does not open a hole. A failed check at that point gives `unsafe_endpoint`. A failed certificate check on the server gives `endpoint_unreachable` and is not retryable.
 The operating system and Python's default context decide which certificate authorities are trusted.
 
 ## Limits and what is not verified

@@ -168,7 +168,22 @@ def address_allowed(address, loopback_host):
 def _tls_ok(context):
     """True when a TLS context checks certificates and host names and allows TLS 1.2 or later only."""
     return (isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
-            and context.minimum_version >= ssl.TLSVersion.TLSv1_2)
+            and context.minimum_version >= ssl.TLSVersion.TLSv1_2
+            and (context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED or context.maximum_version >= ssl.TLSVersion.TLSv1_2))
+
+
+def _raise_tls_floor(context):
+    """Raise the lowest TLS version of a context to 1.2 when it is lower.
+
+    Some systems report a plain context with no floor at all (`MINIMUM_SUPPORTED`). Refusing such a context would turn a
+    normal caller away, so the change goes on the caller's context. A context that cannot take the change is left as it is,
+    and `_tls_ok` then refuses it.
+    """
+    if context.minimum_version < ssl.TLSVersion.TLSv1_2:
+        try:
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+        except ValueError:
+            pass
 
 
 class _PinnedConnection(http.client.HTTPConnection):
@@ -343,7 +358,8 @@ class ApiAdapter(ma.ModelAdapter):
     """Call an OpenAI-format chat endpoint.
 
     `max_tokens_field` is the name of the output limit in the request: `max_tokens` (the common one) or `max_completion_tokens`.
-    `ssl_context` must check certificates and host names and allow TLS 1.2 or later only. `resolver` replaces
+    `ssl_context` must check certificates and host names and must not cap TLS below 1.2. Schola raises its lowest version to TLS 1.2
+    (on the context you pass in). `resolver` replaces
     `socket.getaddrinfo`; tests use it. The total time must be at least the connect time.
     A loopback endpoint may run without a key (`api_key=None`).
     """
@@ -369,10 +385,11 @@ class ApiAdapter(ma.ModelAdapter):
             raise ma._invalid(f'max_response_bytes must be a whole number from 1 to {MAX_RESPONSE_BYTES_LIMIT}.')
         if ssl_context is None:
             ssl_context = ssl.create_default_context()
-            if ssl_context.minimum_version < ssl.TLSVersion.TLSv1_2:
-                ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        elif not _tls_ok(ssl_context):
-            raise ma._invalid('The TLS context must check certificates and host names and allow TLS 1.2 or later only.')
+        if isinstance(ssl_context, ssl.SSLContext):
+            _raise_tls_floor(ssl_context)
+        if not _tls_ok(ssl_context):
+            raise ma._invalid('The TLS context must check certificates and host names, and it must not cap TLS below 1.2. '
+                              'Schola raises its lowest version to TLS 1.2 for you.')
         if resolver is not None and not callable(resolver):
             raise ma._invalid('The resolver must be a function.')
         super().__init__(allowed_paths=allowed_paths, secrets=() if api_key is None else (api_key,))

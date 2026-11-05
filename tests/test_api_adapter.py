@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import unittest
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -259,21 +260,66 @@ class EndpointRuleTests(Case):
     def test_the_total_time_may_equal_the_connect_time(self):
         ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), connect_timeout=2, total_timeout=2)
 
-    def test_a_tls_context_must_allow_tls_12_or_later(self):
+    def test_a_context_with_no_floor_is_raised_to_tls_12_not_refused(self):
+        # A plain context can report MINIMUM_SUPPORTED (it does on some Linux systems). That must not turn a caller away.
         context = ssl.create_default_context()
         context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
-        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        adapter = ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertIs(adapter._ssl_context, context)
+
+    def test_a_floor_above_tls_12_is_kept(self):
+        context = ssl.create_default_context()
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_3)
 
-    def test_a_default_context_that_allows_old_tls_is_raised_to_tls_12(self):
-        old = ssl.create_default_context()
-        old.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
-        with mock.patch('ssl.create_default_context', return_value=old):
+    def test_a_context_that_caps_tls_below_12_is_refused_with_a_message_that_says_what_to_do(self):
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', DeprecationWarning)
+                context.maximum_version = ssl.TLSVersion.TLSv1_1
+        except ValueError:
+            self.skipTest('this system cannot cap TLS at 1.1')
+        error = self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertIn('must not cap TLS below 1.2', str(error))
+        self.assertIn('raises its lowest version', str(error))
+
+    def test_a_context_that_reports_no_floor_is_raised_whatever_the_system(self):
+        # A context that behaves like the Linux one on every system: it reports MINIMUM_SUPPORTED until a floor is set.
+        class NoFloor(ssl.SSLContext):
+            _floor = ssl.TLSVersion.MINIMUM_SUPPORTED
+
+            @property
+            def minimum_version(self):
+                return self._floor
+
+            @minimum_version.setter
+            def minimum_version(self, value):
+                self._floor = value
+
+        context = NoFloor(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.MINIMUM_SUPPORTED)
+        ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+        # The same context, with the default path: the adapter builds its own context and raises that one.
+        with mock.patch('ssl.create_default_context', return_value=NoFloor(ssl.PROTOCOL_TLS_CLIENT)):
             adapter = ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET))
         self.assertEqual(adapter._ssl_context.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_a_context_that_cannot_take_a_floor_is_refused(self):
+        class Stuck(ssl.SSLContext):
+            @property
+            def minimum_version(self):
+                return ssl.TLSVersion.MINIMUM_SUPPORTED
+
+            @minimum_version.setter
+            def minimum_version(self, value):
+                raise ValueError('not supported here')
+
+        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=Stuck(ssl.PROTOCOL_TLS_CLIENT))
 
     def test_the_default_limits(self):
         self.assertEqual(api_adapter.MAX_RESPONSE_BYTES, 1_000_000)
@@ -1711,6 +1757,7 @@ class TlsTests(Case):
         adapter = ApiAdapter('https://127.0.0.1:1/v1', 'm', ApiKey(SECRET))
         self.assertEqual(adapter._ssl_context.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(adapter._ssl_context.check_hostname)
+        self.assertGreaterEqual(adapter._ssl_context.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     def test_a_context_that_skips_verification_is_refused(self):
         weak = []
