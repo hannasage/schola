@@ -201,13 +201,14 @@ This page was written before any change to storage. The event log step adds one 
       <reflection-id>.json
 ```
 
-- `events.jsonl` is the learning event log. It follows `contracts/learning-events.md`. The store only appends to it (`event_log.py`).
+- `events.jsonl` is the learning event log. It follows `contracts/learning-events.md`. The store appends to it and never edits a line (`event_log.py`). The one way the store removes it is `DELETE /api/events` with `confirm`, which also removes every reflection.
 - `.events.lock` is the lock file. It holds no data and the store never deletes it.
-- `reflections/<reflection-id>.json` holds one reflection. The name is a random lowercase UUID. The file holds `version`, `reflectionId`, `charCount`, and `text`.
+- `reflections/<reflection-id>.json` holds one reflection. The name is a random lowercase UUID. The file holds `version`, `reflectionId`, `charCount`, and `text`. The store keeps at most 1000 of them and 16 MB in all.
 - The folder name starts with the character `_`, as `_lessons/` does. No curriculum id starts with that character.
-- The store creates folders with mode `0700` and files with mode `0600`.
+- The store creates `_events/` and `reflections/` with mode `0700` and files with mode `0600`. It creates the data folder with mode `0700` when it has to make it. A store folder that already exists must belong to the current user and allow no access to others, or the store refuses to write.
 - Older builds ignore the folder. The record, library, and recovery code never reads or writes it.
 - The routes are `POST /api/events`, `GET /api/events`, `GET /api/events/export`, `DELETE /api/events`, `POST /api/reflections`, and `GET /api/reflections/<id>`. All need the session token (`event_routes.py`).
+- A log over the 5 MB cap gives `log_full` on an append and `log_corrupt` on a read. A store folder that is a regular file gives `log_corrupt`.
 - The log is local and is not encrypted. Any program that runs as the student can read it. The privacy limits are those of the contract and of `docs/event-log.md`.
 - A request body for these routes has a limit of 262,144 bytes.
 
