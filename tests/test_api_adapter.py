@@ -3,14 +3,17 @@
 A fake provider runs on a loopback port in a thread. The tests never use the real network and never call a real provider.
 """
 import contextlib
+import copy
 import errno
 import http.client
 import json
 import os
+import pickle
 from pathlib import Path
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2210,7 +2213,6 @@ class TransportSeamTests(Case):
             self.assertCode('timeout', adapter.complete, call(), retryable=True)
 
     def test_a_refusal_on_any_address_is_what_the_failure_reports(self):
-        two = lambda host, port, *a, **k: [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', port)), (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
         for order in ((OSError(errno.EADDRNOTAVAIL, 'x'), ConnectionRefusedError(errno.ECONNREFUSED, 'x')),
                       (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), OSError(errno.EADDRNOTAVAIL, 'x'))):
             with self.subTest(order=[type(e).__name__ for e in order]), mock.patch('socket.create_connection', side_effect=list(order)):
@@ -2225,6 +2227,15 @@ class TransportSeamTests(Case):
             with self.subTest(first=type(order[0]).__name__), mock.patch('socket.create_connection', side_effect=list(order)):
                 adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), resolver=two)
                 self.assertCode('timeout', adapter.complete, call(), retryable=True)
+
+    def test_a_connect_failure_can_be_copied_and_pickled_and_keeps_what_it_knows(self):
+        original = api_adapter.ConnectFailed(errno.ECONNREFUSED, 'no connection', True)
+        for name, clone in (('copy', copy.copy(original)), ('deepcopy', copy.deepcopy(original)), ('pickle', pickle.loads(pickle.dumps(original)))):
+            with self.subTest(how=name):
+                self.assertIsInstance(clone, api_adapter.ConnectFailed)
+                self.assertEqual((clone.errno, clone.refused, clone.strerror), (errno.ECONNREFUSED, True, 'no connection'))
+        self.assertFalse(pickle.loads(pickle.dumps(api_adapter.ConnectFailed(errno.EMFILE, 'x', False))).refused)
+        self.assertFalse(api_adapter.ConnectFailed(errno.EMFILE, 'x').refused)
 
     def test_a_subclass_can_reword_a_network_error_and_nothing_else(self):
         class Reworded(ApiAdapter):
@@ -2326,6 +2337,7 @@ class ConnectionCloseTests(Case):
                 return {'Content-Type': 'application/json', 'Content-Length': str(len(body))}.get(name)
 
             closes_after_the_body = False
+            chunked = False
 
             def isclosed(self):
                 return self.closes_after_the_body and self.calls >= 1
@@ -2358,6 +2370,72 @@ class ConnectionCloseTests(Case):
                     return body[:10]
                 raise OSError(errno.EBADF, 'Bad file descriptor')
         error, raw = adapter._read(Connection(), Short(OSError()), 50, adapter._parse, '/chat/completions')
+        self.assertEqual((error.code, error.tokens_charged, raw), ('endpoint_unreachable', 50, None))
+
+    def test_a_chunked_stream_that_stops_short_is_an_error_even_when_content_length_matches_what_arrived(self):
+        piece = json.dumps(ok_payload()).encode()
+
+        def head(handler, length):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.send_header('Content-Length', str(length))  # http.client ignores this for a chunked reply
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+
+        def reset(handler):
+            handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))  # close() sends a reset
+            handler.connection.close()
+
+        def no_terminator(end):
+            def responder(handler, request_body):
+                head(handler, len(piece))
+                handler.wfile.write(f'{len(piece):x}\r\n'.encode() + piece + b'\r\n')  # the whole body, and no 0-size last chunk
+                handler.wfile.flush()
+                end(handler)
+            return responder
+
+        def cut_chunk(end):
+            def responder(handler, request_body):
+                head(handler, 40)
+                handler.wfile.write(b'270f\r\n' + piece[:40])  # the chunk says 9999 bytes and 40 arrive
+                handler.wfile.flush()
+                end(handler)
+            return responder
+        cases = {'no terminator, FIN': (no_terminator(lambda handler: None), 'bad_response'), 'no terminator, reset': (no_terminator(reset), 'endpoint_unreachable'),
+                 'cut chunk, FIN': (cut_chunk(lambda handler: None), 'bad_response'), 'cut chunk, reset': (cut_chunk(reset), 'endpoint_unreachable')}
+        for name, (responder, code) in cases.items():
+            with self.subTest(case=name):
+                budget = TokenBudget(100_000)
+                request = call(budget)
+                error = self.assertCode(code, self.adapter(self.provider(responder)).complete, request)
+                self.assertEqual((error.tokens_charged, budget.spent), (request.hold_tokens, request.hold_tokens))
+
+    def test_a_fake_response_that_is_chunked_never_counts_as_whole_after_an_error(self):
+        body = json.dumps(ok_payload()).encode()
+
+        class Response:
+            status = 200
+            chunked = 1
+            calls = 0
+
+            def getheader(self, name):
+                return {'Content-Type': 'application/json', 'Content-Length': str(len(body))}.get(name)
+
+            def isclosed(self):
+                return False
+
+            def read1(self, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return body
+                raise OSError(errno.EBADF, 'Bad file descriptor')
+
+        class Connection:
+            def arm(self):
+                pass
+        adapter = ApiAdapter('http://127.0.0.1:1/v1', 'm', None)
+        error, raw = adapter._read(Connection(), Response(), 50, adapter._parse, '/chat/completions')
         self.assertEqual((error.code, error.tokens_charged, raw), ('endpoint_unreachable', 50, None))
 
     def test_arm_does_not_touch_a_closed_socket_and_still_stops_at_the_deadline(self):

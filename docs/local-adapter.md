@@ -47,7 +47,7 @@ The call and the result are the same as in `docs/model-adapters.md`. The adapter
 
 ### Loopback only
 
-The host must be one of three exact spellings: `127.0.0.1`, `[::1]`, or `localhost` (in any letter case).
+The host must be one of three spellings: `127.0.0.1`, `[::1]`, or `localhost`. Letter case does not matter.
 The constructor refuses any other host at once. The error code is `unsafe_endpoint`.
 That covers every public host and every private address. It also covers other loopback addresses, such as `127.0.0.2`.
 It covers other spellings of the same address too: `127.1`, `[::ffff:127.0.0.1]`, and `localhost.` (with a final dot).
@@ -79,9 +79,8 @@ The local adapter adds nothing for this, and no test covers it for this adapter.
 
 The adapter never sends an `Authorization` header and holds no key.
 If the caller passes an `api_key`, the adapter refuses with `invalid_request`. The message does not repeat the value.
-A local server that asks for a key is not supported. Such a server answers HTTP 401 or 403. The adapter reports `auth_failed` with this sentence:
-
-> The local server asked for a key. This adapter does not send one.
+A local server that asks for a key is not supported. Such a server answers HTTP 401 or 403. The adapter reports `auth_failed` with a fixed sentence.
+The sentence names the status (401 or 403). It says that a key or an access rule can be the cause, and that this adapter sends no key.
 
 ### Presets
 
@@ -114,13 +113,17 @@ Schola leaves an entry out, and counts it in `skipped`, in these cases:
 - The id repeats an earlier id.
 - The id looks like a path or an option. This is the rule for an untrusted label (see below).
 
-An id is an untrusted label. The server chose it, and a later step can show it to the student or put it in a request. So Schola also leaves out an id that:
+An id is an untrusted label. The server chose it. A later step can show it to the student or put it in a request.
+Use an id as a display label and as a model name in a request. Never use it as a path.
+So Schola also leaves out an id that:
 
 - starts with `/`, `~`, or `-`
-- has a `..` segment (`..`, `a/../b`, or `a/..`)
-- starts with a drive letter, a colon, and a slash or backslash, such as `C:/models/x`
+- has a segment that is `.` or `..` (`./x`, `a/./b`, `../x`, `a/../b`, or `a/..`)
+- starts with one letter and a colon, such as `C:/models/x` or `C:foo`
 
-Ids such as `llama3:8b` and `hf.co/user/model` pass. The check reads the id only. It does not open any path.
+Schola tells a drive from a model and a tag by the length of the part before the first colon. One letter is the only shape of a drive. So `C:foo` and `c:x` are left out, and `llama3:8b` and `qwen2.5:7b` pass.
+A model that really has a one-letter name before the colon is left out too.
+Ids such as `hf.co/user/model` and `a..b` pass. A dot inside a segment is fine. The check reads the id only. It does not open any path.
 
 The list holds at most 500 ids. When the server lists more usable ids, `truncated` is true. Schola drops the rest.
 
@@ -217,6 +220,7 @@ These changes are in `api_adapter.py`. Each has a test in `tests/test_api_adapte
 - Windows and Linux are untested. The tests ran on macOS. The continuous integration run on Linux checks the test files there.
 - `https` on loopback with a self-made certificate has no special support and no test for this adapter.
 - The adapter does not retry. `retryable` is information for the caller, and the caller needs its own limit on attempts.
+  A server can take a request and reset the connection before any reply byte. That costs nothing in the budget. So a retry loop does not end by itself (see `docs/model-adapters.md`).
 - The adapter does not start a runtime and does not download a model.
 
 ## Not built in this step

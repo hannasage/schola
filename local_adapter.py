@@ -4,7 +4,7 @@
     LocalAdapter.preset('ollama', model).complete(request)
     LocalAdapter(base_url).list_models()
 
-This is the API adapter (`api_adapter.py`) with three rules added and three things changed. `docs/local-adapter.md` explains them.
+This is the API adapter (`api_adapter.py`) with three rules added and five things changed. `docs/local-adapter.md` explains them.
 
 Added
 -----
@@ -53,11 +53,11 @@ MAX_LISTED_MODELS = 500
 LOCALHOST_ADDRESSES = ('127.0.0.1', '::1')
 
 NOT_LISTENING = 'No local model server answered at that address. Start one, then try again.'
-UNSAFE_URL = ('A local model must be at 127.0.0.1, [::1], or localhost (exactly these spellings), with no credentials, query, or fragment. '
+UNSAFE_URL = ('A local model must be at 127.0.0.1, [::1], or localhost (letter case does not matter), with no credentials, query, or fragment. '
               'Use the API adapter for any other host.')
 NOT_THIS_COMPUTER = 'localhost resolved to an address that is not this computer.'
 NO_MODEL_LIST = 'This server does not offer a model list. Type the model name instead.'
-WANTS_A_KEY = 'The local server asked for a key. This adapter does not send one.'
+WANTS_A_KEY = 'The local server refused the request (401 or 403). It may want a key, which this adapter does not send, or an access rule may apply.'
 NO_USABLE_ID = 'The server listed models, but Schola can use none of the names. Type the model name instead.'
 _NO_MODEL = 'Choose a model before you ask for a completion.'
 _GENERAL = 'Schola could not reach the endpoint.'
@@ -77,7 +77,8 @@ def _usable_id(name):
     """True for a model id Schola can use as a label. An id is untrusted text: it passes the model name rule and does not look like a path or an option."""
     if not api_adapter.model_name_ok(name):
         return False
-    if name[0] in '/~-' or '..' in name.split('/') or (len(name) > 2 and name[0].isalpha() and name[1] == ':' and name[2] in '/\\'):
+    # A single letter and a colon is the shape of a drive (`C:/x` or `C:foo`). A longer name before the colon (`llama3:8b`) is a model and a tag.
+    if name[0] in '/~-' or any(part in ('.', '..') for part in name.split('/')) or (len(name) > 1 and name[0].isalpha() and name[1] == ':'):
         return False
     return True
 
@@ -134,6 +135,7 @@ class LocalAdapter(api_adapter.ApiAdapter):
                          connect_timeout=connect_timeout, read_timeout=read_timeout, total_timeout=total_timeout, max_response_bytes=max_response_bytes,
                          ssl_context=ssl_context)
         self._model = model
+
     @classmethod
     def preset(cls, name, model=None, **options):
         """An adapter for one of the `PRESETS`. Other options (timeouts, `allowed_paths`, and so on) go to the constructor."""

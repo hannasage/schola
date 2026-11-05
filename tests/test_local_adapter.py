@@ -141,6 +141,8 @@ class EndpointTests(LocalCase):
                 self.assertEqual(str(error), local_adapter.UNSAFE_URL)
                 self.assertNotIn('Use https', str(error))
                 self.assertIn('API adapter', str(error))
+                self.assertIn('letter case does not matter', str(error))
+                self.assertNotIn('exactly', str(error))
 
 
 class KeyTests(LocalCase):
@@ -574,8 +576,9 @@ class ListModelsTests(LocalCase):
         self.assertCode('bad_response', self.adapter(self.provider(reply_raw(top))).list_models)
 
     def test_ids_are_untrusted_labels_so_path_like_and_option_like_ids_are_left_out(self):
-        bad = ('../x', 'a/../b', '..', 'a/..', '/abs/model.gguf', '/', '~', '~root/x', '~/m', '-flag', '--model', '-', 'C:/models/x', 'c:\\models\\x', 'Z:/x', 'C:\\x', '//server/share')
-        good = ('llama3:8b', 'hf.co/user/model', 'a..b', 'x/y/z', 'a-b', 'model.v2', 'q4_k_m', 'a~b', 'c:x', 'ab:/x', 'ab/x', 'c:', '1:/x', '.hidden', 'a/.b', '...')
+        bad = ('../x', 'a/../b', '..', 'a/..', '/abs/model.gguf', '/', '~', '~root/x', '~/m', '-flag', '--model', '-', 'C:/models/x', 'Z:/x', '//server/share',
+               '.', './x', 'a/./b', 'a/.', 'C:foo', 'c:x', 'Z:', 'c:', 'a:b')
+        good = ('llama3:8b', 'hf.co/user/model', 'a..b', 'x/y/z', 'a-b', 'model.v2', 'q4_k_m', 'a~b', 'ab:/x', 'ab/x', '1:/x', '.hidden', 'a/.b', '...', 'qwen2.5:7b', 'ab:c', 'a.b/c.d')
         for name in bad:
             with self.subTest(bad=name):
                 result = self.lister(models_payload(name, 'fine')).list_models()
@@ -609,13 +612,13 @@ class ListModelsTests(LocalCase):
 
     def test_a_local_server_gets_local_sentences_for_the_statuses_that_read_wrong_for_it(self):
         no_list = 'This server does not offer a model list. Type the model name instead.'
-        wants_key = 'The local server asked for a key. This adapter does not send one.'
+        wants_key = 'The local server refused the request (401 or 403). It may want a key, which this adapter does not send, or an access rule may apply.'
         for status, sentence, code in ((404, no_list, 'invalid_request'), (401, wants_key, 'auth_failed'), (403, wants_key, 'auth_failed')):
             with self.subTest(status=status):
                 provider = self.provider(lambda handler, body, status=status: send(handler, status, BODY_SECRET.encode()))
                 error = self.assertCode(code, self.adapter(provider).list_models, retryable=False)
                 self.assertEqual(str(error), sentence)
-                self.assertNotIn('API key', str(error).replace('asked for a key', ''))
+                self.assertNotIn('API key', str(error))
                 inside = self.assertCode(code, self.lister({'error': {'code': status, 'message': BODY_SECRET}}).list_models, retryable=False)
                 self.assertTrue(str(inside).endswith(sentence), str(inside))
         for status in (401, 403):

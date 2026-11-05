@@ -315,6 +315,9 @@ The operating system and Python's default context decide which certificate autho
 - The adapter does not read a provider's `Retry-After` header.
 - The token count comes from the provider. Schola cannot check the numbers, and the input estimate is rough.
 - A connection that breaks before any reply byte arrives counts as nothing in the budget. The provider can still bill for such a call. Schola cannot see it.
+  This holds even when the request was fully sent. A server can take the request and then reset the connection, and the call costs nothing in the budget.
+  The cap never moves on such a failure, so a retry loop never ends by itself. A caller that retries needs its own limit on attempts.
+  Schola does not charge the hold here, because the rule above is part of the documented charging rules and the tests check it.
 - Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.12, 3.13, and 3.14.
 - A reply with a correct `Content-Length` and `Connection: close` failed on Python 3.12 and later in the first version of this adapter. The step E4 work fixed it (see `docs/local-adapter.md`). The tests now send that header in every framing.
 

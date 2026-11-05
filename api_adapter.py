@@ -204,7 +204,7 @@ class ConnectFailed(OSError):
     `errno` is the number of the failure. When any address refused the connection it is the number of that refusal, and `refused` is true.
     """
 
-    def __init__(self, number, message, refused):
+    def __init__(self, number, message, refused=False):
         super().__init__(number, message)
         self.refused = refused
 
@@ -665,7 +665,8 @@ class ApiAdapter(ma.ModelAdapter):
         except Exception as caught:
             # The body broke in the middle of a reply the provider billed: a reset, a cut chunk, an over-long line, a timeout.
             # A body that was read to its declared length is whole, whatever the socket says afterwards.
-            if declared is None or total != declared:
+            # A chunked reply is not framed by Content-Length (`http.client` ignores it), so only its own last chunk can finish it.
+            if response.chunked or total != declared:  # with no declared length, `total` is never equal to it
                 return _billed(_classify(caught) or _bad(), None, hold), None
         if declared is not None and total != declared:
             return _billed(_bad('The provider reply ended early.'), None, hold), None
