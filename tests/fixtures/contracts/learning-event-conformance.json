@@ -1,0 +1,828 @@
+[
+  {
+    "name": "attempt-submitted",
+    "file": "learning-events/valid/attempt-submitted.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "attempt-id-uuid-form",
+    "file": "learning-events/valid/attempt-id-uuid-form.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "attempt-id-letters-digits-underscore-hyphen",
+    "file": "learning-events/valid/attempt-id-letters-digits-underscore-hyphen.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "attempt-id-64-characters",
+    "file": "learning-events/valid/attempt-id-64-characters.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "check-result-passed",
+    "file": "learning-events/valid/check-result-passed.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "check-result-failed",
+    "file": "learning-events/valid/check-result-failed.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "check-result-self-reported",
+    "file": "learning-events/valid/check-result-self-reported.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "hint-requested-nudge-null-attempt",
+    "file": "learning-events/valid/hint-requested-nudge-null-attempt.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "hint-requested-question-null-attempt",
+    "file": "learning-events/valid/hint-requested-question-null-attempt.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "hint-requested-partial-example",
+    "file": "learning-events/valid/hint-requested-partial-example.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "hint-requested-full-answer-accepted-offer",
+    "file": "learning-events/valid/hint-requested-full-answer-accepted-offer.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "agent-offer-pending",
+    "file": "learning-events/valid/agent-offer-pending.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "agent-offer-recall-question",
+    "file": "learning-events/valid/agent-offer-recall-question.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "agent-offer-review-suggestion",
+    "file": "learning-events/valid/agent-offer-review-suggestion.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "reflection-saved",
+    "file": "learning-events/valid/reflection-saved.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "reflection-saved-module-level",
+    "file": "learning-events/valid/reflection-saved-module-level.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "task-opened",
+    "file": "learning-events/valid/task-opened.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "task-finished-passed",
+    "file": "learning-events/valid/task-finished-passed.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "task-finished-abandoned",
+    "file": "learning-events/valid/task-finished-abandoned.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "module-completed",
+    "file": "learning-events/valid/module-completed.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "mode-changed",
+    "file": "learning-events/valid/mode-changed.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "review-result",
+    "file": "learning-events/valid/review-result.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "envelope-eight-skills",
+    "file": "learning-events/valid/envelope-eight-skills.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "envelope-no-skills",
+    "file": "learning-events/valid/envelope-no-skills.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "envelope-offset-and-fraction",
+    "file": "learning-events/valid/envelope-offset-and-fraction.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "envelope-leap-day",
+    "file": "learning-events/valid/envelope-leap-day.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "envelope-newer-minor-version",
+    "file": "learning-events/valid/envelope-newer-minor-version.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "evidence-allowed-punctuation",
+    "file": "learning-events/valid/evidence-allowed-punctuation.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "evidence-200-characters",
+    "file": "learning-events/valid/evidence-200-characters.json",
+    "kind": "learning-event",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "log-multi-line",
+    "file": "learning-events/valid/log-multi-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "valid",
+    "stage": "none",
+    "invalidLines": {},
+    "truncatedTail": false
+  },
+  {
+    "name": "log-empty",
+    "file": "learning-events/valid/log-empty.jsonl",
+    "kind": "learning-event-log",
+    "expect": "valid",
+    "stage": "none",
+    "invalidLines": {},
+    "truncatedTail": false
+  },
+  {
+    "name": "log-no-final-newline",
+    "file": "learning-events/valid/log-no-final-newline.jsonl",
+    "kind": "learning-event-log",
+    "expect": "valid",
+    "stage": "none",
+    "invalidLines": {},
+    "truncatedTail": false
+  },
+  {
+    "name": "unknown-type",
+    "file": "learning-events/invalid/unknown-type.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "confidence-rated-not-in-v1",
+    "file": "learning-events/invalid/confidence-rated-not-in-v1.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "extra-envelope-property",
+    "file": "learning-events/invalid/extra-envelope-property.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "extra-data-property",
+    "file": "learning-events/invalid/extra-data-property.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "hint-full-answer-null-attempt",
+    "file": "learning-events/invalid/hint-full-answer-null-attempt.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "hint-partial-example-null-attempt",
+    "file": "learning-events/invalid/hint-partial-example-null-attempt.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-over-200-characters",
+    "file": "learning-events/invalid/evidence-over-200-characters.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-bidi-character",
+    "file": "learning-events/invalid/evidence-bidi-character.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-control-character",
+    "file": "learning-events/invalid/evidence-control-character.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-line-separator",
+    "file": "learning-events/invalid/evidence-line-separator.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-tag-character",
+    "file": "learning-events/invalid/evidence-tag-character.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-zero-width-space",
+    "file": "learning-events/invalid/evidence-zero-width-space.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-left-to-right-mark",
+    "file": "learning-events/invalid/evidence-left-to-right-mark.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-right-to-left-mark",
+    "file": "learning-events/invalid/evidence-right-to-left-mark.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-arabic-letter-mark",
+    "file": "learning-events/invalid/evidence-arabic-letter-mark.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-first-isolate",
+    "file": "learning-events/invalid/evidence-first-isolate.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-last-isolate",
+    "file": "learning-events/invalid/evidence-last-isolate.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-delete-character",
+    "file": "learning-events/invalid/evidence-delete-character.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-c1-next-line",
+    "file": "learning-events/invalid/evidence-c1-next-line.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-c1-last-control",
+    "file": "learning-events/invalid/evidence-c1-last-control.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-start-of-heading",
+    "file": "learning-events/invalid/evidence-start-of-heading.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-lone-surrogate",
+    "file": "learning-events/invalid/evidence-lone-surrogate.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-non-ascii-letter",
+    "file": "learning-events/invalid/evidence-non-ascii-letter.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-emoji",
+    "file": "learning-events/invalid/evidence-emoji.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-angle-brackets",
+    "file": "learning-events/invalid/evidence-angle-brackets.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "evidence-double-quote",
+    "file": "learning-events/invalid/evidence-double-quote.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "smuggled-code-field",
+    "file": "learning-events/invalid/smuggled-code-field.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "smuggled-text-field",
+    "file": "learning-events/invalid/smuggled-text-field.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "smuggled-output-field",
+    "file": "learning-events/invalid/smuggled-output-field.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "smuggled-top-level-code",
+    "file": "learning-events/invalid/smuggled-top-level-code.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-event-id",
+    "file": "learning-events/invalid/bad-event-id.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-session-id",
+    "file": "learning-events/invalid/bad-session-id.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-timestamp-second-60",
+    "file": "learning-events/invalid/bad-timestamp-second-60.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-timestamp-no-zone",
+    "file": "learning-events/invalid/bad-timestamp-no-zone.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "impossible-date",
+    "file": "learning-events/invalid/impossible-date.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "agent-offer-triggered-by-itself",
+    "file": "learning-events/invalid/agent-offer-triggered-by-itself.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "newer-minor-version-with-a-new-field",
+    "file": "learning-events/invalid/newer-minor-version-with-a-new-field.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "unsupported-major-version",
+    "file": "learning-events/invalid/unsupported-major-version.json",
+    "kind": "learning-event",
+    "expect": "invalid:unsupported_version",
+    "stage": "version"
+  },
+  {
+    "name": "schema-version-three-parts",
+    "file": "learning-events/invalid/schema-version-three-parts.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "too-many-skills",
+    "file": "learning-events/invalid/too-many-skills.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-skill-id",
+    "file": "learning-events/invalid/bad-skill-id.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "repeated-skill",
+    "file": "learning-events/invalid/repeated-skill.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "missing-data",
+    "file": "learning-events/invalid/missing-data.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "missing-task-id-property",
+    "file": "learning-events/invalid/missing-task-id-property.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "null-task-on-task-event",
+    "file": "learning-events/invalid/null-task-on-task-event.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "task-on-module-completed",
+    "file": "learning-events/invalid/task-on-module-completed.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "attempt-id-with-space",
+    "file": "learning-events/invalid/attempt-id-with-space.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "attempt-id-65-characters",
+    "file": "learning-events/invalid/attempt-id-65-characters.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "attempt-id-empty",
+    "file": "learning-events/invalid/attempt-id-empty.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "hint-attempt-id-with-dot",
+    "file": "learning-events/invalid/hint-attempt-id-with-dot.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "source-student-on-attempt-submitted",
+    "file": "learning-events/invalid/source-student-on-attempt-submitted.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "source-agent-on-check-result",
+    "file": "learning-events/invalid/source-agent-on-check-result.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "source-student-on-self-reported-check",
+    "file": "learning-events/invalid/source-student-on-self-reported-check.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "source-student-on-task-finished",
+    "file": "learning-events/invalid/source-student-on-task-finished.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "source-agent-on-module-completed",
+    "file": "learning-events/invalid/source-agent-on-module-completed.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "null-task-on-attempt-submitted",
+    "file": "learning-events/invalid/null-task-on-attempt-submitted.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "null-task-on-check-result",
+    "file": "learning-events/invalid/null-task-on-check-result.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "null-task-on-hint-requested",
+    "file": "learning-events/invalid/null-task-on-hint-requested.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "null-task-on-task-finished",
+    "file": "learning-events/invalid/null-task-on-task-finished.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-artifact-digest",
+    "file": "learning-events/invalid/bad-artifact-digest.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "negative-duration",
+    "file": "learning-events/invalid/negative-duration.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-check-status",
+    "file": "learning-events/invalid/bad-check-status.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "bad-mode",
+    "file": "learning-events/invalid/bad-mode.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "data-is-not-an-object",
+    "file": "learning-events/invalid/data-is-not-an-object.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "repeated-key-top-level",
+    "file": "learning-events/invalid/repeated-key-top-level.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "repeat"
+  },
+  {
+    "name": "repeated-key-in-data",
+    "file": "learning-events/invalid/repeated-key-in-data.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "repeat"
+  },
+  {
+    "name": "repeated-key-written-with-an-escape",
+    "file": "learning-events/invalid/repeated-key-written-with-an-escape.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "repeat"
+  },
+  {
+    "name": "repeated-key-in-nested-array",
+    "file": "learning-events/invalid/repeated-key-in-nested-array.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "repeat"
+  },
+  {
+    "name": "damaged-json",
+    "file": "learning-events/invalid/damaged-json.json",
+    "kind": "learning-event",
+    "expect": "invalid:invalid",
+    "stage": "parse"
+  },
+  {
+    "name": "log-damaged-line",
+    "file": "learning-events/invalid/log-damaged-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-truncated-tail",
+    "file": "learning-events/invalid/log-truncated-tail.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "3": "truncated_tail"
+    },
+    "truncatedTail": true
+  },
+  {
+    "name": "log-oversized-line",
+    "file": "learning-events/invalid/log-oversized-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "too_large"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-duplicate-event-id",
+    "file": "learning-events/invalid/log-duplicate-event-id.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "3": "invalid"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-blank-line",
+    "file": "learning-events/invalid/log-blank-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-unsupported-major-line",
+    "file": "learning-events/invalid/log-unsupported-major-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "unsupported_version"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-mixed-problems",
+    "file": "learning-events/invalid/log-mixed-problems.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid",
+      "3": "unsupported_version",
+      "4": "invalid",
+      "5": "truncated_tail"
+    },
+    "truncatedTail": true
+  },
+  {
+    "name": "log-repeated-key-line",
+    "file": "learning-events/invalid/log-repeated-key-line.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-repeated-key-in-tail",
+    "file": "learning-events/invalid/log-repeated-key-in-tail.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid"
+    },
+    "truncatedTail": false
+  },
+  {
+    "name": "log-line-with-schema-error",
+    "file": "learning-events/invalid/log-line-with-schema-error.jsonl",
+    "kind": "learning-event-log",
+    "expect": "invalid:invalid",
+    "stage": "lines",
+    "invalidLines": {
+      "2": "invalid"
+    },
+    "truncatedTail": false
+  }
+]

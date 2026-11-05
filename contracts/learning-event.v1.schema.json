@@ -1,0 +1,592 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:schola:contract:learning-event:v1",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "$ref": "urn:schola:contract:lesson-common:v1#/$defs/schemaVersion"
+    },
+    "eventId": {
+      "$ref": "#/$defs/uuid"
+    },
+    "time": {
+      "$ref": "urn:schola:contract:lesson-common:v1#/$defs/timestamp"
+    },
+    "sessionId": {
+      "$ref": "#/$defs/uuid"
+    },
+    "moduleId": {
+      "$ref": "urn:schola:contract:lesson-common:v1#/$defs/lessonId"
+    },
+    "moduleVersion": {
+      "$ref": "urn:schola:contract:lesson-common:v1#/$defs/contentVersion"
+    },
+    "taskId": {
+      "oneOf": [
+        {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/localId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source": {
+      "enum": [
+        "student",
+        "app",
+        "agent"
+      ]
+    },
+    "skills": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/skillId"
+      }
+    },
+    "type": {
+      "enum": [
+        "attempt_submitted",
+        "check_result",
+        "hint_requested",
+        "agent_offer",
+        "reflection_saved",
+        "task_opened",
+        "task_finished",
+        "module_completed",
+        "mode_changed",
+        "review_result"
+      ]
+    },
+    "data": {
+      "description": "The shape depends on type. A rule in allOf closes it for each type."
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "time",
+    "sessionId",
+    "moduleId",
+    "moduleVersion",
+    "taskId",
+    "source",
+    "skills",
+    "type",
+    "data"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "attempt_submitted"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataAttemptSubmitted"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "source": {
+            "const": "app"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "check_result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataCheckResult"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "source": {
+            "const": "app"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "hint_requested"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataHintRequested"
+          },
+          "taskId": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "agent_offer"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataAgentOffer"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "reflection_saved"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataReflectionSaved"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "task_opened"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataTaskOpened"
+          },
+          "taskId": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "task_finished"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataTaskFinished"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "source": {
+            "const": "app"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "module_completed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataModuleCompleted"
+          },
+          "taskId": {
+            "type": "null"
+          },
+          "source": {
+            "const": "app"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "mode_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataModeChanged"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "review_result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/dataReviewResult"
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "A lowercase UUID in the 8-4-4-4-12 form."
+    },
+    "skillId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,39}$",
+      "description": "A skill label: a lowercase letter, then up to 39 lowercase letters, digits, or hyphens."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "A lowercase SHA-256 digest in hex. It stands for the work. The work itself never appears in the log."
+    },
+    "evidence": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9 .,:;()'_/-]{0,200}$",
+      "description": "A short note of at most 200 characters. Only ASCII letters, digits, the space, and the marks . , : ; ( ) apostrophe _ / - are allowed, so no hidden or control character can enter."
+    },
+    "dataAttemptSubmitted": {
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/attemptId"
+        },
+        "artifactDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "artifactBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 104857600
+        }
+      },
+      "required": [
+        "attemptId",
+        "artifactDigest",
+        "artifactBytes"
+      ],
+      "additionalProperties": false
+    },
+    "dataCheckResult": {
+      "type": "object",
+      "properties": {
+        "checkId": {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/localId"
+        },
+        "attemptId": {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/attemptId"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "error",
+            "skipped",
+            "self-reported"
+          ]
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600000
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "runnerType": {
+          "oneOf": [
+            {
+              "$ref": "urn:schola:contract:lesson-common:v1#/$defs/localId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "checkId",
+        "attemptId",
+        "status",
+        "durationMs",
+        "evidence",
+        "runnerType"
+      ],
+      "additionalProperties": false
+    },
+    "dataHintRequested": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/hintLevel"
+        },
+        "attemptId": {
+          "oneOf": [
+            {
+              "$ref": "urn:schola:contract:lesson-common:v1#/$defs/attemptId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "enum": [
+            "student",
+            "agent-offer-accepted"
+          ]
+        }
+      },
+      "required": [
+        "level",
+        "attemptId",
+        "origin"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "level": {
+                "enum": [
+                  "partial-example",
+                  "full-answer"
+                ]
+              }
+            },
+            "required": [
+              "level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "attemptId": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dataAgentOffer": {
+      "type": "object",
+      "properties": {
+        "offeredLevel": {
+          "enum": [
+            "nudge",
+            "question",
+            "partial-example",
+            "full-answer",
+            "recall-question",
+            "review-suggestion"
+          ]
+        },
+        "triggerEventId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "outcome": {
+          "enum": [
+            "pending",
+            "accepted",
+            "dismissed",
+            "ignored"
+          ]
+        },
+        "policyId": {
+          "$ref": "urn:schola:contract:lesson-common:v1#/$defs/localId"
+        }
+      },
+      "required": [
+        "offeredLevel",
+        "triggerEventId",
+        "outcome",
+        "policyId"
+      ],
+      "additionalProperties": false
+    },
+    "dataReflectionSaved": {
+      "type": "object",
+      "properties": {
+        "reflectionId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "charCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": [
+        "reflectionId",
+        "charCount"
+      ],
+      "additionalProperties": false
+    },
+    "dataTaskOpened": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "dataTaskFinished": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "enum": [
+            "passed",
+            "abandoned",
+            "skipped"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "dataModuleCompleted": {
+      "type": "object",
+      "properties": {
+        "checksPassed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "tasksTotal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "checksPassed",
+        "tasksTotal"
+      ],
+      "additionalProperties": false
+    },
+    "dataModeChanged": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "enum": [
+            "coach",
+            "pair",
+            "show-me"
+          ]
+        },
+        "to": {
+          "enum": [
+            "coach",
+            "pair",
+            "show-me"
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    },
+    "dataReviewResult": {
+      "type": "object",
+      "properties": {
+        "skillId": {
+          "$ref": "#/$defs/skillId"
+        },
+        "outcome": {
+          "enum": [
+            "correct",
+            "incorrect"
+          ]
+        },
+        "intervalDays": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3650
+        }
+      },
+      "required": [
+        "skillId",
+        "outcome",
+        "intervalDays"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
