@@ -9,6 +9,8 @@ The code is `model_adapter.py` and `api_adapter.py`.
 `types/model-adapter.d.ts` types the error payload and nothing else. A request and a result get types once a route sends them.
 The tests are `tests/test_model_adapter.py` and `tests/test_api_adapter.py`.
 The code uses only the Python standard library.
+It needs Python 3.10 or later. The two test files passed on 3.10, 3.11, 3.12, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
+The tests use the explicit range list for address checks and do not depend on the `ipaddress` tables of one Python version.
 Nothing calls these adapters yet. No route, screen, or agent loop uses them in this step.
 
 ## Terms
@@ -135,7 +137,7 @@ The key stays in memory. Step E3 builds no storage for keys. Where keys live on 
 Until that decision is made, the code that creates an adapter must get the key from somewhere itself. That code must not write the key to the event log, a log line, or an error.
 
 What the wrapper does not do: Python cannot hide an object from code in the same process. Code that reads memory, uses the debugger, or walks the object can reach the value.
-Some error reporters record the local variables of every stack frame. Such a tool records the key text in the frame that builds the header. Do not turn that on in a build that uses real keys.
+Some error reporters record the local variables of every stack frame. Such a tool records the key text in the frame that builds the header. Do not turn that on in a build that uses real keys. Such a tool also records a base URL that the caller typed, with any password in it.
 
 If a provider echoes the key, the adapter removes it from the reply text and sets `redacted` and the `notice`. The context guard refuses a message that holds the key.
 
@@ -276,7 +278,7 @@ The operating system and Python's default context decide which certificate autho
 - The adapter does not read a provider's `Retry-After` header.
 - The token count comes from the provider. Schola cannot check the numbers, and the input estimate is rough.
 - A connection that breaks after the request was sent counts as nothing in the budget. A bill can hide there.
-- Windows is untested. The tests ran on macOS with Python 3.14 only.
+- Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.11, 3.12, and 3.14.
 
 ## Not built in this step
 
