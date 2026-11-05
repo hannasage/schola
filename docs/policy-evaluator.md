@@ -6,7 +6,7 @@ Read `docs/model-adapters.md` first for the other half of the engine. Read `cont
 
 The code is `policy_evaluator.py`. The tests are `tests/test_policy_evaluator.py`.
 The code uses only the Python standard library. It needs Python 3.10 or later.
-Nothing calls the evaluator yet. No route, screen, or agent loop uses it in this step. The agent loop is step E6.
+The agent loop (`agent_loop.py`, step E6) is the first caller. No route or screen calls the evaluator yet. See `docs/agent-loop.md`.
 
 ## What this step does and does not do
 
