@@ -310,7 +310,7 @@ A later step can lift this cost by reading only the tail of the file.
 `tests/test_agent_loop.py` uses no network and no real clock. The model is a stub that overrides `_send`. The log is a real `EventLog` in a temporary folder.
 The clock and the ids are injected.
 
-The 153 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS. The 197 tests of the evaluator also passed on the same four versions.
+The 155 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS. The 197 tests of the evaluator also passed on the same four versions.
 
 - It builds a schema-valid `agent_offer` event for each kind of offer (hint, recall, review) and runs it through `learning_event.validate_event`.
 - It checks every reason code and the kind that goes with it.
@@ -329,5 +329,24 @@ The 153 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS. The 197 tes
 
 A stub model replaces the real one. No test uses a real model, a real network, or a real shell.
 
-A mutation pass changed the key rules one at a time and ran the tests. The first pass made 156 changes. The tests caught 130 and missed 26.
-One of the 26 had a typo in its own pattern and ran nothing. The others were fixed with new tests or with a simpler rule in the code.
+A mutation pass changed the key rules one at a time and ran the tests. The changes cover these rules:
+
+- the cap and the counters
+- the mute checks before and after the call
+- the order of the model call and the write
+- the reads that fail closed
+- the text cleaner
+- the self-mute after 3 failures
+- the single pending offer
+- the locks and the outcome events
+- the session cap floor in the evaluator
+
+- The first pass made 156 changes. The tests caught 130. One change had a typo in its own pattern and ran nothing. The other 25 got new tests or a simpler rule in the code.
+- The second pass made 165 changes: the 156, with the typo fixed, and 9 more. The tests caught 162. Three survived.
+- A third run of those three changes, against the final tests, caught all three.
+
+One of the three needs a note. The change `offset += REBUILD_PAGE - 1` is equivalent at the real page size of 500.
+A line read twice changes nothing, because the loop counts pairs. A test with a page size of one catches it as an endless loop, and the run stops it at a time limit.
+So that kill is real but degenerate.
+
+The mutation script is a throwaway tool. It is not part of the repository.

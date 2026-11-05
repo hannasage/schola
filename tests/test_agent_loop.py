@@ -1329,10 +1329,21 @@ class RestartTests(LoopCase):
             rig.loop.resolve(result.offer.offer_id, 'dismissed')
         for _ in range(20):
             rig.app.hint()
-        with mock.patch.object(al, 'REBUILD_PAGE', 7):
-            again = rig.restart()
-        self.assertEqual((again.offers_this_session, again.last_offer_at), (3, BASE_TIME))
+        for page in (1, 2, 3, 7):
+            with mock.patch.object(al, 'REBUILD_PAGE', page):
+                again = rig.restart()
+            self.assertEqual((again.offers_this_session, again.last_offer_at), (3, BASE_TIME), page)
         self.assertGreater(al.REBUILD_PAGE, 7)
+
+    def test_every_line_of_every_page_is_read(self):
+        rig = Rig(self)
+        for index in range(10):  # single events, each a pair of its own: a skipped line would show
+            rig.app.add('agent_offer', {'offeredLevel': 'nudge', 'triggerEventId': f'{index:08x}-0000-4000-8000-0000000000bb', 'outcome': 'pending',
+                                        'policyId': 'fail-hint'}, source='agent')
+            rig.app.hint()
+        for page in (1, 2, 3, 4, 5, 20, 21, 500):
+            with mock.patch.object(al, 'REBUILD_PAGE', page):
+                self.assertEqual(rig.restart().offers_this_session, 10, page)
 
     def test_a_damaged_log_at_start_blocks_offers_until_it_is_whole(self):
         rig = Rig(self)
@@ -1617,6 +1628,10 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(al.clean_offer_text('a\u0301\u0301 \u0301\u0301b'), 'a\u0301\u0301 \u0301\u0301b')
         self.assertEqual(al.clean_offer_text('a' + '\u20dd' * 10), 'a\u20dd\u20dd')
         self.assertEqual(al.clean_offer_text('a\u0301\u20dd\u0301\u20dd'), 'a\u0301\u20dd')
+
+    def test_a_link_past_the_cut_still_refuses_the_text(self):
+        self.assertIsNone(al.clean_offer_text('Want a hint? ' + 'a' * 300 + ' https://x.test'))
+        self.assertEqual(len(al.clean_offer_text('Want a hint? ' + 'a' * 300)), 280)
 
     def test_a_cut_that_ends_in_a_web_address_is_refused(self):
         self.assertIsNone(al.clean_offer_text('a' * 272 + ' foo.community'))
