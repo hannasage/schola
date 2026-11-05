@@ -187,6 +187,30 @@ Recovery restores a damaged `record.json` from its backup.
 - `PUT /api/state`, `PUT /api/curricula`, `PUT /api/library`, and `PUT /api/records/<id>` write (`server.py:232-254`).
 - `POST /api/import/preview` writes nothing. `POST /api/import` and `POST /api/recovery` write (`server.py:256-277`, `local_store.py:453-501`).
 
+## Added by the event log step (E2)
+
+This page was written before any change to storage. The event log step adds one folder to the data folder.
+`docs/event-log.md` describes it in full. The older sections above stay as they were.
+
+```text
+<data-dir>/
+  _events/
+    events.jsonl
+    .events.lock
+    reflections/
+      <reflection-id>.json
+```
+
+- `events.jsonl` is the learning event log. It follows `contracts/learning-events.md`. The store only appends to it (`event_log.py`).
+- `.events.lock` is the lock file. It holds no data and the store never deletes it.
+- `reflections/<reflection-id>.json` holds one reflection. The name is a random lowercase UUID. The file holds `version`, `reflectionId`, `charCount`, and `text`.
+- The folder name starts with the character `_`, as `_lessons/` does. No curriculum id starts with that character.
+- The store creates folders with mode `0700` and files with mode `0600`.
+- Older builds ignore the folder. The record, library, and recovery code never reads or writes it.
+- The routes are `POST /api/events`, `GET /api/events`, `GET /api/events/export`, `DELETE /api/events`, `POST /api/reflections`, and `GET /api/reflections/<id>`. All need the session token (`event_routes.py`).
+- The log is local and is not encrypted. Any program that runs as the student can read it. The privacy limits are those of the contract and of `docs/event-log.md`.
+- A request body for these routes has a limit of 262,144 bytes.
+
 ## Not covered here
 
 - The storage of the native iOS app. This page did not read it.
