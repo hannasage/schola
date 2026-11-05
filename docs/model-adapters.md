@@ -81,7 +81,7 @@ A message never holds the key, the URL, the address, the error text of the opera
 Schola never reads the body of a provider error.
 Schola raises an error after the code that caught the problem ends. So the error chains no other error. A chained error can hold such text.
 Schola turns an unexpected failure inside an adapter into `bad_response`. If the original had a `retryable` flag, the error keeps it.
-Schola writes the type and the traceback of the original to the logger `schola.model_adapter`, with every held key replaced by `[redacted]`. The logger prints nothing until the application adds a handler.
+Schola writes only the type of the original and the file, line, and function of each frame to the logger `schola.model_adapter`. It drops the message. The message can hold a key or a path. The logger prints nothing until the application adds a handler.
 An out-of-memory failure is not turned into an error. It goes through.
 
 ## The token budget
@@ -93,36 +93,44 @@ An out-of-memory failure is not turned into an error. It goes through.
 - `remaining` and `exhausted` count the holds of running calls. While a call runs, `remaining` is smaller by its hold.
 - A cap that is small next to `max_output_tokens` refuses every call. Pick a `max_output_tokens` that is well below the cap.
 - After a call, the budget swaps the hold for the tokens the response reports: input plus output.
-- If the response has no usable usage numbers, the budget counts `max_output_tokens` as spent. The result says so: `usage_reported` is false, `usage` is empty, and `notice` explains. A usage that is present but wrong is treated the same way. Examples are a negative number, a number that is not whole, and only one of the two counts.
-- A usage of zero tokens next to a reply that has text is also treated as missing. A reply with text cannot cost nothing. A reply with no text and zero usage is taken as it is.
+- Schola raises that charge to a floor. The floor is the input estimate divided by 4, plus the number of reply characters divided by 8. A provider that under-counts then costs at least this much. The `notice` says so.
+- No charge goes above twice the hold. Schola puts a line in the `notice` for each cap.
+- If the response has no usable usage numbers, the budget counts the whole hold as spent. The result says so: `usage_reported` is false, `usage` is empty, and `notice` explains.
+- These cases count as no usable usage: a field that is missing, a negative number, a number that is not whole, and only one of the two counts.
+- An input count of zero is also unusable, with text or without. The provider read the input, so zero cannot be right.
 - Schola ignores `total_tokens`. The two counts decide.
+- The budget takes a charge that is a plain whole number of 0 or more. A subclass or an error that hands over anything else is charged the whole hold.
 
-One call can still pass the cap. The estimate can be too low, and the provider counts its own way. When that happens, the overshoot is the difference between what the provider reported and the hold. The next call is then refused.
+One call can still pass the cap. The estimate can be too low, and the provider counts its own way. The overshoot is at most the hold, because no charge goes above twice the hold. The next call is then refused.
 Twenty calls that run at the same time cannot take more holds than the cap allows. So the total overshoot is the sum of those differences, not the sum of the whole calls.
+The estimate is rough. It suits Latin text. Text in Chinese or Japanese costs about one token a character, so the estimate runs low there and the overshoot grows.
 
 ## What a failed call costs
 
 A reply that arrived but cannot be used was still billed. A request that was sent and never answered was probably billed too. The budget counts them.
+A charge for a failure is the whole hold unless the text says otherwise. The whole hold is the input estimate plus `max_output_tokens`.
 
-- A 200 reply whose body cannot be used: the budget counts the `usage` the body carries. If `usage` cannot be read, the budget counts `max_output_tokens`. These cases belong here:
+- A 200 reply whose body cannot be used: the budget counts the `usage` the body carries. If `usage` cannot be read, the budget counts the whole hold. These cases belong here:
   - a null `content` with no refusal
   - an empty `choices` list
   - a wrong shape or a broken JSON body
   - a reply that is too large
   - a reply with the wrong type, or with compression
-  - a body that ends early
+  - a length header that cannot be read
+- A 200 reply whose body breaks in the middle counts the whole hold. This covers a reset, a cut chunk, a chunk line that is too long, and a body that ends early. Schola counts it like a body that ends before its declared length.
 - A 200 reply that holds an `error` object counts as an error from the provider. The budget counts nothing. The one exception is a reply that carries `usage`. Then the budget counts that.
-- A timeout after the request was fully sent: the budget counts `max_output_tokens`.
+- A timeout after the request was fully sent: the budget counts the whole hold.
+- An interrupt (such as Ctrl-C), or an out-of-memory failure, after the send began: the budget counts the whole hold, because the request can have gone out. Before the send began, it counts nothing.
 - A refusal from the provider, with no text, is a reply, not an error. It comes back with the stop reason `content_filter` and its usage.
 - A call to a tool, with no text, is a reply too. It comes back with the stop reason `other` and its usage.
 - Everything else counts nothing. That covers these cases:
   - a connect failure, a name lookup failure, or a TLS failure
-  - a timeout before the request was sent
+  - a timeout before the request was sent, or while it was still going out
   - a redirect
   - any HTTP status other than 200 (401, 402, 403, 429, 4xx, 5xx)
-  - a connection that breaks after the request was sent. This case can hide a bill that Schola does not see.
+  - a connection that breaks before any reply came back. This case can hide a bill that Schola does not see.
 
-A caller that retries on a retryable error cannot loop forever. Each billed failure fills the budget, and the loop ends with `token_cap_reached`.
+A failure that counts nothing can repeat without end. A 429, a 5xx, a connect failure, and a reset all count nothing. A caller that retries on a retryable error needs its own limit on attempts. Only billed failures fill the budget and end a retry loop with `token_cap_reached`.
 
 ## The API key
 
@@ -144,11 +152,22 @@ If a provider echoes the key, the adapter removes it from the reply text and set
 ## The context guard
 
 The model must not see keys or files that it must not see. `context_guard(messages, allowed_paths, secrets)` is a small check. The shared `complete` runs it on every request.
-It first folds the text to a plain form (Unicode NFKC) and removes zero-width and other invisible characters. It scans that text. It also scans a second copy with all spaces and line breaks removed, so a key cut by spaces or lines still shows.
+It first folds the text to a plain form (Unicode NFKC). It scans three views of the text.
+
+- The key view has the invisible characters deleted. Three Unicode classes count:
+  - format marks (Cf)
+  - control codes that are not white space (Cc)
+  - combining marks (Mn and Me)
+  - the blank fillers U+115F, U+1160, U+3164, U+FFA0, and U+2800
+  - variation selectors and tag characters (they fall in the classes above)
+- The compact view is the key view with all spaces and line breaks removed. A key cut by spaces or lines still shows. Schola also joins the compact views of all messages and looks for key shapes in the joined text. A key split over two messages shows.
+- The path view turns each invisible character into a space instead. So `open\u200b/etc/passwd` reads as `open /etc/passwd`.
+
+The key view and the path view differ on purpose. Deleting a character can glue a word onto a path.
 It raises `invalid_request` for a message that does one of these things:
 
 - It holds a key that the adapter holds (exact match). Schola also looks for the key in all messages joined together.
-- It holds text with the shape of a common secret. These shapes count:
+- It holds text with the shape of a common secret. A private key header can have up to 40 capital letters or spaces before and after `PRIVATE KEY`. These shapes count:
   - `sk-` keys (also in capitals), Stripe keys, AWS access keys, and GitHub tokens.
   - Slack tokens, Google keys, Hugging Face tokens, Groq keys, and npm tokens.
   - GitLab tokens (`glpat-`) and SendGrid keys (`SG.`).
@@ -168,12 +187,13 @@ These path forms count:
 - Home paths that start with `~`, Windows drive paths, and `\\server\share`.
 - A `file:` URL, with `//` or with one slash.
 
-A path starts at the start of the text. It also starts after one of these marks: white space, a quote, a bracket, `<`, `>`, `:`, `=`, `,`, `;`, `|`, `&`, or `!`. A slash inside a word starts nothing. So `and/or`, `km/h`, `1/2`, and `и/или` pass.
+A path starts at the start of the text. It also starts after any character that is not part of a word or of a path. Letters, digits, `.`, `_`, `-`, `/`, and `\` are part of a word or a path. A `-` that follows white space can also start a path, as in `x -/etc/passwd`. A slash inside a word starts nothing. So `and/or`, `km/h`, `1/2`, and `и/или` pass.
+A path ends at white space, a quote, a bracket, or one of `< > | * ? , ;`. It also ends at `:`, `=`, `&`, and `!`. A second path glued on with one of those marks is checked on its own. So `/allowed/proj/bin:/etc/passwd` and `--volume /allowed/proj:/etc/shadow` are refused. A line suffix such as `a.py:12:5` is fine. A URL ends at `,`, `;`, and `)` too, so `http://x.com,/etc/passwd` is refused.
 `//word` alone is a comment marker, not a path. `https://host/path` is a URL, not a path. A closing tag such as `</div>` is not a path.
 The error names the message number. It never repeats the text.
 
 `allowed_paths` is a list of absolute folders. The default is the empty list, so by default the guard refuses every absolute path.
-The root of everything (`/`, or a drive such as `C:\`) is refused as an allowed path. Name a folder.
+The root of everything is refused as an allowed path. That means `/`, a drive such as `C:\`, and a bare `\\`. Name a folder.
 A path is inside a root in two cases: it equals the root, or it sits under the root. Schola first cleans the path (it removes `.` and doubled separators). Schola does not follow links. A path of more than 4096 characters is refused.
 A root can hold a space, such as `/Users/x/Sage Advice/y`. A path that starts with that root passes. The match is exact, and for a Windows root it ignores case.
 
@@ -183,7 +203,8 @@ The limits of the guard:
 
 - It is a short list of patterns. It misses keys in formats it does not know. It misses keys that are encoded, or spelled out. A hex digest and an id pass, on purpose.
 - Schola finds a split key only at the start of the text or after a non-letter. A key split after a word is missed.
-- It can refuse harmless text that looks like a key or a path. Teaching text about regular expressions, shell variables, or `password = "..."` examples can trip it. A slash after `<` or `:` starts a path, so `a:/b` is refused.
+- It can refuse harmless text that looks like a key or a path. Teaching text about regular expressions, shell variables, or `password = "..."` examples can trip it. A slash after any mark that is not part of a word starts a path, so `a:/b` and `(/x)` are refused.
+- Look-alike slashes such as U+2215 and U+2044 are not read as slashes. A root-relative Windows path such as `\etc\passwd` is not checked.
 - It does not check relative paths such as `src/main.py`. It checks only for `..` segments.
 - It does not decode percent codes. `%2e%2e/` passes.
 - It does not decide what belongs in a message. Steps E5 and E6 choose what the model sees. That work covers rollups of events, a short window of recent events, fetching a raw event by id, and marking student text as data. The guard stops two kinds of mistakes at the last moment.
@@ -237,11 +258,14 @@ The adapter never follows a redirect. Any answer in the 300 range gives `unsafe_
 
 ### Time and size limits
 
-- Three limits apply. The connect time is 10 seconds by default. The wait for each read is 60 seconds. The whole call takes at most 120 seconds. The caller can set all three, up to 600 seconds. The total must be at least the connect time.
-- One clock covers the whole call: the name lookup, each try to connect, the TLS handshake, the send, and the reply. Each connect try gets the smaller of the connect time and what is left of the total. When the total is gone, Schola stops trying other addresses. A timer closes the socket at the end of the total. A server that sends one byte at a time cannot hold the call.
-- The bound is the total plus a small delay for thread scheduling. A name lookup that hangs is the exception. Schola stops waiting at the deadline, but the lookup keeps its own daemon thread until the system gives up. Each hung lookup leaves one such thread.
+- Three limits apply. The connect time is 10 seconds by default. The wait for each read is 60 seconds. The whole call takes at most 120 seconds. The caller can set all three, up to 600 seconds. The total must be at least the connect time and at least the read time.
+- One clock covers the whole call: the name lookup, each try to connect, the TLS handshake, the send, and the reply. Each connect try gets the smaller of the connect time and what is left of the total. When the total is gone, Schola stops trying other addresses.
+- Every send and every read of the body carries its own limit. The limit is the read time or what is left of the total, whichever is smaller. A timer also shuts the socket at the end of the total. A shutdown from another thread does not reliably wake a blocked send or TLS read on every system. So the limits on the socket are the main bound, and the timer is the backup.
+- A server that never reads the request, or that goes silent after the TLS handshake, ends the call at the total. A server that sends the body one byte at a time ends it at the total too.
+- One case is weaker. A server can send the header lines of the reply one byte at a time. Each wait there has the read time, so only the timer stops this. The timer works on the systems where the tests ran, but Schola cannot promise it for every system.
+- The bound is the total plus a small delay for thread scheduling. The tests allow 0.6 seconds of delay. A name lookup that hangs is the exception. Schola stops waiting at the deadline, but the lookup keeps its own daemon thread until the system gives up. Each hung lookup leaves one such thread.
 - Schola reads the reply in pieces. It refuses the reply with `response_too_large` once the reply passes 1 MB (1,000,000 bytes). If the declared length is already bigger, it refuses at once. The caller can set the cap up to 10 MB.
-- The reply must have the type `application/json` or an `application/` type that ends in `+json`, no compression, and a `utf-8` charset or none.
+- The reply must have the type `application/json` or an `application/` type that ends in `+json`, no compression, and a `utf-8` charset or none. A `Content-Length` must be plain ASCII digits. Anything else is billed like an unreadable body.
 - The reply must be one JSON object with `choices[0].message.content` as text. Schola refuses numbers of more than 18 digits, `NaN`, and invalid text. Anything else gives `bad_response`. Schola uses only the first choice. An empty `choices` list has its own message.
 - A null `content` can still be a reply.
   - With a `refusal` or the `finish_reason` `content_filter`, the call returns an empty text and the stop reason `content_filter`.
@@ -266,10 +290,11 @@ The status table:
 TLS is the encryption that `https` uses. For `https`, the adapter uses a context that checks certificates and host names and allows TLS 1.2 or later only.
 
 - With no `ssl_context`, the adapter builds the default context. A lowest version below TLS 1.2 goes up to TLS 1.2.
-- You can pass your own context. The adapter refuses a context that skips the certificate check or the host name check. It also refuses a context whose highest version is below TLS 1.2.
+- You can pass your own context. The adapter refuses a context that skips the certificate check or the host name check. It also refuses a context whose highest version is below TLS 1.2, or below its own lowest version. The adapter makes these checks first. A refused context stays as it was.
 - Some systems report a plain context with no lowest version at all (`MINIMUM_SUPPORTED`). The adapter does not refuse such a context. It raises the lowest version to TLS 1.2 on the context you passed in. Your context changes.
 - To set it yourself: `context = ssl.create_default_context(); context.minimum_version = ssl.TLSVersion.TLSv1_2`.
 - A lowest version above TLS 1.2 stays as it is.
+- A context that two adapters share changes for both. Another thread can also change a context between the check and the connect. The connect-time check below catches the change, but only the checks it makes.
 
 The adapter checks the context again at connect time. A change made after the adapter was built does not open a hole. A failed check at that point gives `unsafe_endpoint`. A failed certificate check on the server gives `endpoint_unreachable` and is not retryable.
 The operating system and Python's default context decide which certificate authorities are trusted.
@@ -282,10 +307,13 @@ The operating system and Python's default context decide which certificate autho
 - The HTTPS path is tested against a loopback server with a certificate made at test time. It needs the `openssl` program. The tests skip without it. A public certificate chain is not tested.
 - The address rules rest on Python's `ipaddress` module and on a fixed list of ranges. Its tables of special addresses change between Python versions.
 - DNS lookups use the system resolver. Nothing cancels a lookup that hangs. The call stops waiting at the deadline.
-- The adapter does not retry. `retryable` is information for the caller.
+- The adapter does not retry. `retryable` is information for the caller, and the caller needs its own limit on attempts.
+- A name lookup that outlasts the connect time leaves one daemon thread until the system gives up.
+- A 200 reply with `"error": false` or `"error": {}` next to valid choices is refused, because any `error` value that is not null counts as an error.
+- A whole number of more than 18 digits anywhere in a reply gets the whole reply refused.
 - The adapter does not read a provider's `Retry-After` header.
 - The token count comes from the provider. Schola cannot check the numbers, and the input estimate is rough.
-- A connection that breaks after the request was sent counts as nothing in the budget. A bill can hide there.
+- A connection that breaks before any reply byte arrives counts as nothing in the budget. The provider can still bill for such a call. Schola cannot see it.
 - Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.11, 3.12, and 3.14.
 
 ## Not built in this step
