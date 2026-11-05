@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "1.1",
+  "id": "script-check-module",
+  "version": "1.0.0",
+  "title": "A lesson module with script checks",
+  "outcome": "The student can state one fact about the lesson.",
+  "blocks": [
+    {
+      "type": "text",
+      "id": "intro",
+      "body": "Read this short text."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-1",
+      "prompt": "State the fact in one sentence.",
+      "hints": [
+        {
+          "level": "nudge",
+          "text": "Look again at the first sentence of task 1."
+        },
+        {
+          "level": "question",
+          "text": "What result do you expect from task 1 before you run anything?"
+        },
+        {
+          "level": "partial-example",
+          "text": "Here is the first step of task 1. Finish the rest yourself."
+        },
+        {
+          "level": "full-answer",
+          "text": "Here is a complete answer to task 1."
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "id": "run-script",
+      "kind": "automated",
+      "description": "A script checks the work.",
+      "runner": {
+        "type": "script"
+      },
+      "runtime": "python3",
+      "source": "import os\nimport sys\n\nif not os.path.exists(\"notes.txt\"):\n    print(\"notes.txt is missing\")\n    sys.exit(1)\nprint(\"ok\")\n",
+      "args": [
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+        "a4",
+        "a5",
+        "a6",
+        "a7",
+        "a8"
+      ]
+    }
+  ],
+  "prerequisites": [],
+  "license": {
+    "id": "CC-BY-4.0"
+  }
+}

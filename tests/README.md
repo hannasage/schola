@@ -109,5 +109,39 @@ It checks that a curriculum import still uses the older review.
 `tests/lessons-dialog.test.mjs` runs the import dialog against a fake document and a fake server.
 It covers Cancel and Escape, a failed list after an import, a failed pin switch, and a reload that fails after a failed switch.
 
+Check runner checks cover the built-in checks and the rules that keep them inside the student's workspace:
+
+```sh
+python3 -m unittest -v tests.test_check_runner
+```
+
+The tests build their own folders under a temporary directory. They cover `..` paths, absolute paths, NUL bytes, long paths, links that leave the folder, a link swapped in after the path check, named pipes, sockets, device files, files over the size cap, and a pattern that would run forever.
+
+The git commit check, against repositories built at test time that try to run programs:
+
+```sh
+python3 -m unittest -v tests.test_check_git
+```
+
+Each hostile repository names a marker script in its config, in its hooks, and in an included file. A control step first runs a git command that is known to run the script, so an empty marker folder means something. The tests skip when git is not installed.
+
+Script checks (tier 2), the schema version 1.1 fixtures, and the limits:
+
+```sh
+python3 -m unittest -v tests.test_check_script
+node --test tests/lesson-contracts.test.mjs tests/lesson-python-parity.test.mjs
+```
+
+The script tests run real `python3` and `node` scripts. They cover a missing or wrong consent (no process starts, shown with a patched `subprocess`), a changed script, the scratch copy and its caps, a link that leaves the workspace, a clean environment that holds no secret, a timeout that kills a child, an output flood, a child left behind, the file, open-file, and process limits, a limit that cannot be set, and a second run that gets `busy`. Two tests record what a consented script can still do, so the documentation stays true. One test sends a lesson with a script check through the import route, the consent route, the run route, and the lesson backup. The process limit test forks at most 400 short-lived children. The Node tests check that the Python and Node validators agree on the script fixtures.
+
+The check routes, the token, the workspace setting, and consent:
+
+```sh
+python3 -m unittest -v tests.test_check_routes
+node --test tests/check-consent.test.mjs
+```
+
+The route tests start a server that handles requests at the same time, so they can check the busy answer. They cover a missing and a wrong token, a foreign Host and Origin, unsafe workspace folders, consent bound to a hash and a folder, and a run request that tries to grant consent. The Node test runs the check service and the consent screen against a fake server and a fake document. It checks that Cancel makes no call and that server text is shown as text only.
+
 The golden data in `tests/fixtures/storage/pre-s03/` is the data folder as it was before lessons.
 A test loads it and checks that no byte changes.

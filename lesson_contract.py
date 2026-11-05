@@ -576,6 +576,38 @@ def _module_errors(module):
     for index, identifier in enumerate(module['prerequisites']):
         if identifier == module['id']:
             errors.append(_error(_pointer('prerequisites', index), 'A module cannot list itself as a prerequisite.'))
+    errors.extend(_script_errors(module))
+    return errors
+
+
+_MINOR = re.compile(r'^1\.([0-9]+)$')
+_LONE_SURROGATE = re.compile('[\ud800-\udfff]')
+SCRIPT_FIELDS = ('runtime', 'source', 'args', 'timeoutSeconds')
+# The largest script, in UTF-8 bytes. The schema counts characters, so the byte limit is checked here.
+MAX_SCRIPT_BYTES = 65536
+
+
+def _script_errors(module):
+    """Rules for script checks (schema version 1.1) that the schema cannot state."""
+    errors = []
+    minor = int(_MINOR.match(module['schemaVersion']).group(1))
+    if minor < 1:
+        # Version 1.0 does not define the script fields. A 1.0 script runner with no fields stays valid.
+        if any(field in check for check in module['checks'] for field in SCRIPT_FIELDS):
+            errors.append(_error('/schemaVersion', 'Script check fields need schemaVersion 1.1 or later.'))
+        return errors
+    for index, check in enumerate(module['checks']):
+        runner = check.get('runner')
+        if isinstance(runner, dict) and runner.get('type') == 'script':
+            for field in ('runtime', 'source'):
+                if field not in check:
+                    errors.append(_error(_pointer('checks', index, field), f'A script check needs the field {field}.'))
+        source = check.get('source')
+        if isinstance(source, str):
+            if _LONE_SURROGATE.search(source):
+                errors.append(_error(_pointer('checks', index, 'source'), 'The script holds a character that is not valid text.'))
+            elif len(source.encode('utf-8')) > MAX_SCRIPT_BYTES:
+                errors.append(_error(_pointer('checks', index, 'source'), f'The script is larger than {MAX_SCRIPT_BYTES} bytes.'))
     return errors
 
 

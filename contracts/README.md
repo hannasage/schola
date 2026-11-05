@@ -79,7 +79,7 @@ Every object is closed. The `runner` descriptor of a check is closed too, but it
 
 ### Choices and their reasons
 
-- `schemaVersion` is a string in the form `MAJOR.MINOR`, such as `1.0`. The schemas accept major version 1 and any minor number. Objects are closed, so a document with new fields needs a schema that knows them. A reader that sees an unknown field in a `1.x` document reports it as invalid.
+- `schemaVersion` is a string in the form `MAJOR.MINOR`, such as `1.0`. Minor version 1 added the script check fields. The schemas accept major version 1 and any minor number. Objects are closed, so a document with new fields needs a schema that knows them. A reader that sees an unknown field in a `1.x` document reports it as invalid.
 - The content `version` of a module and a packet is a three-part string such as `1.2.0`. A plain integer cannot tell a fix from a new feature. A pre-release suffix is not allowed. A packet entry must name one exact version, never a range.
 - Ids use lowercase letters, digits, and hyphens, start with a letter or digit, and hold at most 60 characters. This pattern is stricter than the curriculum module id pattern, so ids are safe in file names and links.
 - Block, task, and check ids use the same pattern. They are unique inside one module.
@@ -87,7 +87,7 @@ Every object is closed. The `runner` descriptor of a check is closed too, but it
 - A task holds a prompt and a hint ladder. The ladder has exactly four entries. The levels are `nudge`, `question`, `partial-example`, and `full-answer`, in that order. The schema enforces the order. The validator also checks it as a backstop.
 - Text fields (`title`, `outcome`, task `prompt`, check `description`, and block `body`) need at least one visible character. White space, the zero-width characters U+200B to U+200D, U+2060, and U+FEFF do not count.
 - A link in a `source-link` block or in `license` uses `http` or `https`. It has no user information before the host. It holds no control character (U+0000 to U+001F and U+007F) and no bidirectional override (U+202A to U+202E and U+2066 to U+2069). An `@` in the path or query is allowed.
-- A check has a `kind`. The kind `automated` needs a `runner` descriptor. The kind `self-reported` must not have one.
+- A check has a `kind`. The kind `automated` needs a `runner` descriptor. The kind `self-reported` must not have one. A `script` runner also needs `runtime` and `source` from schema version 1.1.
 - A harness reference holds an id and `requiredPermissions`. The list is empty or holds names from a closed set. The set is the tutor call surface: `get_lesson`, `get_attempt`, `run_check`, `request_hint`, and `log_reflection`. A harness may add context. It never widens what an agent may do, so no other permission name is valid.
 - `prerequisites` is a list of module ids. It is advice only. A reader warns about a missing prerequisite and never blocks on it.
 - `license` is an object with an `id`, such as an SPDX identifier, and an optional link.
@@ -95,7 +95,48 @@ Every object is closed. The `runner` descriptor of a check is closed too, but it
 
 ### Checks hold descriptors, not code
 
-The module contract does not hold executable code in a check. A check holds a `description` and, for an automated check, a `runner` descriptor. A runner descriptor is data only. The validator never executes it. Nothing may use it to grant permissions. A runner reads the descriptor and decides what to do. The `interactive-code` block holds starter text for the student to edit. It is data. No reader may run it or any runner field unless the reader first shows the student what will run and the student agrees.
+In schema version 1.0, a check holds a `description` and, for an automated check, a `runner` descriptor. A runner descriptor is data only. The validator never executes it. Nothing may use it to grant permissions. A runner reads the descriptor and decides what to do. The `interactive-code` block holds starter text for the student to edit. It is data. No reader may run it or any runner field unless the reader first shows the student what will run and the student agrees.
+
+Schema version 1.1 adds one case. A check whose runner type is `script` also holds the text of a script. See "Script checks" below. A script is still data to the validator, and a reader still runs nothing until the student sees the script and agrees.
+
+### Built-in check runners
+
+The local app runs a small set of check types itself. They run no creator code. A runner descriptor names one of them in `type` and adds the fields below. The rules for all of them:
+
+- Every path is relative to the student's workspace folder. It uses `/` between parts. It may not be absolute, hold `..`, a backslash, a drive letter, a NUL byte, or any control character, or be longer than 1,024 bytes. A part may hold at most 255 bytes, and a path at most 32 parts.
+- A symbolic link that leaves the workspace is never followed. A link that stays inside is allowed.
+- A runner never opens a device, a named pipe, or a socket. It reads at most 1,000,000 bytes of a file. A larger file gives an `error` result.
+- A field that the type does not list is an `error`, not a hint to ignore.
+- An unknown `type` gives the status `skipped`, never `passed`. The student then reports the result by hand.
+
+The types:
+
+- `file-exists`: `path` (required), `kind` (`file`, `directory`, or `any`, default `file`), `nonEmpty` (boolean, files only).
+- `text-match`: `path` (required), and exactly one of `text` or `pattern`. `text` is a literal substring. `pattern` is a regular expression of at most 200 characters, run in a separate process that is stopped after two seconds. `ignoreCase` (boolean) and `minCount` (integer from 1 to 1,000, default 1) are optional.
+- `json-valid`: `path` (required), `topLevel` (`any`, `object`, or `array`, default `any`), and `requiredKeys` (a list of top-level key names).
+
+- `git-commit-exists`: `minCommits` (integer from 1 to 1,000, default 1), `messageContains` (a literal text of 1 to 500 characters), and `ignoreCase` (boolean). Without `messageContains`, the check counts the commits reachable from `HEAD`. With it, the check counts the commits among the newest 500 whose message holds the text. The workspace must be a git repository that the current user owns. Its `.git` entry must be a real folder, or a plain file (a gitfile) that names a folder inside the workspace. The repository config may hold only plain-data settings. A partial clone, a setting that names a program, an `include`, and a promisor pack are refused.
+
+A run returns a `status` of `passed`, `failed`, `error`, or `skipped`, a small flat `evidence` object, and a short `log`. The evidence of a built-in check holds counts and names, not the content of a student file. A script check is different: its evidence holds the first 500 characters of the script's output, and a script can print the content of a file it reads. Treat the evidence of a script check as readable by the student and by the student's agent.
+
+### Script checks (schemaVersion 1.1)
+
+A check of kind `automated` whose runner is `{ "type": "script" }` holds a script that the local app can run after the student agrees. The script fields sit on the check, next to the `runner`, because the flat `runner` cannot hold a script.
+
+- `runtime` is required. It is `python3` or `node`.
+- `source` is required. It is the script text. It is UTF-8, at most 65,536 bytes, and holds no NUL byte and no lone surrogate. The schema limits the length to 65,536 characters. The validators also count bytes, so 22,000 characters of three bytes each are too large.
+- `args` is optional. It is a list of at most 8 texts of at most 200 characters, with no NUL byte. The app passes each one as a separate argument. No shell reads them.
+- `timeoutSeconds` is optional. It is a whole number from 1 to 120. The default is 30.
+
+The `runner` of a script check holds only `type`. The script fields are allowed only on a check whose runner type is `script`. A check of kind `self-reported` or a check with another runner type must not hold them.
+
+The version rule: these fields exist from schema version 1.1. A document with `schemaVersion` `1.0` that holds any of them is invalid, and the error points at `/schemaVersion`. A document with `schemaVersion` `1.1` or later that has a `script` runner must hold `runtime` and `source`. A `1.0` document with `{ "type": "script" }` and no fields stays valid, as it was. A reader that cannot run it skips the check, and the student reports the result by hand.
+
+The change is additive. The schema file keeps the identifier `urn:schola:contract:lesson-module:v1`. Every earlier fixture and test passes unchanged. The Python and Node validators apply the same rules and give the same answers on every fixture.
+
+`timeoutSeconds` may be written as a whole-number float such as `30.0`. JSON Schema counts it as an integer, both validators accept it, and the runtime treats it as `30`.
+
+A reader must treat the script as untrusted. It shows the runtime, the arguments, the time limit, and the script to the student. It records the student's agreement for the SHA-256 hash of everything that would run. See [Release and recovery](../docs/RELEASE.md#local-checks) for how Schola runs one and what it does not protect.
 
 ### Help records and the full answer
 

@@ -84,6 +84,39 @@ function moduleErrors(module) {
       errors.push({ pointer: pointerOf('prerequisites', index), message: 'A module cannot list itself as a prerequisite.' });
     }
   });
+  errors.push(...scriptErrors(module));
+  return errors;
+}
+
+const SCRIPT_FIELDS = Object.freeze(['runtime', 'source', 'args', 'timeoutSeconds']);
+/** The largest script, in UTF-8 bytes. The schema counts characters, so the byte limit is checked here. */
+export const MAX_SCRIPT_BYTES = 65536;
+
+/** Rules for script checks (schema version 1.1) that the schema cannot state. */
+function scriptErrors(module) {
+  const errors = [];
+  const minor = Number(/^1\.(\d+)$/.exec(module.schemaVersion)[1]);
+  if (minor < 1) {
+    // Version 1.0 does not define the script fields. A 1.0 script runner with no fields stays valid.
+    if (module.checks.some((check) => SCRIPT_FIELDS.some((field) => Object.hasOwn(check, field)))) {
+      errors.push({ pointer: '/schemaVersion', message: 'Script check fields need schemaVersion 1.1 or later.' });
+    }
+    return errors;
+  }
+  module.checks.forEach((check, index) => {
+    if (isObject(check.runner) && check.runner.type === 'script') {
+      for (const field of ['runtime', 'source']) {
+        if (!Object.hasOwn(check, field)) errors.push({ pointer: pointerOf('checks', index, field), message: `A script check needs the field ${field}.` });
+      }
+    }
+    if (typeof check.source === 'string') {
+      if (/\p{Cs}/u.test(check.source)) {
+        errors.push({ pointer: pointerOf('checks', index, 'source'), message: 'The script holds a character that is not valid text.' });
+      } else if (Buffer.byteLength(check.source, 'utf8') > MAX_SCRIPT_BYTES) {
+        errors.push({ pointer: pointerOf('checks', index, 'source'), message: `The script is larger than ${MAX_SCRIPT_BYTES} bytes.` });
+      }
+    }
+  });
   return errors;
 }
 

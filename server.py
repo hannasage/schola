@@ -6,6 +6,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
 from local_store import LocalStore, StoreError, finite_json, strict_keys, validate_origin
+import check_routes
 import lesson_routes
 from lesson_store import LessonStore
 
@@ -236,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < size <= limit:
             if size > limit:
                 self.drain(size)
-            raise StoreError("Backup must be smaller than 2 MB." if limit == 2_000_000 else "Lesson files must be smaller than 5 MB.", "payload_too_large", 413)
+            raise StoreError({2_000_000: "Backup must be smaller than 2 MB.", lesson_routes.BODY_LIMIT: "Lesson files must be smaller than 5 MB."}.get(limit, "This request must be smaller than 64 KB."), "payload_too_large", 413)
         try:
             raw = self.rfile.read(size)
         except TimeoutError:
@@ -253,6 +254,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.forbidden()
         path = urlsplit(self.path).path
         try:
+            if path in check_routes.GET_ROUTES:
+                return self.lesson_response(lambda: check_routes.handle_get(self.server, self.lessons(), path, self.headers))
             if path in lesson_routes.GET_ROUTES:
                 return self.lesson_response(lambda: lesson_routes.handle_get(self.lessons(), path))
             if path == "/api/recovery":
@@ -309,10 +312,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.forbidden()
         route = urlsplit(self.path).path
         lesson = route in lesson_routes.POST_ROUTES
-        if not lesson and route not in ("/api/import", "/api/import/preview", "/api/recovery"):
+        check = route in check_routes.POST_ROUTES
+        if not lesson and not check and route not in ("/api/import", "/api/import/preview", "/api/recovery"):
             return self.not_found()
         try:
-            payload = self.body(lesson_routes.BODY_LIMIT if lesson else 2_000_000)
+            payload = self.body(lesson_routes.BODY_LIMIT if lesson else check_routes.BODY_LIMIT if check else 2_000_000)
+            if check:
+                return self.lesson_response(lambda: check_routes.handle_post(self.server, self.lessons(), route, payload, self.headers))
             if lesson:
                 return self.lesson_response(lambda: lesson_routes.handle_post(self.lessons(), route, payload, self.store() if route.endswith("/migrate") else None))
             if urlsplit(self.path).path == "/api/recovery":
@@ -338,6 +344,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     server.data_dir = args.data_dir
+    check_routes.session_for(server)  # the check token is made when the server starts
     print(f"Schola is ready at http://127.0.0.1:{args.port}", flush=True)
     try:
         server.serve_forever()

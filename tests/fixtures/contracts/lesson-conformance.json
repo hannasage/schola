@@ -306,5 +306,152 @@
     "file": "invalid/help-record-unknown-major.json",
     "expect": "invalid:unsupported_version",
     "stage": "version"
+  },
+  {
+    "name": "lesson-module-script-check",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-check.json",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "lesson-module-script-source-too-large",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-source-too-large.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-source-at-the-limit",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-source-at-the-limit.json",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "lesson-module-script-source-too-many-bytes",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-source-too-many-bytes.json",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "lesson-module-script-source-exact-bytes",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-source-exact-bytes.json",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "lesson-module-script-unknown-runtime",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-unknown-runtime.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-too-many-args",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-too-many-args.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-eight-args",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-eight-args.json",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "lesson-module-script-long-arg",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-long-arg.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-source-nul",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-source-nul.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-fields-in-version-1-0",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-fields-in-version-1-0.json",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "lesson-module-script-missing-source",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-missing-source.json",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "lesson-module-script-missing-runtime",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-missing-runtime.json",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "lesson-module-script-fields-on-built-in-runner",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-fields-on-built-in-runner.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-fields-on-self-reported",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-fields-on-self-reported.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-timeout-zero",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-timeout-zero.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-timeout-too-long",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-timeout-too-long.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-timeout-not-integer",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-timeout-not-integer.json",
+    "expect": "invalid:invalid",
+    "stage": "schema"
+  },
+  {
+    "name": "lesson-module-script-lone-surrogate",
+    "kind": "lesson-module",
+    "file": "invalid/lesson-module-script-lone-surrogate.json",
+    "expect": "invalid:invalid",
+    "stage": "semantic"
+  },
+  {
+    "name": "lesson-module-script-version-1-0-runner-only",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-version-1-0-runner-only.json",
+    "expect": "valid",
+    "stage": "none"
+  },
+  {
+    "name": "lesson-module-script-timeout-whole-float",
+    "kind": "lesson-module",
+    "file": "valid/lesson-module-script-timeout-whole-float.json",
+    "expect": "valid",
+    "stage": "none"
   }
 ]

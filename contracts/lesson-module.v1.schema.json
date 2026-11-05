@@ -285,6 +285,27 @@
         },
         "runner": {
           "$ref": "#/$defs/runner"
+        },
+        "runtime": {
+          "enum": [
+            "python3",
+            "node"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/scriptSource"
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/scriptArgument"
+          }
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
         }
       },
       "required": [
@@ -317,6 +338,34 @@
           "else": {
             "properties": {
               "runner": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runner": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "script"
+                  }
+                },
+                "required": [
+                  "type"
+                ]
+              }
+            },
+            "required": [
+              "runner"
+            ]
+          },
+          "else": {
+            "properties": {
+              "runtime": false,
+              "source": false,
+              "args": false,
+              "timeoutSeconds": false
             }
           }
         }
@@ -369,6 +418,17 @@
           }
         ]
       }
+    },
+    "scriptSource": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "pattern": "^[^\\u0000]*$"
+    },
+    "scriptArgument": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[^\\u0000]*$"
     },
     "harness": {
       "type": "object",
