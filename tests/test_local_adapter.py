@@ -3,6 +3,8 @@
 A fake model server runs on a loopback port in a thread. The tests never start a real runtime, never call the default ports of one,
 and never use the real network. Where a test builds a preset, it sends the call to the fake server by replacing `socket.create_connection`.
 """
+import dataclasses
+import errno
 import json
 from pathlib import Path
 import socket
@@ -21,8 +23,11 @@ import local_adapter
 from local_adapter import LocalAdapter
 import model_adapter as ma
 from model_adapter import ApiKey, CompletionRequest, Message, ModelAdapterError, TokenBudget
+import api_adapter
 from test_api_adapter import BODY_SECRET, SECRET, Case, Provider, call, free_port, ok_payload, reply_json, reply_raw, send
 
+NO_USABLE_ID = 'The server listed models, but Schola can use none of the names. Type the model name instead.'
+GENERAL = 'Schola could not reach the endpoint.'
 NOT_LISTENING = 'No local model server answered at that address. Start one, then try again.'
 
 
@@ -74,39 +79,68 @@ class EndpointTests(LocalCase):
         for good in ('llama3.2:latest', 'hf.co/user/model:Q4_K_M', 'qwen2.5-7b-instruct', 'x' * 200):
             LocalAdapter('http://127.0.0.1:1/v1', good)
 
-    def test_a_hostname_that_resolves_anywhere_but_loopback_is_refused_before_any_connection(self):
-        for answer in (['10.0.0.5'], ['8.8.8.8'], ['127.0.0.1', '8.8.8.8'], ['::1', '192.168.0.9'], ['169.254.169.254'], ['::ffff:127.0.0.1'], ['0.0.0.0'], ['not an address']):
-            with self.subTest(answer=answer):
-                def resolver(host, port, *args, **kwargs):
-                    return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (text, port)) for text in answer]
-                adapter = LocalAdapter('http://localhost:11434/v1', 'm', resolver=resolver)
+    def test_only_these_three_spellings_are_accepted_so_other_loopback_addresses_are_refused_on_purpose(self):
+        for url in ('http://127.0.0.2/v1', 'http://127.255.255.254/v1', 'http://[::ffff:127.0.0.1]/v1', 'http://0:11434/v1', 'http://[0:0:0:0:0:0:0:1]/v1',
+                    'http://localhost./v1', 'http://LOCALHOST.:1/v1', 'http://ip6-localhost/v1', 'http://localhost.localdomain/v1', 'http://foo.localhost/v1'):
+            with self.subTest(url=url):
+                self.assertCode('unsafe_endpoint', LocalAdapter, url, 'm')
+
+    def test_any_port_and_path_prefix_on_a_loopback_host_is_accepted(self):
+        for url in ('http://127.0.0.1:1/', 'http://127.0.0.1:65535/a/b/c', 'http://localhost:9999/openai/v1/', 'http://[::1]:3000/v1'):
+            with self.subTest(url=url):
+                LocalAdapter(url, 'm')
+
+    def test_localhost_is_not_looked_up_and_means_two_fixed_addresses(self):
+        self.assertEqual(local_adapter.LOCALHOST_ADDRESSES, ('127.0.0.1', '::1'))
+        adapter = LocalAdapter('http://localhost:11434/v1', 'm')
+        with mock.patch('socket.getaddrinfo', side_effect=AssertionError('no lookup')), mock.patch('threading.Thread', side_effect=AssertionError('no lookup thread')):
+            self.assertEqual(adapter._addresses(), ['127.0.0.1', '::1'])
+        self.assertEqual(LocalAdapter('http://127.0.0.1:1/v1', 'm')._addresses(), ['127.0.0.1'])
+        self.assertEqual(LocalAdapter('http://[::1]:1/v1', 'm')._addresses(), ['::1'])
+        with self.assertRaises(TypeError):
+            LocalAdapter('http://localhost:1/v1', 'm', resolver=lambda *args, **kwargs: [])
+
+    def test_a_bad_address_for_localhost_is_still_refused_on_every_call_before_any_connection(self):
+        for answer in (('10.0.0.5',), ('8.8.8.8',), ('127.0.0.1', '8.8.8.8'), ('::1', '192.168.0.9'), ('169.254.169.254',), ('::ffff:127.0.0.1',), ('0.0.0.0',), ('not an address',)):
+            with self.subTest(answer=answer), mock.patch.object(local_adapter, 'LOCALHOST_ADDRESSES', answer):
+                adapter = LocalAdapter('http://localhost:11434/v1', 'm')
                 with mock.patch('socket.create_connection') as connect:
-                    self.assertCode('unsafe_endpoint', adapter.complete, call())
-                    self.assertCode('unsafe_endpoint', adapter.list_models)
+                    for function in (lambda: adapter.complete(call()), adapter.list_models):
+                        error = self.assertCode('unsafe_endpoint', function, retryable=False)
+                        self.assertEqual(str(error), 'localhost resolved to an address that is not this computer.')
                     connect.assert_not_called()
 
-    def test_the_connection_goes_to_the_address_that_was_checked_and_the_name_is_looked_up_once_a_call(self):
+    def test_the_connection_goes_to_the_fixed_address_and_the_name_stays_in_the_host_header(self):
         provider = self.provider()
-        lookups = []
-
-        def resolver(host, port, *args, **kwargs):
-            lookups.append(host)
-            address = '127.0.0.1' if len(lookups) == 1 else '8.8.8.8'  # a second answer would be a rebinding
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (address, port))]
-        adapter = LocalAdapter(f'http://localhost:{provider.port}/v1', 'm', resolver=resolver)
+        adapter = LocalAdapter(f'http://localhost:{provider.port}/v1', 'm')
         self.assertEqual(adapter.complete(call()).text, 'Hello from the model.')
-        self.assertEqual(lookups, ['localhost'])
         self.assertEqual(provider.requests[0]['headers']['host'], f'localhost:{provider.port}')
 
-    def test_a_literal_loopback_address_needs_no_lookup(self):
-        provider = self.provider()
-        adapter = LocalAdapter(provider.url(), 'm', resolver=mock.Mock(side_effect=AssertionError('no lookup')))
-        adapter.complete(call())
+    def test_a_completion_and_a_list_work_through_the_name_localhost(self):
+        provider = self.provider(lambda handler, body: reply_json(models_payload('a') if handler.command == 'GET' else ok_payload())(handler, body))
+        adapter = LocalAdapter(f'http://localhost:{provider.port}/v1', 'm')
+        self.assertEqual(adapter.complete(call()).stop_reason, 'end')
+        self.assertEqual(adapter.list_models().ids, ('a',))
 
-    def test_https_on_loopback_is_inherited_not_extended(self):
-        adapter = LocalAdapter('https://127.0.0.1:8443/v1', 'm')
-        self.assertTrue(adapter._ssl_context.check_hostname)
-        self.assertEqual(adapter._ssl_context.verify_mode, __import__('ssl').CERT_REQUIRED)
+    def test_a_completion_and_a_list_work_through_the_ipv6_loopback_address(self):
+        try:
+            provider = Provider(host='::1')
+        except OSError:
+            self.skipTest('this system has no IPv6 loopback address')
+        self.addCleanup(provider.stop)
+        provider.responder = lambda handler, body: reply_json(models_payload('a') if handler.command == 'GET' else ok_payload())(handler, body)
+        adapter = LocalAdapter(f'http://[::1]:{provider.port}/v1', 'm')
+        self.assertEqual(adapter.complete(call()).stop_reason, 'end')
+        self.assertEqual(adapter.list_models().ids, ('a',))
+        self.assertEqual(provider.requests[0]['headers']['host'], f'[::1]:{provider.port}')
+
+    def test_the_url_messages_are_about_a_local_server_and_do_not_say_use_https(self):
+        for url in ('http://example.com/v1', 'https://example.com/v1', 'ftp://127.0.0.1/v1', 'http://127.0.0.1/v1?x', 'http://127.0.0.2/v1', 'http://user:p@127.0.0.1/v1'):
+            with self.subTest(url=url):
+                error = self.assertCode('unsafe_endpoint', LocalAdapter, url, 'm')
+                self.assertEqual(str(error), local_adapter.UNSAFE_URL)
+                self.assertNotIn('Use https', str(error))
+                self.assertIn('API adapter', str(error))
 
 
 class KeyTests(LocalCase):
@@ -209,10 +243,31 @@ class NoModelTests(LocalCase):
     def test_an_adapter_with_no_model_can_list_but_not_complete(self):
         provider = self.provider(reply_json(models_payload('a', 'b')))
         adapter = LocalAdapter(provider.url())
-        self.assertEqual(adapter.list_models(), ('a', 'b'))
+        self.assertEqual(adapter.list_models().ids, ('a', 'b'))
         budget = TokenBudget(1000)
         self.assertCode('invalid_request', adapter.complete, call(budget), retryable=False)
         self.assertEqual((budget.spent, budget.remaining, len(provider.requests)), (0, 1000, 1))
+
+    def test_the_guard_also_sits_where_the_body_is_built(self):
+        adapter = LocalAdapter('http://127.0.0.1:1/v1', None)
+        self.assertCode('invalid_request', adapter._body, call())
+        provider = self.provider()
+        adapter = LocalAdapter(provider.url())
+        error, reply = adapter._exchange(call())
+        self.assertEqual(error.code, "invalid_request")
+        self.assertEqual(provider.requests, [])
+
+    def test_a_request_of_the_wrong_kind_gets_the_request_sentence_first(self):
+        for adapter in (LocalAdapter('http://127.0.0.1:1/v1', None), LocalAdapter('http://127.0.0.1:1/v1', 'm')):
+            for bad in (None, 'text', {'messages': []}, [Message('user', 'x')]):
+                error = self.assertCode('invalid_request', adapter.complete, bad)
+                self.assertEqual(str(error), 'Send a CompletionRequest.')
+
+    def test_the_model_sentence_wins_over_the_context_guard_so_nothing_else_runs_first(self):
+        adapter = LocalAdapter('http://127.0.0.1:1/v1', None)
+        shaped = 'sk-' + 'A1b2C3d4' * 4
+        error = self.assertCode('invalid_request', adapter.complete, call(text=f'my key is {shaped}'))
+        self.assertEqual(str(error), 'Choose a model before you ask for a completion.')
 
     def test_a_preset_can_be_made_without_a_model(self):
         self.assertIsInstance(LocalAdapter.preset('ollama'), LocalAdapter)
@@ -223,7 +278,6 @@ class NoModelTests(LocalCase):
 
 class TimeoutDefaultTests(LocalCase):
     def test_the_defaults_are_longer_than_the_api_adapters_and_inside_its_bound(self):
-        import api_adapter
         adapter = LocalAdapter('http://127.0.0.1:1/v1', 'm')
         self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (5.0, 300.0, 600.0))
         self.assertGreater(local_adapter.DEFAULT_READ_TIMEOUT, api_adapter.DEFAULT_READ_TIMEOUT)
@@ -234,10 +288,31 @@ class TimeoutDefaultTests(LocalCase):
         url = 'http://127.0.0.1:1/v1'
         for options in ({'connect_timeout': 0}, {'read_timeout': -1}, {'total_timeout': 0}, {'total_timeout': 601}, {'read_timeout': 601}, {'connect_timeout': True},
                         {'read_timeout': '5'}, {'total_timeout': float('nan')}, {'total_timeout': float('inf')}, {'read_timeout': 100, 'total_timeout': 50},
-                        {'connect_timeout': 20, 'read_timeout': 10, 'total_timeout': 10}, {'read_timeout': None}):
+                        {'connect_timeout': 20, 'read_timeout': 10, 'total_timeout': 10}, {'total_timeout': '30'}, {'total_timeout': True}, {'total_timeout': float('nan')}):
             with self.subTest(options=options):
                 self.assertCode('invalid_request', LocalAdapter, url, 'm', **options)
         LocalAdapter(url, 'm', connect_timeout=600, read_timeout=600, total_timeout=600)
+
+    def test_setting_only_the_total_time_works_and_lowers_the_defaults_that_would_not_fit(self):
+        url = 'http://127.0.0.1:1/v1'
+        adapter = LocalAdapter(url, 'm', total_timeout=30)
+        self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (5.0, 30, 30))
+        adapter = LocalAdapter(url, 'm', total_timeout=2)
+        self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (2, 2, 2))
+        adapter = LocalAdapter(url, 'm', total_timeout=450)
+        self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (5.0, 300.0, 450))
+        adapter = LocalAdapter(url, 'm', read_timeout=40)
+        self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (5.0, 40, 600.0))
+        adapter = LocalAdapter(url, 'm', connect_timeout=1, total_timeout=30)
+        self.assertEqual((adapter._connect_timeout, adapter._read_timeout, adapter._total_timeout), (1, 30, 30))
+        self.assertEqual(LocalAdapter.preset('ollama', 'm', total_timeout=30)._read_timeout, 30)
+
+    def test_a_value_the_caller_sets_is_never_lowered_and_is_still_checked(self):
+        url = 'http://127.0.0.1:1/v1'
+        self.assertCode('invalid_request', LocalAdapter, url, 'm', read_timeout=100, total_timeout=50)
+        self.assertCode('invalid_request', LocalAdapter, url, 'm', connect_timeout=100, total_timeout=50)
+        self.assertCode('invalid_request', LocalAdapter, url, 'm', total_timeout=601)
+        self.assertCode('invalid_request', LocalAdapter, url, 'm', total_timeout=0)
 
     def test_the_response_cap_is_checked_like_the_api_adapters(self):
         for cap in (0, -1, True, 10_000_001, 1.5, None):
@@ -305,13 +380,6 @@ class CompleteTests(LocalCase):
         self.assertCode('token_cap_reached', self.adapter(provider).complete, call(budget, max_output_tokens=100), retryable=False)
         self.assertEqual((provider.requests, budget.spent), ([], 0))
 
-    def test_the_budget_has_no_default(self):
-        with self.assertRaises(TypeError):
-            TokenBudget()
-        self.assertCode('invalid_request', TokenBudget, 0)
-        with self.assertRaises(TypeError):
-            CompletionRequest([Message('user', 'Hi.')], 10)
-
     def test_the_reply_text_is_not_trusted_and_a_provider_error_text_never_leaks(self):
         provider = self.provider(reply_json({'error': {'message': BODY_SECRET, 'code': 500}}))
         self.assertCode('endpoint_unreachable', self.adapter(provider).complete, call())
@@ -342,20 +410,46 @@ class NotListeningTests(LocalCase):
         self.assertNotIn(str(port), str(error))
         self.assertNotIn('127.0.0.1', str(error))
 
-    def test_the_sentence_is_fixed_for_every_loopback_spelling(self):
-        for host in ('127.0.0.1', '[::1]'):
-            adapter = LocalAdapter(f'http://{host}:{free_port()}/secret-path/v1', 'm')
-            self.assertEqual(str(self.assertCode('endpoint_unreachable', adapter.list_models)), NOT_LISTENING)
+    def test_the_sentence_is_fixed_for_every_loopback_spelling_and_every_address_is_tried(self):
+        tried = []
 
-    def test_a_name_that_does_not_resolve_keeps_its_own_sentence(self):
-        def nothing(host, port, *args, **kwargs):
-            raise OSError('no such host')
-        error = self.assertCode('endpoint_unreachable', LocalAdapter('http://localhost:1/v1', 'm', resolver=nothing).list_models, retryable=True)
-        self.assertEqual(str(error), 'Schola could not find the endpoint host.')
+        def refuse(address, *args, **kwargs):
+            tried.append(address)
+            raise ConnectionRefusedError(errno.ECONNREFUSED, 'refused')
+        for host, expected in (('127.0.0.1', ['127.0.0.1']), ('[::1]', ['::1']), ('localhost', ['127.0.0.1', '::1'])):
+            del tried[:]
+            adapter = LocalAdapter(f'http://{host}:1234/secret-path/v1', 'm')
+            with mock.patch('socket.create_connection', side_effect=refuse):
+                self.assertEqual(str(self.assertCode('endpoint_unreachable', adapter.list_models, retryable=True)), NOT_LISTENING)
+            self.assertEqual([address for address, port in tried], expected)
+
+    def test_only_a_refusal_gets_the_friendly_sentence(self):
+        cases = ((errno.ECONNREFUSED, ConnectionRefusedError, NOT_LISTENING, True), (errno.ECONNABORTED, ConnectionAbortedError, NOT_LISTENING, True),
+                 (errno.EMFILE, OSError, GENERAL, True), (errno.ENETUNREACH, OSError, GENERAL, True), (errno.EADDRNOTAVAIL, OSError, GENERAL, True),
+                 (errno.EACCES, PermissionError, GENERAL, False), (errno.EPERM, PermissionError, GENERAL, False), (errno.EHOSTUNREACH, OSError, GENERAL, True))
+        adapter = LocalAdapter('http://127.0.0.1:1234/v1', 'm')
+        for number, kind, sentence, retryable in cases:
+            for call_it in (adapter.list_models, lambda: adapter.complete(call())):
+                with self.subTest(errno=number), mock.patch('socket.create_connection', side_effect=kind(number, 'x')):
+                    error = self.assertCode('endpoint_unreachable', call_it, retryable=retryable)
+                    self.assertEqual(str(error), sentence)
+                    self.assertEqual(error.tokens_charged, 0)
+
+    def test_a_refusal_on_one_address_and_trouble_on_the_other_still_says_nothing_is_listening(self):
+        for order in ((OSError(errno.EADDRNOTAVAIL, 'x'), ConnectionRefusedError(errno.ECONNREFUSED, 'x')), (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), OSError(errno.ENETUNREACH, 'x'))):
+            with self.subTest(order=[type(e).__name__ for e in order]), mock.patch('socket.create_connection', side_effect=list(order)):
+                error = self.assertCode('endpoint_unreachable', LocalAdapter('http://localhost:1234/v1', 'm').list_models, retryable=True)
+                self.assertEqual(str(error), NOT_LISTENING)
+
+    def test_a_timeout_on_any_address_is_a_timeout_and_not_the_friendly_sentence(self):
+        for order in ((socket.timeout('t'), ConnectionRefusedError(errno.ECONNREFUSED, 'x')), (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), socket.timeout('t'))):
+            for call_it in (lambda adapter: adapter.list_models(), lambda adapter: adapter.complete(call())):
+                with self.subTest(first=type(order[0]).__name__), mock.patch('socket.create_connection', side_effect=list(order)):
+                    adapter = LocalAdapter('http://localhost:1234/v1', 'm')
+                    error = self.assertCode('timeout', call_it, adapter, retryable=True)
+                    self.assertNotEqual(str(error), NOT_LISTENING)
 
     def test_other_connection_trouble_keeps_the_general_sentence(self):
-        def hang_up(connection):
-            connection.close()
         listener = socket.socket()
         listener.bind(('127.0.0.1', 0))
         listener.listen(5)
@@ -364,27 +458,29 @@ class NotListeningTests(LocalCase):
         def serve():
             while True:
                 try:
-                    connection = listener.accept()[0]
+                    listener.accept()[0].close()
                 except OSError:
                     return
-                hang_up(connection)
         threading.Thread(target=serve, daemon=True).start()
         adapter = LocalAdapter(f'http://127.0.0.1:{listener.getsockname()[1]}/v1', 'm')
         error = self.assertCode('endpoint_unreachable', adapter.list_models, retryable=True)
-        self.assertNotEqual(str(error), NOT_LISTENING)
+        self.assertEqual(str(error), GENERAL)
 
     def test_a_server_error_status_keeps_its_own_sentence(self):
         provider = self.provider(reply_raw(b'', 503))
         error = self.assertCode('endpoint_unreachable', self.adapter(provider).list_models, retryable=True)
-        self.assertNotEqual(str(error), NOT_LISTENING)
+        self.assertEqual(str(error), 'The provider had a server error (HTTP 503).')
 
 
 class ListModelsTests(LocalCase):
     def test_it_asks_with_a_get_to_models_and_returns_the_ids_in_order_as_a_tuple(self):
         provider = self.provider(reply_json(models_payload('llama3.2:latest', 'qwen2.5:7b', 'hf.co/user/model:Q4_K_M')))
         result = self.adapter(provider).list_models()
-        self.assertEqual(result, ('llama3.2:latest', 'qwen2.5:7b', 'hf.co/user/model:Q4_K_M'))
-        self.assertIsInstance(result, tuple)
+        self.assertEqual(result.ids, ('llama3.2:latest', 'qwen2.5:7b', 'hf.co/user/model:Q4_K_M'))
+        self.assertEqual((result.skipped, result.truncated), (0, False))
+        self.assertIsInstance(result.ids, tuple)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.ids = ()
         sent = provider.requests[0]
         self.assertEqual((sent['method'], sent['path'], sent['body']), ('GET', '/v1/models', b''))
         self.assertEqual(sent['headers']['accept'], 'application/json')
@@ -394,49 +490,69 @@ class ListModelsTests(LocalCase):
 
     def test_it_works_with_a_base_url_that_has_no_path_or_a_trailing_slash(self):
         provider = self.provider(reply_json(models_payload('a')))
-        self.assertEqual(LocalAdapter(provider.url(''), 'm').list_models(), ('a',))
-        self.assertEqual(LocalAdapter(provider.url('/v1/'), 'm').list_models(), ('a',))
+        self.assertEqual(LocalAdapter(provider.url(''), 'm').list_models().ids, ('a',))
+        self.assertEqual(LocalAdapter(provider.url('/v1/'), 'm').list_models().ids, ('a',))
         self.assertEqual([request['path'] for request in provider.requests], ['/models', '/v1/models'])
 
-    def test_it_takes_no_argument_and_uses_no_budget_and_is_not_complete(self):
+    def test_it_takes_no_argument_and_so_uses_no_budget(self):
         adapter = self.adapter(self.provider(reply_json(models_payload('a'))))
-        self.assertIsNot(LocalAdapter.list_models, LocalAdapter.complete)
         with self.assertRaises(TypeError):
             adapter.list_models(TokenBudget(10))
-        self.assertEqual(adapter.list_models(), ('a',))
+        self.assertEqual(adapter.list_models().ids, ('a',))
 
-    def test_an_empty_list_is_an_empty_tuple(self):
-        self.assertEqual(self.lister({'object': 'list', 'data': []}).list_models(), ())
+    def test_an_empty_list_is_an_empty_result(self):
+        result = self.lister({'object': 'list', 'data': []}).list_models()
+        self.assertEqual((result.ids, result.skipped, result.truncated), ((), 0, False))
 
     def test_ids_that_the_model_name_rule_refuses_are_left_out(self):
         long_id = 'x' * 201
         ids = ['ok-1', 'has space', '', long_id, 'é', 'a\nb', '/Users/me/My Models/x.gguf', 'ok-2', 'a\x00b', 'x' * 200]
-        self.assertEqual(self.lister(models_payload(*ids)).list_models(), ('ok-1', 'ok-2', 'x' * 200))
+        result = self.lister(models_payload(*ids)).list_models()
+        self.assertEqual(result.ids, ('ok-1', 'ok-2', 'x' * 200))
+        self.assertEqual((result.skipped, result.truncated), (7, False))
 
     def test_every_returned_id_can_start_an_adapter(self):
-        names = ('llama3.2:latest', 'hf.co/user/model:Q4_K_M', 'qwen2.5-7b-instruct-1m', 'a@b+c#d~e', '/models/x.gguf')
-        for name in self.lister(models_payload(*names)).list_models():
+        names = ('llama3.2:latest', 'hf.co/user/model:Q4_K_M', 'qwen2.5-7b-instruct-1m', 'a@b+c#d~e', 'models/x.gguf', 'llama3:8b', 'a..b')
+        for name in self.lister(models_payload(*names)).list_models().ids:
             LocalAdapter('http://127.0.0.1:1/v1', name)
 
     def test_entries_of_the_wrong_kind_are_left_out(self):
         data = [{'id': 'good'}, 'text', 5, None, [], {'id': 5}, {'id': None}, {'id': ['x']}, {'name': 'no-id'}, {'id': True}, {}, {'id': 'good-too'}]
-        self.assertEqual(self.lister({'data': data}).list_models(), ('good', 'good-too'))
+        result = self.lister({'data': data}).list_models()
+        self.assertEqual((result.ids, result.skipped), (('good', 'good-too'), 10))
 
     def test_a_repeated_id_is_listed_once(self):
-        self.assertEqual(self.lister(models_payload('a', 'b', 'a', 'b', 'c')).list_models(), ('a', 'b', 'c'))
+        result = self.lister(models_payload('a', 'b', 'a', 'b', 'c')).list_models()
+        self.assertEqual((result.ids, result.skipped), (('a', 'b', 'c'), 2))
 
-    def test_the_count_is_capped(self):
+    def test_the_count_is_capped_and_the_result_says_so(self):
         cap = local_adapter.MAX_LISTED_MODELS
         self.assertEqual(cap, 500)
         names = [f'model-{number}' for number in range(cap + 100)]
         result = self.lister(models_payload(*names)).list_models()
-        self.assertEqual(result, tuple(names[:cap]))
+        self.assertEqual((result.ids, result.truncated, result.skipped), (tuple(names[:cap]), True, 0))
         exact = self.lister(models_payload(*names[:cap])).list_models()
-        self.assertEqual(len(exact), cap)
+        self.assertEqual((len(exact.ids), exact.truncated), (cap, False))
+        one_more = self.lister(models_payload(*names[:cap + 1])).list_models()
+        self.assertEqual((len(one_more.ids), one_more.truncated), (cap, True))
+
+    def test_unusable_entries_after_the_cap_do_not_make_the_list_truncated(self):
+        cap = local_adapter.MAX_LISTED_MODELS
+        data = [{'id': f'model-{number}'} for number in range(cap)] + [{'id': 'bad id'}, {'id': 'model-3'}, 'text']
+        result = self.lister({'data': data}).list_models()
+        self.assertEqual((len(result.ids), result.truncated, result.skipped), (cap, False, 3))
 
     def test_the_cap_counts_listed_ids_and_not_skipped_entries(self):
         junk = [{'id': 'bad id'}] * 1000
-        self.assertEqual(self.lister({'data': junk + [{'id': 'fine'}]}).list_models(), ('fine',))
+        result = self.lister({'data': junk + [{'id': 'fine'}]}).list_models()
+        self.assertEqual((result.ids, result.skipped), (('fine',), 1000))
+
+    def test_a_list_with_entries_and_no_usable_id_is_an_error_not_an_empty_list(self):
+        for data in ([{'id': '/Users/me/My Models/x.gguf'}], [{'id': 'has space'}, {'id': ''}], ['text', 5, None], [{'name': 'a'}], [{'id': 'a'}] * 0 + [{'id': 'bad id'}] * 600):
+            with self.subTest(data=str(data)[:40]):
+                error = self.assertCode('bad_response', self.lister({'data': data}).list_models, retryable=False)
+                self.assertEqual(str(error), NO_USABLE_ID)
+                self.assertEqual(error.tokens_charged, 0)
 
     def test_a_reply_that_is_not_the_list_envelope_is_bad_response_and_charges_nothing(self):
         for body in (b'', b'not json', b'[]', b'[{"id":"a"}]', b'null', b'"text"', b'5', b'{}', b'{"data":null}', b'{"data":{}}', b'{"data":"a"}', b'{"models":[{"id":"a"}]}',
@@ -445,23 +561,34 @@ class ListModelsTests(LocalCase):
                 error = self.assertCode('bad_response', self.adapter(self.provider(reply_raw(body))).list_models, retryable=False)
                 self.assertEqual(error.tokens_charged, 0)
 
-    def test_a_deeply_nested_reply_is_a_typed_error_or_an_empty_list_and_never_a_crash(self):
+    def test_a_deeply_nested_reply_is_a_typed_error_and_never_a_crash(self):
         # Some Python versions refuse this depth and some read it. Both are fine: an entry that is a list is not a model.
         body = b'{"data":' + b'[' * 100_000 + b']' * 100_000 + b'}'
         adapter = self.adapter(self.provider(reply_raw(body)), max_response_bytes=1_000_000)
         try:
-            self.assertEqual(adapter.list_models(), ())
+            self.fail(adapter.list_models())
         except ModelAdapterError as error:
             self.assertEqual(error.code, 'bad_response')
             self.assertClean(error)
         top = b'[' * 100_000 + b']' * 100_000
         self.assertCode('bad_response', self.adapter(self.provider(reply_raw(top))).list_models)
 
+    def test_ids_are_untrusted_labels_so_path_like_and_option_like_ids_are_left_out(self):
+        bad = ('../x', 'a/../b', '..', 'a/..', '/abs/model.gguf', '/', '~', '~root/x', '~/m', '-flag', '--model', '-', 'C:/models/x', 'c:\\models\\x', 'Z:/x', 'C:\\x', '//server/share')
+        good = ('llama3:8b', 'hf.co/user/model', 'a..b', 'x/y/z', 'a-b', 'model.v2', 'q4_k_m', 'a~b', 'c:x', 'ab:/x', 'ab/x', 'c:', '1:/x', '.hidden', 'a/.b', '...')
+        for name in bad:
+            with self.subTest(bad=name):
+                result = self.lister(models_payload(name, 'fine')).list_models()
+                self.assertEqual((result.ids, result.skipped), (('fine',), 1))
+        result = self.lister(models_payload(*good)).list_models()
+        self.assertEqual(result.ids, good)
+        self.assertEqual(result.skipped, 0)
+
     def test_a_huge_id_is_skipped_quickly(self):
         big = 'a' * 900_000
         adapter = self.adapter(self.provider(reply_json(models_payload(big, 'fine'))), max_response_bytes=1_000_000)
         started = time.monotonic()
-        self.assertEqual(adapter.list_models(), ('fine',))
+        self.assertEqual(adapter.list_models().ids, ('fine',))
         self.assertLess(time.monotonic() - started, 5.0)
 
     def test_an_error_object_in_a_200_reply_is_an_error_and_never_echoed(self):
@@ -480,6 +607,42 @@ class ListModelsTests(LocalCase):
                 error = self.assertCode(code, self.adapter(provider).list_models, retryable=retryable)
                 self.assertEqual(error.tokens_charged, 0)
 
+    def test_a_local_server_gets_local_sentences_for_the_statuses_that_read_wrong_for_it(self):
+        no_list = 'This server does not offer a model list. Type the model name instead.'
+        wants_key = 'The local server asked for a key. This adapter does not send one.'
+        for status, sentence, code in ((404, no_list, 'invalid_request'), (401, wants_key, 'auth_failed'), (403, wants_key, 'auth_failed')):
+            with self.subTest(status=status):
+                provider = self.provider(lambda handler, body, status=status: send(handler, status, BODY_SECRET.encode()))
+                error = self.assertCode(code, self.adapter(provider).list_models, retryable=False)
+                self.assertEqual(str(error), sentence)
+                self.assertNotIn('API key', str(error).replace('asked for a key', ''))
+                inside = self.assertCode(code, self.lister({'error': {'code': status, 'message': BODY_SECRET}}).list_models, retryable=False)
+                self.assertTrue(str(inside).endswith(sentence), str(inside))
+        for status in (401, 403):
+            provider = self.provider(lambda handler, body, status=status: send(handler, status, b'x'))
+            self.assertEqual(str(self.assertCode('auth_failed', self.adapter(provider).complete, call())), wants_key)
+            inside = self.assertCode('auth_failed', self.lister({'error': {'code': status}}).complete, call())
+            self.assertTrue(str(inside).endswith(wants_key), str(inside))
+        inside = self.assertCode('invalid_request', self.lister({'error': {'code': 404}}).complete, call())
+        self.assertTrue(str(inside).endswith('Check the base URL and the model name.'), str(inside))
+        self.assertNotIn('model list', str(inside))
+
+    def test_a_404_on_the_chat_path_keeps_the_general_sentence_and_the_other_statuses_do_not_change(self):
+        provider = self.provider(lambda handler, body: send(handler, 404, b'x'))
+        error = self.assertCode('invalid_request', self.adapter(provider).complete, call(), retryable=False)
+        self.assertEqual(str(error), 'The provider refused the request (HTTP 404). Check the base URL and the model name.')
+        for status, code, sentence in ((429, 'rate_limited', 'The provider says there were too many requests or the quota is used. Try again later.'),
+                                       (504, 'timeout', 'The provider timed out (HTTP 504).')):
+            provider = self.provider(lambda handler, body, status=status: send(handler, status, b'x'))
+            self.assertEqual(str(self.assertCode(code, self.adapter(provider).list_models)), sentence)
+
+    def test_the_api_adapter_keeps_its_own_wording(self):
+        for status, sentence in ((401, 'The provider refused the API key. Check the key and what it may do.'),
+                                 (404, 'The provider refused the request (HTTP 404). Check the base URL and the model name.')):
+            provider = self.provider(lambda handler, body, status=status: send(handler, status, b'x'))
+            adapter = api_adapter.ApiAdapter(provider.url(), 'm', ApiKey(SECRET))
+            self.assertEqual(str(self.assertCode('auth_failed' if status == 401 else 'invalid_request', adapter.complete, call())), sentence)
+
     def test_the_body_cap_holds(self):
         padded = json.dumps(models_payload('a')).encode()
         for size, outcome in ((2000, ('a',)), (2001, None)):
@@ -490,7 +653,7 @@ class ListModelsTests(LocalCase):
                     error = self.assertCode('response_too_large', adapter.list_models, retryable=False)
                     self.assertEqual(error.tokens_charged, 0)
                 else:
-                    self.assertEqual(adapter.list_models(), outcome)
+                    self.assertEqual(adapter.list_models().ids, outcome)
 
     def test_a_chunked_body_over_the_cap_is_refused_too(self):
         def chunked(handler, body):
@@ -510,7 +673,7 @@ class ListModelsTests(LocalCase):
         for options in cases:
             with self.subTest(options=options):
                 self.assertCode('bad_response', self.adapter(self.provider(reply_raw(good, **options))).list_models)
-        self.assertEqual(self.adapter(self.provider(reply_raw(good, content_type='application/vnd.api+json; charset=utf-8'))).list_models(), ('a',))
+        self.assertEqual(self.adapter(self.provider(reply_raw(good, content_type='application/vnd.api+json; charset=utf-8'))).list_models().ids, ('a',))
 
     def test_a_body_that_ends_early_is_bad_response(self):
         def short(handler, body):
@@ -583,7 +746,7 @@ class ListModelsTests(LocalCase):
             except OSError:
                 pass
         provider = self.provider(slow_body)
-        self.assertEqual(self.adapter(provider, connect_timeout=1, read_timeout=1, total_timeout=20).list_models(), ('a',))
+        self.assertEqual(self.adapter(provider, connect_timeout=1, read_timeout=1, total_timeout=20).list_models().ids, ('a',))
         self.assertCode('timeout', self.adapter(provider, connect_timeout=1, read_timeout=1, total_timeout=1.5).list_models)
 
     def test_a_body_that_drips_ends_at_the_list_limit_when_the_call_limits_are_long(self):
@@ -603,6 +766,25 @@ class ListModelsTests(LocalCase):
             started = time.monotonic()
             self.assertCode('timeout', adapter.list_models, retryable=True)
             self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_a_list_is_read_whole_when_the_server_says_connection_close(self):
+        body = json.dumps(models_payload('a', 'b')).encode()
+
+        def chunked(handler, request_body):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            for start in range(0, len(body), 9):
+                piece = body[start:start + 9]
+                handler.wfile.write(f'{len(piece):x}\r\n'.encode() + piece + b'\r\n')
+            handler.wfile.write(b'0\r\n\r\n')
+        responders = {'length': lambda handler, b: send(handler, 200, body, headers={'Connection': 'close'}), 'chunked': chunked,
+                      'neither': lambda handler, b: send(handler, 200, body, headers={'Connection': 'close'}, length=False)}
+        for name, responder in responders.items():
+            with self.subTest(framing=name):
+                self.assertEqual(self.adapter(self.provider(responder)).list_models().ids, ('a', 'b'))
 
     def test_a_failure_leaks_no_url_address_or_provider_text(self):
         provider = self.provider(lambda handler, body: send(handler, 200, json.dumps({'data': [{'id': 'a'}], 'error': BODY_SECRET}).encode()))
@@ -630,7 +812,7 @@ class ListModelsTests(LocalCase):
         worker = threading.Thread(target=lambda: results.append(adapter.complete(call())))
         worker.start()
         try:
-            self.assertEqual(adapter.list_models(), ('a',))
+            self.assertEqual(adapter.list_models().ids, ('a',))
         finally:
             gate.set()
             worker.join(10)

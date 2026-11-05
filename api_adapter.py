@@ -199,7 +199,14 @@ def _raise_tls_floor(context):
 
 
 class ConnectFailed(OSError):
-    """Every address refused the connection (no timeout). It is an `OSError`, so it is `endpoint_unreachable` unless a subclass of the adapter words it better."""
+    """No address connected, and none timed out. It is an `OSError`, so it is `endpoint_unreachable` unless a subclass of the adapter words it better.
+
+    `errno` is the number of the failure. When any address refused the connection it is the number of that refusal, and `refused` is true.
+    """
+
+    def __init__(self, number, message, refused):
+        super().__init__(number, message)
+        self.refused = refused
 
 
 class _PinnedConnection(http.client.HTTPConnection):
@@ -228,7 +235,10 @@ class _PinnedConnection(http.client.HTTPConnection):
         A shutdown from the timer thread does not reliably wake a blocked send or TLS read on every system, so every
         wait carries its own limit as well.
         """
-        self.live().settimeout(min(self._read_timeout, self._left()))
+        wait = min(self._read_timeout, self._left())  # raises when the deadline has passed
+        sock = self.live()
+        if sock is not None and getattr(sock, 'fileno', lambda: 0)() != -1:  # `http.client` closes the socket once it has read a whole body
+            sock.settimeout(wait)
 
     def live(self):
         """The socket in use. `http.client` drops `self.sock` as soon as a reply says "connection: close", but the reply still reads from it."""
@@ -247,19 +257,24 @@ class _PinnedConnection(http.client.HTTPConnection):
     def connect(self):
         if self._context is not None and not _tls_ok(self._context):
             raise ModelAdapterError('The TLS settings no longer check certificates and host names. Schola sent nothing.', 'unsafe_endpoint')
-        last = None
+        last = refusal = timeout = None
         for address in self._addresses:
             wait = self._remaining()
             try:
                 sock = socket.create_connection((address, self.port), wait)
             except OSError as error:
                 last = error
+                if isinstance(error, TimeoutError):
+                    timeout = error
+                elif isinstance(error, (ConnectionRefusedError, ConnectionAbortedError)) and refusal is None:
+                    refusal = error
                 continue
             break
         else:
-            if isinstance(last, TimeoutError):
-                raise last
-            raise ConnectFailed('no connection')
+            if timeout is not None:
+                raise timeout  # an address that timed out may be a server that is busy; the others do not change that
+            failure = refusal or last
+            raise ConnectFailed(failure.errno, 'no connection', refusal is not None)
         self.sock = self._live = sock  # set at once, so the timer can close a socket that is still in the handshake
         if self._context is not None:
             # A failure here leaves the raw socket in `self.sock`, and `close()` of the connection closes it.
@@ -388,7 +403,7 @@ def _billed(error, usage, unreadable):
     return error
 
 
-def _body_error(value, usage):
+def _body_error(value, usage, status_error=None):
     """The error for a 200 reply that holds an `error` object. A number in `code` or `status` goes through the status table."""
     number = None
     if isinstance(value, dict):
@@ -399,7 +414,7 @@ def _body_error(value, usage):
             if isinstance(candidate, int) and 400 <= candidate <= 599:  # a bool is 0 or 1, so it never gets here
                 number = candidate
                 break
-    mapped = _status_error(number) if number is not None else None
+    mapped = (status_error or _status_error)(number) if number is not None else None
     if mapped is not None:
         # Same code and retry advice as the status table, but the sentence says where the provider put it.
         mapped = ModelAdapterError(f'The provider reported this in the body of a 200 reply: {mapped}', mapped.code)  # the retry advice comes from the code
@@ -546,6 +561,10 @@ class ApiAdapter(ma.ModelAdapter):
             raise error  # raised here, outside any handler, so it chains nothing
         return raw
 
+    def _status_error(self, status, path):
+        """The error for an HTTP status that is not 200 (or None for 200), for a call to `path`. A subclass can word one status better."""
+        return _status_error(status)
+
     def _classify_error(self, caught):
         """The typed error for a network or protocol exception, or None. A subclass can word one case better; it must not leak."""
         return _classify(caught)
@@ -592,7 +611,7 @@ class ApiAdapter(ma.ModelAdapter):
                                            connect_timeout, read_timeout, deadline)
             connection.request(method, endpoint.path + path, None if body is None else body(), self._headers(body is not None))
             sent = True
-            error, raw = self._read(connection, connection.getresponse(), hold, parse)
+            error, raw = self._read(connection, connection.getresponse(), hold, parse, path)
         except MemoryError:
             raise
         except ModelAdapterError as caught:
@@ -614,8 +633,8 @@ class ApiAdapter(ma.ModelAdapter):
             return _timeout(hold if sent else 0), None
         return error, raw
 
-    def _read(self, connection, response, hold, parse):
-        failure = _status_error(response.status)
+    def _read(self, connection, response, hold, parse, path):
+        failure = self._status_error(response.status, path)
         if failure is not None:
             return failure, None  # the body of an error reply is never read; nothing is charged
         # From here the provider answered 200, so the call was billed. A reply that cannot be read is charged the whole hold.
@@ -632,7 +651,7 @@ class ApiAdapter(ma.ModelAdapter):
                 return _billed(_too_large(), None, hold), None
         pieces, total = [], 0
         try:
-            while True:
+            while not response.isclosed():  # a closed response has nothing more to read, and its socket is gone
                 connection.arm()
                 piece = response.read1(_CHUNK)
                 if not piece:
@@ -645,7 +664,9 @@ class ApiAdapter(ma.ModelAdapter):
             raise
         except Exception as caught:
             # The body broke in the middle of a reply the provider billed: a reset, a cut chunk, an over-long line, a timeout.
-            return _billed(_classify(caught) or _bad(), None, hold), None
+            # A body that was read to its declared length is whole, whatever the socket says afterwards.
+            if declared is None or total != declared:
+                return _billed(_classify(caught) or _bad(), None, hold), None
         if declared is not None and total != declared:
             return _billed(_bad('The provider reply ended early.'), None, hold), None
         return parse(b''.join(pieces), hold)
@@ -656,7 +677,7 @@ class ApiAdapter(ma.ModelAdapter):
             return _billed(_bad(), None, hold), None
         usage = _usage(document)
         if document.get('error') is not None:
-            return _body_error(document['error'], usage), None
+            return _body_error(document['error'], usage, lambda status: self._status_error(status, '/chat/completions')), None
         choices = document.get('choices')
         if not isinstance(choices, list):
             return _billed(_bad(), usage, hold), None

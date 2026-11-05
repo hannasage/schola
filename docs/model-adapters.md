@@ -9,7 +9,7 @@ The code is `model_adapter.py` and `api_adapter.py`.
 `types/model-adapter.d.ts` types the error payload and nothing else. A request and a result get types once a route sends them.
 The tests are `tests/test_model_adapter.py` and `tests/test_api_adapter.py`.
 The code uses only the Python standard library.
-It needs Python 3.10 or later. The two test files passed on 3.10, 3.11, 3.12, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
+It needs Python 3.10 or later. The three test modules (`test_model_adapter`, `test_api_adapter`, and `test_local_adapter`) passed on 3.10, 3.12, 3.13, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
 The tests use the explicit range list for address checks and do not depend on the `ipaddress` tables of one Python version.
 Nothing calls these adapters yet. No route, screen, or agent loop uses them in this step.
 Step E4 added the local adapter, a subclass of the API adapter. `docs/local-adapter.md` describes it.
@@ -315,7 +315,8 @@ The operating system and Python's default context decide which certificate autho
 - The adapter does not read a provider's `Retry-After` header.
 - The token count comes from the provider. Schola cannot check the numbers, and the input estimate is rough.
 - A connection that breaks before any reply byte arrives counts as nothing in the budget. The provider can still bill for such a call. Schola cannot see it.
-- Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.11, 3.12, and 3.14.
+- Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.12, 3.13, and 3.14.
+- A reply with a correct `Content-Length` and `Connection: close` failed on Python 3.12 and later in the first version of this adapter. The step E4 work fixed it (see `docs/local-adapter.md`). The tests now send that header in every framing.
 
 ## Not built in this step
 
