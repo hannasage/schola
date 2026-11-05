@@ -580,7 +580,7 @@ class CompleteTests(unittest.TestCase):
         self.assertNotIn(SECRET, str(error))
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
-        text = ''.join(traceback.format_exception(error))
+        text = ''.join(traceback.TracebackException(type(error), error, error.__traceback__, capture_locals=True).format())
         self.assertNotIn(SECRET, text)
 
     def test_the_key_value_is_removed_from_the_reply_text(self):

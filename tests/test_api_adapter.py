@@ -117,6 +117,11 @@ def call(budget=None, text='Hello.', max_output_tokens=100):
     return CompletionRequest([Message('user', text)], max_output_tokens, budget or TokenBudget(100_000))
 
 
+def formatted(error):
+    """The traceback of an error as text, with the local variables of every frame. This works on every supported Python."""
+    return ''.join(traceback.TracebackException(type(error), error, error.__traceback__, capture_locals=True).format())
+
+
 class Case(unittest.TestCase):
     def provider(self, responder=None, **options):
         provider = Provider(responder, **options)
@@ -139,8 +144,7 @@ class Case(unittest.TestCase):
 
     def assertClean(self, error):
         """No key, no provider text, and no chained error in anything an error can show."""
-        shown = ' '.join([str(error), repr(error), repr(error.args), json.dumps(error.payload()),
-                          ''.join(traceback.format_exception(error)), ''.join(traceback.format_exception(error, capture_locals=False))])
+        shown = ' '.join([str(error), repr(error), repr(error.args), json.dumps(error.payload()), formatted(error)])
         for secret in (SECRET, SECRET[:14], BODY_SECRET):
             self.assertNotIn(secret, shown)
         self.assertIsNone(error.__cause__)
@@ -1568,7 +1572,9 @@ class KeyHandlingTests(Case):
         yield 'oversize', self.provider(lambda h, b: send(h, 200, echo + b' ' * 5000)), {'max_response_bytes': 1000}
         yield 'refused', None, {'url': f'http://127.0.0.1:{free_port()}/v1'}
         yield 'private', None, {'url': 'https://10.0.0.1/v1'}
-        yield 'credentials', None, {'url': f'https://user:{SECRET}@example.com/v1'}
+        # The caller typed this URL, so a tool that records local variables shows it. The message and the payload never do
+        # (EndpointRuleTests checks that). The check here is that the held key is not in the error, and the key is not the URL password.
+        yield 'credentials', None, {'url': 'https://user:url-password-1@example.com/v1'}
 
     def test_no_error_path_shows_the_key(self):
         count = 0
