@@ -1,5 +1,6 @@
 """Reflections: separate local files fetched by id. The text never enters the log or an error message."""
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -97,8 +98,8 @@ class SaveAndGetTests(ReflectionCase):
 
     def test_the_limits_match_the_contract(self):
         schema = json.loads((ROOT / 'contracts' / 'learning-event.v1.schema.json').read_text(encoding='utf-8'))
-        text = json.dumps(schema)
-        self.assertIn('"maximum": 10000', text)
+        count = schema['$defs']['dataReflectionSaved']['properties']['charCount']
+        self.assertEqual((count['minimum'], count['maximum']), (1, event_log.MAX_REFLECTION_CHARS))
         self.assertEqual(event_log.MAX_REFLECTION_CHARS, 10000)
         event = json.loads((FIXTURES / 'valid' / 'reflection-saved.json').read_text(encoding='utf-8'))
         saved = self.log.save_reflection('x')
@@ -197,6 +198,17 @@ class FailureTests(ReflectionCase):
         self.assertEqual(len(list(self.folder.glob('*.json'))), 2)
         self.assert_no_text(error)
 
+    def test_that_failure_hands_the_caller_the_id_so_the_reflection_can_be_fetched(self):
+        self.log.save_reflection('first')
+        with mock.patch('event_log._fsync_dir', side_effect=OSError(errno.EIO, 'boom')):
+            error = self.refused('fsync_failed', self.log.save_reflection, SECRET)
+        self.assertEqual(set(error.details), {'partialLine', 'maybeWritten', 'reflectionId', 'charCount'})
+        self.assertEqual(error.details['charCount'], len(SECRET))
+        self.assertIn('id', error.payload()['error'])
+        self.assertEqual(self.log.get_reflection(error.details['reflectionId']),
+                         {'reflectionId': error.details['reflectionId'], 'charCount': len(SECRET), 'text': SECRET})
+        self.assert_no_text(error)
+
     def test_a_write_error_is_write_failed_and_leaves_no_file(self):
         self.log.save_reflection('first')
         before = tree(self.data)
@@ -221,9 +233,9 @@ class FailureTests(ReflectionCase):
             self.refused('write_failed', self.log.save_reflection, SECRET)
         self.assertEqual(tree(self.data), before)
 
-    def test_a_folder_that_cannot_be_made_is_write_failed(self):
+    def test_a_regular_file_in_place_of_the_folder_is_log_corrupt(self):
         (self.data / '_events').write_text('a file, not a folder')
-        error = self.refused('write_failed', self.log.save_reflection, SECRET)
+        error = self.refused('log_corrupt', self.log.save_reflection, SECRET)
         self.assert_no_text(error)
 
     def test_a_symbolic_link_is_refused_for_the_folder_and_for_a_file(self):
@@ -305,3 +317,117 @@ class CorruptTests(ReflectionCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StoreLimitTests(ReflectionCase):
+    def test_the_limits_are_1000_files_and_16_mb(self):
+        self.assertEqual(event_log.MAX_REFLECTIONS, 1000)
+        self.assertEqual(event_log.MAX_REFLECTION_STORE_BYTES, 16 * 1024 * 1024)
+
+    def test_the_store_refuses_the_save_after_the_last_allowed_file(self):
+        with mock.patch.object(event_log, 'MAX_REFLECTIONS', 3):
+            for number in range(3):
+                self.log.save_reflection(f'text {number}')
+            before = tree(self.data)
+            error = self.refused('reflections_full', self.log.save_reflection, 'one too many')
+            self.assertEqual(error.status, 409)
+            self.assertEqual(tree(self.data), before)
+
+    def test_the_store_refuses_the_save_that_would_pass_the_byte_limit_and_allows_one_that_just_fits(self):
+        size = len(json.dumps({'version': 1, 'reflectionId': str(uuid.uuid4()), 'charCount': 1, 'text': 'x'}, ensure_ascii=False, indent=2)) + 1
+        with mock.patch.object(event_log, 'MAX_REFLECTION_STORE_BYTES', size * 2):
+            self.log.save_reflection('x')
+            self.log.save_reflection('y')
+            self.assertEqual(sum(path.stat().st_size for path in self.folder.glob('*.json')), size * 2)
+            self.refused('reflections_full', self.log.save_reflection, 'z')
+
+    def test_delete_makes_room_again(self):
+        with mock.patch.object(event_log, 'MAX_REFLECTIONS', 1):
+            self.log.save_reflection('one')
+            self.refused('reflections_full', self.log.save_reflection, 'two')
+            self.log.delete(confirm=True)
+            self.assertEqual(self.log.save_reflection('two')['charCount'], 3)
+
+    def test_a_save_removes_leftover_temporary_files_and_does_not_count_them(self):
+        self.log.save_reflection('first')
+        stale = self.folder / f'.touchline-{uuid.uuid4()}.tmp'
+        stale.write_text('x' * 5000)
+        other = self.folder / 'notes.txt'
+        other.write_text('not ours')
+        with mock.patch.object(event_log, 'MAX_REFLECTIONS', 2):
+            self.log.save_reflection('second')
+        self.assertFalse(stale.exists())
+        self.assertTrue(other.exists())
+
+    def test_a_leftover_that_cannot_be_removed_stops_the_save(self):
+        self.log.save_reflection('first')
+        stale = self.folder / f'.touchline-{uuid.uuid4()}.tmp'
+        stale.write_text('x')
+        before = tree(self.data)
+        with mock.patch('os.unlink', side_effect=OSError(errno.EPERM, 'no')):
+            self.refused('write_failed', self.log.save_reflection, 'second')
+        self.assertEqual(tree(self.data), before)
+
+    def test_a_save_waits_for_the_lock_like_an_append(self):
+        self.log.save_reflection('first')
+        descriptor = os.open(self.data / '_events' / event_log.LOCK_FILE, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        self.refused('lock_unavailable', self.log.save_reflection, 'second')
+
+    def test_a_reflection_folder_found_empty_flushes_its_entry_and_itself(self):
+        events = self.data / '_events'
+        events.mkdir(mode=0o700)
+        os.chmod(events, 0o700)
+        self.folder.mkdir(mode=0o700)
+        os.chmod(self.folder, 0o700)
+        (events / event_log.LOCK_FILE).touch()
+        with mock.patch('event_log._fsync_dir') as flush:
+            self.log.save_reflection('text')
+        self.assertEqual([call.args[0] for call in flush.call_args_list], [events, self.folder, self.folder])
+
+
+class TieToEventTests(ReflectionCase):
+    def event_for(self, saved, **data):
+        event = json.loads((FIXTURES / 'valid' / 'reflection-saved.json').read_text(encoding='utf-8'))
+        event['eventId'] = str(uuid.uuid4())
+        event['data'] = dict({'reflectionId': saved['reflectionId'], 'charCount': saved['charCount']}, **data)
+        return event
+
+    def test_an_event_for_a_stored_reflection_with_the_same_count_is_accepted(self):
+        saved = self.log.save_reflection('a short explanation')
+        self.assertTrue(self.log.append(self.event_for(saved))['appended'])
+
+    def test_an_event_for_an_unknown_reflection_is_reflection_mismatch_and_writes_nothing(self):
+        before = tree(self.data)
+        event = self.event_for({'reflectionId': str(uuid.uuid4()), 'charCount': 5})
+        error = self.refused('reflection_mismatch', self.log.append, event)
+        self.assertEqual(error.status, 422)
+        self.assertEqual(tree(self.data), before)
+
+    def test_an_event_with_the_wrong_count_is_reflection_mismatch(self):
+        saved = self.log.save_reflection('a short explanation')
+        self.refused('reflection_mismatch', self.log.append, self.event_for(saved, charCount=saved['charCount'] + 1))
+        self.refused('reflection_mismatch', self.log.append, self.event_for(saved, charCount=saved['charCount'] - 1))
+        self.assertFalse((self.data / '_events' / 'events.jsonl').exists())
+
+    def test_an_event_after_the_reflection_was_deleted_is_reflection_mismatch(self):
+        saved = self.log.save_reflection('a short explanation')
+        self.log.delete(confirm=True)
+        self.refused('reflection_mismatch', self.log.append, self.event_for(saved))
+
+    def test_a_damaged_stored_reflection_is_reported_as_damaged_and_not_as_a_mismatch(self):
+        saved = self.log.save_reflection(SECRET)
+        (self.folder / f"{saved['reflectionId']}.json").write_text('{')
+        error = self.refused('reflection_corrupt', self.log.append, self.event_for(saved))
+        self.assert_no_text(error)
+
+    def test_other_event_types_need_no_reflection(self):
+        event = json.loads((FIXTURES / 'valid' / 'task-opened.json').read_text(encoding='utf-8'))
+        event['eventId'] = str(uuid.uuid4())
+        self.assertTrue(self.log.append(event)['appended'])
+
+    def test_the_mismatch_message_shows_no_reflection_text(self):
+        saved = self.log.save_reflection(SECRET)
+        error = self.refused('reflection_mismatch', self.log.append, self.event_for(saved, charCount=saved['charCount'] + 1))
+        self.assert_no_text(error)

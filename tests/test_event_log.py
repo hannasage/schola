@@ -49,6 +49,12 @@ def tree(directory):
     return result
 
 
+def make_private(folder):
+    """Make a folder the way the store does: mode 0700, so the store accepts it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+
+
 class LogCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -60,7 +66,7 @@ class LogCase(unittest.TestCase):
 
     def put(self, data):
         """Write the log file directly, as an outside program or a crash would leave it."""
-        self.folder.mkdir(parents=True, exist_ok=True)
+        make_private(self.folder)
         self.path.write_bytes(data)
 
     def raw(self):
@@ -94,17 +100,22 @@ class AppendTests(LogCase):
         self.assertEqual([item['event'] for item in self.log.read()['events']], events)
 
     def test_every_valid_fixture_event_is_accepted_with_its_exact_content(self):
-        names = sorted(path for path in (FIXTURES / 'valid').glob('*.json'))
-        accepted = 0
-        for index, path in enumerate(names):
+        names = sorted((FIXTURES / 'valid').glob('*.json'))
+        self.assertGreater(len(names), 20)
+        written = []
+        for path in names:
             document = json.loads(path.read_text(encoding='utf-8'))
             document['eventId'] = str(uuid.uuid4())
-            if not learning_event.validate_event(document)['ok']:
-                continue
+            self.assertTrue(learning_event.validate_event(document)['ok'], path.name)
+            if document['type'] == 'reflection_saved':
+                saved = self.log.save_reflection('r' * document['data']['charCount'])
+                document['data']['reflectionId'] = saved['reflectionId']
             self.log.append(document)
-            accepted += 1
-        self.assertGreater(accepted, 20)
-        self.assertTrue(self.log.read()['ok'])
+            written.append(document)
+        report = self.log.read()
+        self.assertTrue(report['ok'])
+        self.assertEqual([item['event'] for item in report['events']], written)
+        self.assertEqual(self.log.export(), b''.join(line_of(document) for document in written))
 
     def test_the_file_and_folder_are_private_to_the_user(self):
         self.log.append(make_event())
@@ -362,7 +373,7 @@ class TruncatedTailTests(LogCase):
                   'os._exit(9)\n')
         seed = self.data / 'event.json'
         seed.write_bytes(line_of(event))
-        self.folder.mkdir()
+        make_private(self.folder)
         done = subprocess.run([sys.executable, '-c', script, str(self.path), str(seed)], capture_output=True, check=False)
         self.assertEqual(done.returncode, 9)
         half = self.raw()
@@ -425,17 +436,17 @@ class ReadTests(LogCase):
     def test_a_missing_log_reads_as_empty_and_says_it_does_not_exist(self):
         before = tree(self.data)
         report = self.log.read()
-        self.assertEqual(report, {'ok': True, 'exists': False, 'lines': [], 'events': [], 'truncatedTail': False})
+        self.assertEqual(report, {'ok': True, 'exists': False, 'lines': [], 'events': [], 'truncatedTail': False, 'total': 0, 'offset': 0, 'limit': None, 'more': False})
         self.assertEqual(tree(self.data), before)
 
     def test_a_missing_log_beside_an_existing_folder_reads_as_empty(self):
-        self.folder.mkdir()
+        make_private(self.folder)
         self.assertFalse(self.log.read()['exists'])
 
     def test_an_empty_file_reads_as_an_empty_log(self):
         self.put(b'')
         report = self.log.read()
-        self.assertEqual(report, {'ok': True, 'exists': True, 'lines': [], 'events': [], 'truncatedTail': False})
+        self.assertEqual(report, {'ok': True, 'exists': True, 'lines': [], 'events': [], 'truncatedTail': False, 'total': 0, 'offset': 0, 'limit': None, 'more': False})
 
     def test_a_log_over_the_size_limit_is_log_corrupt_and_kept(self):
         self.put(b'a' * (MAX_BYTES + 1))
@@ -447,7 +458,8 @@ class ReadTests(LogCase):
         self.refused('log_corrupt', self.log.read)
 
     def test_a_log_that_is_a_folder_is_log_corrupt(self):
-        self.path.mkdir(parents=True)
+        make_private(self.folder)
+        self.path.mkdir()
         for call in (self.log.read, self.log.export, lambda: self.log.append(make_event())):
             with self.subTest(call=call):
                 self.refused('log_corrupt', call)
@@ -466,7 +478,7 @@ class ReadTests(LogCase):
         outside = self.data / 'outside.jsonl'
         outside.write_bytes(line_of(make_event()))
         kept = outside.read_bytes()
-        self.folder.mkdir()
+        make_private(self.folder)
         self.path.symlink_to(outside)
         for call in (self.log.read, self.log.export, lambda: self.log.append(make_event()), lambda: self.log.delete(confirm=True)):
             with self.subTest(call=call):
@@ -520,17 +532,57 @@ class DeleteTests(LogCase):
     def test_unconfirmed_delete_of_a_missing_log_still_asks_for_confirmation(self):
         self.refused('confirmation_required', self.log.delete)
 
-    def test_confirmed_delete_removes_only_the_log_and_flushes_the_folder(self):
+    def test_confirmed_delete_removes_the_log_and_flushes_the_folder_and_leaves_other_files(self):
         self.log.append(make_event())
         other = self.folder / 'reflections'
-        other.mkdir()
+        make_private(other)
         (other / 'keep.json').write_text('{}')
         with mock.patch('event_log._fsync_dir') as flush:
             result = self.log.delete(confirm=True)
-        self.assertEqual(result, {'deleted': True})
+        self.assertEqual(result, {'deleted': True, 'logRemoved': True, 'reflectionsRemoved': 0})
         flush.assert_called_once_with(self.folder)
         self.assertFalse(self.path.exists())
         self.assertTrue((other / 'keep.json').is_file())
+        self.assertTrue((self.folder / event_log.LOCK_FILE).is_file())
+
+    def test_delete_removes_the_log_every_reflection_and_leftover_temporary_files(self):
+        self.log.append(make_event())
+        saved = [self.log.save_reflection(f'reflection {number}') for number in range(3)]
+        stale = self.folder / 'reflections' / f'.touchline-{uuid.uuid4()}.tmp'
+        stale.write_text('left by a crash')
+        with mock.patch('event_log._fsync_dir', wraps=event_log._fsync_dir) as flush:
+            result = self.log.delete(confirm=True)
+        self.assertEqual(result, {'deleted': True, 'logRemoved': True, 'reflectionsRemoved': 3})
+        self.assertEqual([call.args[0] for call in flush.call_args_list], [self.folder, self.folder / 'reflections'])
+        self.assertFalse(self.path.exists())
+        self.assertEqual(list((self.folder / 'reflections').iterdir()), [])
+        for item in saved:
+            self.refused('reflection_not_found', self.log.get_reflection, item['reflectionId'])
+        self.assertTrue((self.folder / event_log.LOCK_FILE).is_file())
+
+    def test_delete_with_reflections_and_no_log_removes_them_and_says_no_log_was_removed(self):
+        self.log.save_reflection('only a reflection')
+        result = self.log.delete(confirm=True)
+        self.assertEqual(result, {'deleted': True, 'logRemoved': False, 'reflectionsRemoved': 1})
+
+    def test_delete_with_nothing_to_delete_is_log_missing(self):
+        self.log.save_reflection('x')
+        self.log.delete(confirm=True)
+        self.refused('log_missing', self.log.delete, confirm=True)
+
+    def test_a_failed_unlink_of_a_reflection_reports_what_was_removed(self):
+        self.log.append(make_event())
+        self.log.save_reflection('one')
+        real = os.unlink
+
+        def refuse(path, *rest, **named):
+            if str(path).endswith('.json') and 'reflections' in str(path):
+                raise OSError(errno.EPERM, 'no')
+            return real(path, *rest, **named)
+
+        with mock.patch('os.unlink', side_effect=refuse):
+            error = self.refused('delete_failed', self.log.delete, confirm=True)
+        self.assertEqual(error.details, {'logRemoved': True, 'reflectionsRemoved': 0})
 
     def test_delete_of_a_missing_log_is_log_missing_not_a_silent_success(self):
         error = self.refused('log_missing', self.log.delete, confirm=True)
@@ -548,7 +600,7 @@ class DeleteTests(LogCase):
         self.log.append(make_event())
         with mock.patch('event_log._fsync_dir', side_effect=OSError(errno.EIO, 'boom')):
             error = self.refused('fsync_failed', self.log.delete, confirm=True)
-        self.assertEqual(error.details, {'removed': True})
+        self.assertEqual(error.details, {'logRemoved': True, 'reflectionsRemoved': 0, 'removed': True})
         self.assertFalse(self.path.exists())
 
     def test_a_failed_unlink_is_delete_failed(self):
@@ -633,7 +685,7 @@ class FailureTests(LogCase):
 
 class LockTests(LogCase):
     def hold(self, exclusive=True):
-        self.folder.mkdir(parents=True, exist_ok=True)
+        make_private(self.folder)
         descriptor = os.open(self.folder / event_log.LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         self.addCleanup(os.close, descriptor)
@@ -679,7 +731,7 @@ class LockTests(LogCase):
         self.assertTrue(slow.append(make_event())['appended'])
 
     def test_a_lock_file_that_cannot_be_opened_is_lock_unavailable(self):
-        self.folder.mkdir()
+        make_private(self.folder)
         (self.folder / event_log.LOCK_FILE).mkdir()
         self.refused('lock_unavailable', self.log.append, make_event())
         self.assertFalse(self.path.exists())
