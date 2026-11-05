@@ -3,6 +3,7 @@
 // and compares the verdict, the reason, and the error pointers with the Node result.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -14,14 +15,15 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const fixtureRoot = path.join(root, 'tests', 'fixtures', 'contracts');
 const manifest = JSON.parse(await readFile(path.join(fixtureRoot, 'lesson-conformance.json'), 'utf8'));
 
-// The child process reads a JSON list of jobs on stdin and writes a JSON list of results.
+// The child process reads a JSON list of jobs from a file named in its arguments and writes a JSON list of results.
 // Each job is { kind, text } or { kind, file }. The -I flag keeps the working folder and
 // the environment out of the import path. No bytecode is written next to the sources.
 const PYTHON_RUNNER = [
   'import sys, json',
   'sys.path.insert(0, sys.argv[1])',
   'import lesson_contract as lc',
-  'jobs = json.load(sys.stdin)',
+  'with open(sys.argv[2], encoding="utf-8") as handle:',
+  '    jobs = json.load(handle)',
   'out = []',
   'for job in jobs:',
   '    if "file" in job:',
@@ -31,15 +33,34 @@ const PYTHON_RUNNER = [
   'print(json.dumps(out))',
 ].join('\n');
 
-function runPython(args, input) {
-  const child = spawnSync('python3', ['-I', '-c', ...args], {
-    input,
-    encoding: 'utf8',
-    maxBuffer: 1 << 28,
-    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
-  });
-  assert.equal(child.status, 0, child.stderr);
-  return child.stdout;
+// The child gets no stdin. A child that waits on a piped stdin can block forever when the machine is
+// busy, so the jobs go in a private temp file and the child gets its path. A hung child is killed
+// after PYTHON_TIMEOUT_MS, so a hang fails this test instead of freezing the whole run.
+const PYTHON_TIMEOUT_MS = 60_000;
+
+function runPython(args, jobs) {
+  const folder = mkdtempSync(path.join(tmpdir(), 'schola-parity-'));
+  try {
+    const argv = [...args];
+    if (jobs !== undefined) {
+      const jobsFile = path.join(folder, 'jobs.json');
+      writeFileSync(jobsFile, jobs, { mode: 0o600 });
+      argv.push(jobsFile);
+    }
+    const child = spawnSync('python3', ['-I', '-c', ...argv], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      maxBuffer: 1 << 28,
+      timeout: PYTHON_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+    });
+    if (child.error) assert.fail(child.error.code === 'ETIMEDOUT' ? `the Python child did not finish in ${PYTHON_TIMEOUT_MS} ms and was killed` : child.error.message);
+    assert.equal(child.status, 0, child.stderr);
+    return child.stdout;
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
 }
 
 const runJobs = (jobs) => JSON.parse(runPython([PYTHON_RUNNER, root], JSON.stringify(jobs)));
@@ -255,5 +276,5 @@ test('an unsupported schema keyword makes the Python validator raise', () => {
     'else:',
     '    print("passed")',
   ].join('\n');
-  assert.equal(runPython([script, root], '').trim(), 'raised True');
+  assert.equal(runPython([script, root]).trim(), 'raised True');
 });
