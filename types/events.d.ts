@@ -39,17 +39,34 @@ interface EventLogLine {
   errors?: Array<{ pointer: string; message: string }>;
 }
 
-/** The answer of GET /api/events. A missing log is `exists: false` with empty lists. */
+/**
+ * The answer of GET /api/events. A missing log is `exists: false` with empty lists.
+ * `lines` and `events` hold one window: `limit` lines after `offset` lines. `events` holds the valid lines of the window only.
+ * `ok` and `truncatedTail` describe the whole log, so `ok: false` means some line, in or out of the window, is damaged.
+ */
 interface EventLogReport {
   ok: boolean;
   exists: boolean;
   lines: EventLogLine[];
   events: Array<{ line: number; event: LearningEventRecord }>;
   truncatedTail: boolean;
+  /** The number of lines in the whole log. */
+  total: number;
+  offset: number;
+  limit: number | null;
+  /** True when lines follow the window. */
+  more: boolean;
 }
 
 interface EventDeleteRequest {
   confirm: true;
+}
+
+/** The answer of DELETE /api/events. */
+interface EventDeleteResult {
+  deleted: true;
+  logRemoved: boolean;
+  reflectionsRemoved: number;
 }
 
 interface EventReflectionSaved {
@@ -62,12 +79,13 @@ interface EventReflection extends EventReflectionSaved {
 }
 
 type EventErrorCode =
-  | 'invalid_request' | 'invalid_json' | 'payload_too_large' | 'unsupported_media_type'
-  | 'invalid_token' | 'forbidden_origin' | 'source_forbidden'
-  | 'invalid_event' | 'unsupported_version' | 'event_too_large' | 'duplicate_event_id' | 'log_full'
+  | 'invalid_request' | 'invalid_json' | 'payload_too_large' | 'unsupported_media_type' | 'request_timeout'
+  | 'invalid_token' | 'forbidden_origin' | 'source_forbidden' | 'not_found' | 'storage_unavailable'
+  | 'invalid_event' | 'unsupported_version' | 'event_too_large' | 'duplicate_event_id' | 'log_full' | 'log_reserved'
   | 'lock_unavailable' | 'write_failed' | 'fsync_failed' | 'delete_failed'
   | 'log_missing' | 'log_unreadable' | 'log_corrupt' | 'unsafe_path' | 'confirmation_required'
   | 'invalid_reflection' | 'invalid_reflection_id' | 'reflection_not_found' | 'reflection_unreadable' | 'reflection_corrupt'
+  | 'reflections_full' | 'reflection_mismatch'
   | 'internal_error';
 
 /** The body of every error answer. `details` lists validator findings for `invalid_event`, or write facts such as `partialLine` and `maybeWritten`. */
@@ -76,5 +94,6 @@ interface EventErrorBody {
   code: EventErrorCode;
   retryable: boolean;
   field?: string;
-  details?: Array<{ pointer: string; message: string }> | { partialLine?: boolean; maybeWritten?: boolean; removed?: boolean };
+  details?: Array<{ pointer: string; message: string }>
+    | { partialLine?: boolean; maybeWritten?: boolean; removed?: boolean; logRemoved?: boolean; reflectionsRemoved?: number; reflectionId?: string; charCount?: number };
 }
