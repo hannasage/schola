@@ -17,15 +17,17 @@ It does not:
 - write any words. The agent writes the offer later, in step E6.
 - call a model.
 - use the network, the disk, or the clock. The caller passes in the time.
-- store anything. It keeps no counters. The caller owns them (see "What the caller must do").
-- read the policy from a file. A later step adds the policy contract file and the place where a module keeps its policy.
-- check that the events are valid. It trusts that `learning_event.py` checked them. It checks only the fields it reads.
+- store anything. The caller owns the counters (see "What the caller must do").
+- read the policy from a file or from JSON text. A later step adds the policy contract file and the loader.
+  That loader refuses an object that repeats a key. This step takes a Python dict.
+- check that the events are valid. See "What the evaluator trusts".
 
 ## Terms
 
 - A tutor policy is a list of rules written by the module creator. It is data, not code.
 - A rule has an id, a trigger, and an action.
-- A trigger says which events make a rule apply. It names an event type. A trigger has four optional parts: a condition, a count, a repeat flag, and a scope.
+- A trigger says which events make a rule apply. It names an event type. Four parts are optional: a condition, a count, a repeat flag, and a scope.
+- The trigger event is the newest event that made a rule apply.
 - An action says what the agent is allowed to do after a rule applies. The list of actions is closed.
 - An offer is one message of help from the agent. The student accepts it or dismisses it.
 - The hint ladder is the ordered list of hint levels: `nudge`, `question`, `partial-example`, `full-answer`. A higher level reveals more.
@@ -33,6 +35,7 @@ It does not:
 - To clamp a level is to lower it to the highest level that the ladder allows. The decision records the clamp.
 - Muted means the student switched the agent off.
 - A window is the part of the event list that the evaluator reads.
+- An epoch is the part of the window that a rule counts. It starts after the last event that restarts the count.
 
 ## Use
 
@@ -50,11 +53,11 @@ decision.to_dict()       # the same data as plain JSON values, with camelCase na
 ```
 
 `evaluate` is a pure function. The same inputs give the same decision. It changes none of its inputs.
+The policy, the state, and the limits must be exactly the classes of this module. A subclass gives `bad_policy`, `bad_state`, or `bad_limits`.
 
 ## The policy format
 
 A policy is a JSON object. The reader takes a Python dict.
-When a caller parses text, the caller refuses an object that repeats a key. `learning_event.py` does this for events.
 
 ```json
 {
@@ -71,27 +74,31 @@ When a caller parses text, the caller refuses an object that repeats a key. `lea
 
 Every object is closed. A key that is not listed here is an error.
 The error names the object that holds the key. It never repeats the key, because the key is untrusted text.
+Every text value must be an exact Python `str`. A subclass of `str` is refused, because a subclass is able to lie about equality.
 
 - `version` is the whole number 1.
 - `rules` is a list of at most 50 rules. It is allowed to be empty. An empty policy never offers anything.
 - `id` has 1 to 40 characters: lowercase ASCII letters, digits, and hyphens. It starts with a letter or a digit. Each id is unique in the policy.
-  The first idea also allowed capitals and `_`. The pattern is narrower now, because the id becomes the `policyId` of an `agent_offer` event. That field has this pattern.
+  The id becomes the `policyId` of an `agent_offer` event. That field has this pattern.
 - A rule has no label and no free text. Nothing in a policy holds a sentence.
 
 ### Triggers
 
-- `event` is required. It is one of the ten event types of the event contract.
+- `event` is required. It is one of the nine event types that the agent does not write. The agent's own event, `agent_offer`, is not allowed.
+  A rule that reacts to an offer is able to start a chain of offers. A later step decides on that.
+  The evaluator still reads `agent_offer` events, for the repeat guard, the epoch, and the session count.
 - `scope` is `task`, `session`, or `module`. The default is `task`. It says which events count:
-  - `task`: events of the task in focus. When no task is in focus, the rule never matches.
+  - `task`: events whose `taskId` is the task in focus. When no task is in focus, the rule never matches.
+    An event with a null `taskId` never matches this scope. The type `module_completed` always has a null `taskId`, so it is not allowed with this scope.
   - `session`: events of the session in focus.
   - `module`: events of the whole module, across sessions and tasks.
   Events of any other module never count, in every scope.
-- `count` is a whole number from 1 to 200. The default is 1. When this many events count, the rule matches.
-  The cap is the size of the window. A larger count is never reached.
+- `count` is a whole number from 1 to 50. The default is 1. When this many events count, the rule matches.
+  The cap is 50 and not 200. The window holds 200 events, and events that do not match use it up.
 - `where` is an optional condition. The list is closed, and each condition fits only some events:
   - `status` fits `check_result`: `passed`, `failed`, `error`, `skipped`, or `self-reported`.
   - `level` fits `hint_requested`: a level of the hint ladder.
-  - `outcome` fits `review_result` (`correct` or `incorrect`) and `agent_offer` (`pending`, `accepted`, `dismissed`, or `ignored`).
+  - `outcome` fits `review_result`: `correct` or `incorrect`.
   A condition means "equals" and nothing else. There is no pattern, no expression, and no code.
 - `repeat` is `true` or `false`. The default is `false`. With `true`, the `count` events share the same result.
   What "the same result" means depends on the event:
@@ -101,6 +108,21 @@ The error names the object that holds the key. It never repeats the key, because
   - `attempt_submitted`: the same work (the same digest).
   Other event types have no result, so `repeat: true` on them is an error.
   The events do not need to be next to each other.
+
+### Where the count starts
+
+A rule counts events from its epoch only. The epoch starts after the latest of these:
+
+1. The last offer by this rule in the module. The rule needs new events for its next offer.
+2. For a `check_result` trigger, the last `passed` check in the same scope and the same module.
+   A rule that counts `passed` checks is not restarted by them. The passed check itself is not counted.
+3. For scope `task`, the last `task_finished` event of the task in focus. A rule that counts `task_finished` events is not restarted by it.
+
+Examples, with a rule that needs two failed checks:
+
+- fail, fail, pass: no offer. The pass restarts the count.
+- fail, pass, fail, fail: an offer, for the last failure.
+- fail, fail, offer, fail: no offer. Two more failures give the next offer.
 
 ### Actions
 
@@ -117,36 +139,48 @@ The spec says the engine enforces six limits. No policy and no model output chan
 
 1. **An offer never reveals more than the ladder allows.** The evaluator lowers `maxLevel` to the highest level whose condition holds for the task in focus.
    `nudge` and `question` need nothing. `partial-example` and `full-answer` need a logged `attempt_submitted` event for that task, in the same module.
+   The task in focus is `state.task_id`. It sets the ceiling. The task of the trigger events does not.
    When no task is in focus, there is no attempt. A `hint_requested` event never counts as an attempt.
-   The evaluator sets the `clamped` field to true after it lowers a level.
-   The clamp runs on every hint decision. The policy has no key to switch it off.
+   The evaluator sets `clamped` to true after it lowers a level. The clamp runs on every hint decision. The policy has no key to switch it off.
 2. **The agent cannot mark a task or a module done.** The policy format has no such action and no such key. A policy that tries one is a `PolicyError`.
 3. **The agent cannot run a script or approve one.** The same holds: the format has no way to say it.
 4. **The agent cannot widen its own permissions.** Every object is closed. The limits, the mute, and the ladder are not in the policy.
    A model cannot edit a policy, because the evaluator takes a checked, frozen object.
 5. **Offers are rate limited.** `OfferLimits` has two required numbers and no defaults: `max_offers_per_session` and `min_gap_seconds`.
-   The values are an open decision for the owner. The evaluator counts nothing itself. It reads `offers_this_session` and `last_offer_at` from the state.
-6. **Mute always works.** A muted state makes the evaluator return `none` with the reason `muted`. It reads nothing else.
-   This happens before the events are read. No event, policy, or limit changes it.
+   The values are an open decision for the owner.
+   The session cap uses the larger of two numbers. One is `offers_this_session` from the state. The other is the number of `agent_offer` events in the window, for this session and this module.
+   A counter that the caller forgot to update does not lift the cap.
+   The gap uses `last_offer_at` from the state only. The evaluator never reads event times.
+6. **Mute always works.** A muted state makes the evaluator return `none` with the reason `muted`. It reads no event.
+   Any value of `muted` other than `False` counts as muted, with no error.
+   The checks on the types of `events`, `policy`, `state`, and `limits` still come first. Even when muted, an `events` value that is not a list or tuple raises `bad_events`.
 
 ## The decision
 
 `Decision` is a frozen object with these fields:
 
 - `action`: `none`, `offer_hint`, `ask_recall`, or `suggest_review`.
-- `rule_id`: the rule that made the offer. Only a matching `none` rule sets it in a `none` decision.
+- `rule_id`: the rule that made the offer. A `none` decision has one only for a matching `none` rule.
 - `level`: for `offer_hint` only. It is the highest level that the agent is allowed to offer.
-- `suppressed_by`: a tuple of reasons for a `none` decision.
+- `requested_level`: for `offer_hint` only. It is the `maxLevel` of the rule.
+- `offered_level`: for an offer only. It is the exact value for `offeredLevel` in the `agent_offer` event. See "The offer event".
+- `ceiling_reason`: `no_attempt` after a clamp, else `None`.
 - `clamped`: true after the ladder lowered the level, false otherwise.
-- `trigger_event_id`: for an offer only. It is the id of the event that made the rule match.
-  The first design had no such field. The caller needs it to write the `agent_offer` event, and the repeat guard below needs that event.
+- `trigger_event_id`: for an offer only. It is the id of the trigger event.
+- `suppressed_by`: a tuple of reasons for a `none` decision.
+- `suppressed_rule_id` and `suppressed_trigger_event_id`: when the session cap or the gap stopped a rule that matched, the rule and its trigger event. Else `None`.
+- `events_read`: how many events the evaluator read. It is 0 for a muted state.
+- `truncated`: true for a list that is longer than the window.
+
+Every id in a decision matches the pattern of the event contract. No free text from an event reaches a decision.
+`to_dict()` gives the same fields with camelCase names.
 
 The reasons in `suppressed_by` come from a closed list:
 
 - `muted`: the student muted the agent. It wins over everything.
 - `session_offer_cap`: the session already holds `max_offers_per_session` offers.
-- `min_gap`: the last offer is less than `min_gap_seconds` old. A last-offer time in the future also counts as too recent.
-- `already_offered`: a rule matched, but the agent already made an offer for that rule and that trigger event.
+- `min_gap`: the last offer is less than `min_gap_seconds` old.
+- `already_offered`: a rule matched, but its trigger event already has an `agent_offer` from some rule.
 - `no_match`: no rule matched.
 
 When both limits stop an offer, the reasons come in this order: `session_offer_cap`, then `min_gap`.
@@ -159,10 +193,22 @@ When both limits stop an offer, the reasons come in this order: `session_offer_c
 4. Otherwise the evaluator applies the rate limit. When a limit stops the offer, the answer is `none` with the reasons.
 5. A hint offer is clamped last.
 
-The evaluator skips a rule that is already answered, and goes on to the next rule.
-Look at the window for an `agent_offer` event of the same module. That event has the rule's id as `policyId` and the trigger event as `triggerEventId`. Then the rule is "already answered".
-This keeps the agent from making the same offer again for the same two failures. A new failure is a new trigger event, so a new offer follows.
-This check reads offers from the events. The rate limit does not. The rate limit reads the counters in the state.
+Look at the window for `agent_offer` events of the same module. An offer by any rule uses up its trigger event.
+The evaluator skips a rule whose trigger event is used up, and goes on to the next rule.
+So one trigger event gets one offer. A narrow rule that answered a trigger leaves no broad rule free to answer the same trigger.
+A new event is a new trigger event, so a new offer follows.
+
+### The offer event
+
+When the agent makes an offer, the caller writes an `agent_offer` event with these values:
+
+- `policyId`: `decision.rule_id`.
+- `triggerEventId`: `decision.trigger_event_id`.
+- `offeredLevel`: `decision.offered_level`. For a hint it is the clamped level. For `ask_recall` it is `recall-question`. For `suggest_review` it is `review-suggestion`.
+- `outcome`: `pending`.
+- `source`: `agent`. The task id is the task in focus, or null.
+
+A test builds this event from each kind of decision and runs it through `learning_event.validate_event`.
 
 ## What the caller must do
 
@@ -170,25 +216,42 @@ The agent loop (step E6) owns these duties. The evaluator cannot do them.
 
 - Call `evaluate` after each new event, with the events oldest first.
 - Keep `offers_this_session` and `last_offer_at`. After the agent makes an offer, add one to the count and set the time. The evaluator never changes them.
-- Pass the right `now`. The evaluator never reads a clock.
-- Write an `agent_offer` event for each offer. Use `rule_id` as `policyId` and `trigger_event_id` as `triggerEventId`. Without it, the same offer repeats.
+  The count is a floor check only. The evaluator also counts the offers it finds in the window.
+- Pass the right `now`. The evaluator never reads a clock. `last_offer_at` is not later than `now`, and neither is negative.
+- Write an `agent_offer` event for each offer, as above. Without it, the same trigger gets the offer again.
 - Pass the real mute state. A caller that forgets the mute defeats limit 6.
 - Treat `level` as a ceiling, not as a command. The agent is free to offer less.
 - Pick the limit values. They have no default.
+
+## What the evaluator trusts
+
+The evaluator trusts that `learning_event.py` or `contracts/validate-events.mjs` approved each event. It does not check the whole log.
+It re-checks only what it reads, and it fails closed:
+
+- The envelope: `eventId` and `sessionId` (lowercase UUID), `moduleId` and `taskId` (the id pattern), `source`, `type`, and `data` (an object).
+- The source rules: only `agent_offer` has the source `agent`, and `agent_offer` has no other source. The four app-only types need the source `app`.
+- The task rules: the five task types need a task id, and `module_completed` needs a null one.
+- The `data` fields that it reads, with the patterns of the event contract:
+  - `check_result`: the check id, the status, and `evidence`.
+  - `attempt_submitted`: the attempt id and the digest.
+  - `hint_requested`: the level.
+  - `review_result`: the skill and the outcome.
+  - `agent_offer`: the policy id, the trigger event id, and the outcome.
+- No event id appears twice in the window.
+
+Every text value must be an exact `str`. The evaluator compares event text for equality. It never copies the text into a decision.
+It does not read event times, the module version, or any other field.
 
 ## The window and the events
 
 - The evaluator reads the last 200 events of the list (`MAX_EVENTS_READ`). It does not read older ones.
   An attempt or a failure older than the window does not count. This errs on the safe side for the ladder: a missed attempt lowers the level.
+  `truncated` tells the caller that older events exist. `events_read` tells how many the evaluator read.
 - The order of the list is the order of events. The evaluator does not read event times, so a list in the wrong order gives wrong counts.
-- For each event in the window, the evaluator checks the fields it reads: the ids, the type, the source, the task id, and a few `data` fields.
-  An event that fails this check raises `EvaluationError` with the code `bad_event`.
+- One event that fails a check raises `EvaluationError` with the code `bad_event`. The path holds the position in the list you passed.
   The evaluator does not skip the event. A silent skip hides an attempt or a failure.
-- An event of the four app-only types needs the source `app`. The types are `attempt_submitted`, `check_result`, `task_finished`, and `module_completed`.
-  Any other source gives `bad_event`. The ladder reads attempts, so this stops an event from the student or the agent from unlocking a higher level.
-- The types tied to a task need a task id. They are `attempt_submitted`, `check_result`, `hint_requested`, `task_opened`, and `task_finished`.
-- Event text such as `evidence` is untrusted. The evaluator compares it for equality and never copies it into a decision.
-- Cost: one pass over the window for each rule. With 50 rules and 200 events that is 10,000 steps. The evaluator uses no pattern matching on event text.
+  So one malformed event in the window blocks all offers until newer events push it out of the window. The mute still works.
+- Cost: one pass over the window for each rule. With 50 rules and 200 events that is 10,000 steps. The evaluator uses no pattern matching on text of unbounded length.
 
 ## Errors
 
@@ -200,41 +263,51 @@ The path is JSON-pointer-like, such as `/rules/0/trigger/count`. It holds only f
 - Policy codes for the meaning: `unknown_action`, `unknown_event`, `bad_condition`, `unsupported_version`.
 - Evaluation codes: `bad_policy`, `bad_events`, `bad_event`, `bad_state`, `bad_limits`, `bad_decision`.
 
+The code checks the state and the limits when it builds them. It checks them again at each call.
+So a value forced into a frozen object with `object.__setattr__` is still caught, except `muted`, which counts as muted.
+
 ## Known limits
 
-- A pass by the student does not reset a count. Say a student fails twice, then passes. The "two failures" still hold in the window.
-  The repeat guard stops a second offer for the same trigger. But a first offer that a limit delayed arrives after the pass.
-  The caller avoids this by calling `evaluate` after each event.
-- A count includes every matching event in the window and in the scope, not only the latest run.
+- A count includes every matching event in the epoch, not only the latest run.
 - It is a choice that "the same result" includes `evidence`. The rule is strict: two failures with different notes are two different results.
 - An attempt that left the window no longer unlocks the upper levels. A student with a long log sees lower levels than the ladder allows. That is the safe direction.
-- The ladder checks that an attempt exists for the task. It does not check that the attempt is the one the student works on now. It does not check the module version.
+- The ladder checks that an attempt exists for the task in focus. It does not check that the attempt is recent, and it does not check the module version.
+- A passed check restarts the count of a `check_result` rule, and a finished task restarts a task-scope rule. These are the only restarts. Other events never restart a count.
 - The policy has no way to say "at most one offer per rule", "only in a certain mode", or "only after a hint". These are not in the spec for this step.
 - The evaluator does not read the mode of the student (`coach`, `pair`, `show-me`).
-- Python cannot hide an object from code in the same process. A program in the same process is able to change a frozen object.
+- The session cap counts offers found in the window. An offer older than the window is not found, so only the caller's counter remembers it.
+- Python cannot hide an object from code in the same process. A program in the same process is able to change a frozen policy.
   These limits stop mistakes and bad data. They do not stop a hostile program in the same process.
 - The tests ran on macOS only. Linux continuous integration is the final check. It has not run for this step.
 
 ## Open decisions for the owner
 
 - The values of `max_offers_per_session` and `min_gap_seconds`. They have no default on purpose.
-- Whether a pass resets a count (see "Known limits").
 - Whether a creator sets a lower rate limit for one module. Today only the caller sets the limits.
-- The shape of the policy contract file, and the version number it uses. This step ships its own strict check and uses `version` 1.
+- Whether a later step lets a rule react to the agent's own offers.
+- The shape of the policy contract file, the version number it uses, and the JSON loader. This step ships its own strict check and uses `version` 1.
 
 ## Tests
 
 `tests/test_policy_evaluator.py` uses no network, no disk, and no clock. It builds events that the real event validator accepts.
-The 135 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
+The 191 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
 
 - It checks the constants kept in code against the schema files. A drift fails a test.
 - It tests each policy fault and the closed objects.
 - It tests the three limits that the format must make impossible to state: done-marking, scripts, and permissions.
 - It tests every ladder level with and without an attempt. A random search looks for an offer above the ladder.
-- It tests mute, the caps, the gap, rule order, scope, count, repeat, the window, and the repeat guard.
+- It tests mute, the caps, the gap, rule order, scope, count, repeat, the epoch, the window, and the repeat guard.
+- It tests every event type and every field that is read, with wrong types, wrong patterns, and strings that lie about equality.
 - It tests that inputs stay unchanged, also with inputs that raise on any change.
-- It tests that the clock is never read, and that the module imports only a few standard modules.
-- It tests that 50 rules over 200 events finish quickly, and that hostile text of 100,000 characters is refused fast.
+- It tests that the module imports only a few standard modules and holds no changing global state.
+- It tests that 50 rules over 200 events finish within a loose bound, and that hostile text of 100,000 characters is refused.
+  The bounds are generous, so a slow runner does not fail them.
 
-A mutation pass changed the key rules one at a time and ran the tests. The rules were the clamp, mute, caps, rule order, scope, and the closed objects.
-Some changes survived. Each one leaves the code with the same behavior for every input.
+A mutation pass changed the key rules one at a time and ran the tests. There were 176 changes. The tests caught 170.
+Six survive. Each leaves the code with the same behavior for every input:
+
+- Dropping the guard for a missing task id on attempts. An attempt always has a task id, or the event is refused.
+- Giving a single non-repeat trigger a different position number. It has no other trigger to compare with.
+- Building repeat groups for a non-repeat rule. The groups are not read.
+- Dropping the length check, or making it one longer. The patterns also bound the length. The check only refuses huge text sooner.
+- Raising the rule cap in `from_dict` by one. The `TutorPolicy` constructor holds the same cap and refuses the same lists.
