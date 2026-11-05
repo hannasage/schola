@@ -160,6 +160,13 @@ class IdTests(ReflectionCase):
                     error = self.refused('invalid_reflection_id', self.log.get_reflection, value)
                 self.assertEqual(error.status, 400)
 
+    def test_one_uppercase_letter_in_any_group_is_refused(self):
+        base = 'abcdefab-abcd-abcd-abcd-abcdefabcdef'
+        for index, character in enumerate(base):
+            if character.isalpha():
+                with self.subTest(index=index):
+                    self.refused('invalid_reflection_id', self.log.get_reflection, base[:index] + character.upper() + base[index + 1:])
+
     def test_a_path_that_leaves_the_store_is_never_read(self):
         (self.data / 'secret.json').write_text(json.dumps({'text': SECRET}))
         self.log.save_reflection('text')
@@ -280,9 +287,15 @@ class CorruptTests(ReflectionCase):
                 self.assert_no_text(error)
                 self.assertEqual(path.read_bytes(), data)
 
-    def test_a_file_over_the_size_limit_is_reflection_corrupt_without_a_full_read(self):
-        identifier, _ = self.stored(b'a' * (event_log.MAX_REFLECTION_BYTES + 1))
-        self.refused('reflection_corrupt', self.log.get_reflection, identifier)
+    def test_a_valid_file_padded_over_the_size_limit_is_reflection_corrupt(self):
+        saved = self.log.save_reflection('ok')
+        path = self.folder / f"{saved['reflectionId']}.json"
+        path.write_bytes(path.read_bytes() + b' ' * event_log.MAX_REFLECTION_BYTES)
+        self.refused('reflection_corrupt', self.log.get_reflection, saved['reflectionId'])
+        padded = self.log.save_reflection('ok')
+        path = self.folder / f"{padded['reflectionId']}.json"
+        path.write_bytes(path.read_bytes().rstrip() + b' ' * (event_log.MAX_REFLECTION_BYTES - len(path.read_bytes().rstrip())))
+        self.assertEqual(self.log.get_reflection(padded['reflectionId'])['text'], 'ok')
 
     def test_a_folder_in_place_of_a_file_is_reflection_corrupt(self):
         identifier = str(uuid.uuid4())

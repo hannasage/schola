@@ -648,6 +648,14 @@ class LockTests(LogCase):
         self.assertTrue(error.retryable)
         self.assertEqual(self.raw(), before)
 
+    def test_a_shared_lock_held_by_a_reader_blocks_append_and_delete(self):
+        self.log.append(make_event())
+        self.hold(exclusive=False)
+        before = self.raw()
+        self.refused('lock_unavailable', self.log.append, make_event())
+        self.refused('lock_unavailable', self.log.delete, confirm=True)
+        self.assertEqual(self.raw(), before)
+
     def test_a_held_lock_blocks_delete_and_read(self):
         self.log.append(make_event())
         self.hold()

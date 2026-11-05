@@ -231,8 +231,6 @@ class EventLog:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
                 raise EventLogError('The event log is not a regular file. Schola left it as it is.', 'log_corrupt')
-            if info.st_size > le.MAX_BYTES:
-                raise EventLogError('The event log is over its 5 MB limit. Schola left it as it is.', oversize_code, 409 if oversize_code == 'log_full' else 500)
             with os.fdopen(descriptor, 'rb') as handle:
                 descriptor = None  # the file object owns it now
                 data = handle.read(le.MAX_BYTES + 1)
@@ -498,7 +496,7 @@ class EventLog:
             raise EventLogError(f'The reflection cannot be read ({_errno_name(error)}).', 'reflection_unreadable') from error
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_REFLECTION_BYTES:
+            if not stat.S_ISREG(info.st_mode):
                 raise EventLogError('The saved reflection is damaged. Schola left it as it is.', 'reflection_corrupt')
             with os.fdopen(descriptor, 'rb') as handle:
                 descriptor = None  # the file object owns it now
