@@ -17,7 +17,7 @@ The student accepts the offer, dismisses it, or ignores it. The model is silent 
 The loop does not:
 
 - show anything. It has no screen and no route. The shell shows the offer.
-- save the mute. The mute lives in memory only. The shell saves it and calls `set_muted` at start.
+- save the mute. The mute lives in memory only. The shell saves `muted` and calls `set_muted` at start.
 - write `hint_requested`. The shell writes that event after the student accepts an offer. See "What the shell must do".
 - store or read an API key. The adapter holds the key.
 - choose the rate limit, the token cap, or the timeouts. Those are decisions for the owner. They have no default.
@@ -32,7 +32,7 @@ The loop does not:
 - An outcome is what the student did with an offer: `accepted`, `dismissed`, or `ignored`.
 - The window is the last 200 events of the log. The evaluator reads only the window.
 - If a check cannot pass, to fail closed is to do nothing. Here it means no model call and no event.
-- Mute means the student switched the agent off. A self-mute is a mute that the loop sets after repeated failures.
+- Mute means the loop makes no offer. The student sets `muted`. The loop sets `self_muted` after repeated failures. Either one keeps the loop quiet.
 - A pair is one policy id with one trigger event id. The log is append-only. So the outcome of an offer is a new `agent_offer` event for the same pair.
   One offer is one pair.
 
@@ -69,24 +69,36 @@ The loop never reads the real clock. The caller injects both functions. So a tes
 A wrong argument raises `AgentLoopError`. It has a stable `code` and a fixed message that holds no data. This is for programmer errors only.
 A condition at run time never raises. It returns a result.
 
+A task label that holds a path or a key-shaped string raises `AgentLoopError` with the code `bad_config`. The loop checks it at construction and at each call.
+So a bad label cannot cause model failures later.
+
 ## What happens on one event
 
 `on_event(event)` follows these steps in order. The whole path runs under one lock, so calls run one at a time.
 
-1. An event of the agent, of another session, or of another module is not a trigger. The result is `none` with the reason `not_a_trigger`.
+1. An event of the agent, of another session, or of another module is not a trigger. The loop computes once which event types the rules of the policy name.
+   An event of any other type is not a trigger either, and the loop does not read the log for it. The result is `none` with the reason `not_a_trigger`.
 2. A muted loop returns `none` with the reason `muted`. A pending offer that has not timed out gives `none` with the reason `offer_pending`.
-3. If the log was damaged at start, the loop rebuilds the counters now. If that fails, the result is `log_damaged`.
-4. The loop reads the window from the log. A damaged line, a cut tail, or a read error gives `log_damaged`. There is no model call and no event.
-5. The loop builds a `SessionState` and calls `evaluate`. A malformed event in the window gives `evaluation_failed`.
-6. The loop sweeps the pending offers that timed out. This happens after the evaluator has read the log. See "Outcomes".
-7. If the decision is `none`, the result is `none` with the reasons of the decision. A matching `none` rule gives the reason `quiet_rule`. There is no model call and no event.
-8. If the trigger event failed before, the result is `none` with the reason `trigger_failed`.
-9. If the token budget is spent, the result is `none` with the reason `budget_exhausted`. There is no model call and no event.
-10. The loop asks for a new event id, builds the prompt, and calls the model.
-11. The loop cleans the text. A refused text gives `bad_offer_text`. There is no event.
-12. The loop checks the mute again, with the lock held. A mute during the call drops the result. The reason is `muted_during_call`. There is no event and no counter change.
-13. The loop appends the `agent_offer` event with the outcome `pending`. If the append fails, the offer is dropped and no counter changes. The reason is `log_failed`.
-14. The loop adds one to `offers_this_session`, sets `last_offer_at`, and keeps the offer as pending. The result is `offer`.
+3. The loop sweeps the pending offers that timed out. If the write of an `ignored` outcome fails, the old offer is still pending.
+   The result is `none` with the reason `offer_pending` and the `error_code` of the log. There is no model call.
+4. If the log was damaged at start, the loop rebuilds the counters now. If that fails, the result is `log_damaged`.
+5. The loop reads the window from the log. A damaged line, a cut tail, or a read error gives `log_damaged`. There is no model call and no event.
+6. The loop builds a `SessionState` and calls `evaluate`. It passes the trigger events that failed before as `exclude_triggers`.
+   A malformed event in the window gives `evaluation_failed`.
+7. If the decision is `none`, the result is `none` with the reasons of the decision. A matching `none` rule gives the reason `quiet_rule`.
+   A trigger that failed before gives `trigger_failed`, after the evaluator tried the other rules. There is no model call and no event.
+8. If the token budget is spent, the result is `none` with the reason `budget_exhausted`. There is no model call and no event.
+9. The loop asks for a new event id, builds the prompt, and calls the model.
+10. The loop cleans the text. A refused text gives `bad_offer_text`. There is no event.
+11. The loop checks the mute and the mute generation, with the state lock held. A mute during the call drops the result.
+    A mute followed by an unmute counts too. The reason is `muted_during_call`. There is no event and no counter change.
+    The loop also checks that no other offer is pending.
+12. The loop appends the `agent_offer` event with the outcome `pending`. It does this without the state lock.
+    If the append fails, the offer is dropped and no counter changes. See "Writes that report an error".
+13. The loop takes the state lock again and adds one to `offers_this_session`. It sets `last_offer_at` and keeps the offer as pending.
+    A mute that landed since step 11 cancels the offer. The loop then marks the offer `ignored` in the log, and the result is `none` with `muted_during_call`.
+    The loop never returns an offer that it already marked `ignored`.
+14. Otherwise the result is `offer`.
 
 The model call comes first and the event second. A model call that fails writes nothing. An event is never written for text that nobody saw.
 This order has a cost. If the process stops between the call and the write, tokens were spent and no offer exists.
@@ -101,27 +113,33 @@ This order has a cost. If the process stops between the call and the write, toke
 - `offer`: a frozen `PendingOffer` for `offer`, else `None`.
 - `reasons`: a tuple of stable codes. It is empty for an `offer`.
 - `tokens_charged`: what the model call cost the budget. It is 0 for a result with no call.
-- `error_code`: the stable code of an adapter error or an event log error, else `None`.
+- `error_code`: the stable code of an adapter error or an event log error, else `None`. An offer can carry one. See "Writes that report an error".
+- `recovered`: how many pending offers of an earlier run the loop closed at start. Only the first result carries a count above 0.
 
 A result never holds an exception message, model text, or event text. The offer text is only in `offer.text`.
 
 `PendingOffer` has these fields: `offer_id` (the `eventId` of its `agent_offer` event), `text`, `action`, `level` (the `offeredLevel`), `rule_id`, `trigger_event_id`, and `created_at`.
 
-The reasons, with the kind that goes with each:
+The reasons, with the kind that goes with each. Four reasons come with the kind `error`. All others come with the kind `none`.
 
-- From the evaluator, kind `none`: `muted`, `session_offer_cap`, `min_gap`, `already_offered`, `no_match`.
-- `quiet_rule`, kind `none`: a rule of the policy says to do nothing here.
-- `not_a_trigger`, kind `none`: the event is from the agent, or from another session or module.
-- `offer_pending`, kind `none`: an earlier offer waits for the student.
-- `trigger_failed`, kind `none`: this trigger failed before. The loop does not try it again.
-- `budget_exhausted`, kind `none`: the token budget has no room for a call.
-- `log_damaged`, kind `none`: the log did not read clean. If the read raised, the `error_code` holds the log error code.
-- `evaluation_failed`, kind `none`: the evaluator refused an event in the window. The `error_code` holds the evaluator code.
-- `bad_offer_text`, kind `none`: the model text was refused. The tokens were spent.
-- `muted_during_call`, kind `none`: the student muted the agent while the model worked. The tokens were spent.
-- `model_failed`, kind `error`: the adapter raised. The `error_code` holds the adapter code.
-- `log_failed`, kind `error`: the event failed to write. The `error_code` holds the log code. The tokens were spent.
-- `self_muted_after_failures`: the loop adds it to the reasons of the third failure in a row. The loop is now muted.
+Kind `error`:
+
+- `model_failed`: the adapter raised, or it gave a result of the wrong type. The `error_code` holds the adapter code.
+- `log_failed`: the event failed to write. The `error_code` holds the log code. The tokens were spent.
+- `log_damaged`: the log did not read clean, or a write left a partial line. If the read or the write raised, the `error_code` holds the log error code.
+- `evaluation_failed`: the evaluator refused an event in the window. The `error_code` holds the evaluator code.
+
+Kind `none`:
+
+- From the evaluator: `muted`, `session_offer_cap`, `min_gap`, `already_offered`, `trigger_failed`, `no_match`.
+- `quiet_rule`: a rule of the policy says to do nothing here.
+- `not_a_trigger`: the event is from the agent, from another session or module, or of a type that no rule names.
+- `offer_pending`: an earlier offer waits for the student, or the loop failed to close an old one.
+- `budget_exhausted`: the token budget has no room for a call.
+- `bad_offer_text`: the model text was refused. The tokens were spent.
+- `muted_during_call`: the student muted the agent while the model worked. The tokens were spent.
+
+`self_muted_after_failures` is not a kind of its own. The loop adds it to the reasons of the third failure in a row. The loop is now self-muted.
 
 ## What the model sees
 
@@ -138,16 +156,16 @@ The user message has a labelled `DATA` block. The block holds:
 
 - the offer kind (`hint`, `recall`, or `review`) and the allowed level name.
 - three counts for the task in focus, taken from the window: failed checks, hint requests, and attempts.
-- the skill ids of the trigger event. Only text that matches the skill id pattern goes in.
-- the task label from the caller. No label means no line.
+- the skill ids of the trigger event, as a JSON list. Only text that matches the skill id pattern goes in.
+- the task label from the caller, as a JSON string. No label means no line.
 
 The prompt never holds hint content, lesson text, answers, student attempts, reflections, evidence text, check ids, attempt ids, digests, event ids, or paths.
 So the model cannot leak an answer from the prompt. The allowed level only tells the model how much help the student can ask for next.
 
 The task label is creator text. It is untrusted. The loop removes hidden characters, collapses white space, and cuts the label to 200 characters.
 Then it writes the label as a JSON string on one line, under a heading that says it is untrusted. A quote or a line break in the label cannot end the block.
-The adapter's context guard then reads the whole prompt. A key-shaped string or a path in the label makes the adapter raise `invalid_request`.
-The loop reports `model_failed` with that code. It does not echo the label.
+The context guard of the adapter reads the whole prompt too. A key that only the adapter holds can still reach that guard.
+Then the adapter raises `invalid_request`, and the loop reports `model_failed` with that code. It does not echo the label.
 
 A test scans every prompt that any test builds. A prompt with a banned marker, an id, a digest, or a path fails the test.
 
@@ -159,32 +177,40 @@ The text from the model is untrusted. The function `clean_offer_text` does this:
 - It removes control, format, private-use, unassigned, and surrogate characters. It removes line and paragraph separators and the blank filler letters.
 - It turns every kind of white space into one space and trims the ends.
 - It keeps at most 2 combining marks in a row.
-- It cuts the text to 280 characters, at a character boundary, and trims the end.
-- It refuses an empty result. It also refuses a result with a link, a code fence, or an HTML-like tag. A refused text returns `None`.
+- It builds a skeleton of the text. The skeleton drops all combining marks. It turns five dot look-alikes into dots. They are listed in `_DOT_LOOKALIKES`.
+  Then it folds the text to plain forms (NFKC).
+- It runs every refusal check on the cleaned text and on the skeleton. Each check also runs on a folded copy of the cleaned text.
+- It cuts the text to 280 characters, at a character boundary, and trims the end. Then it runs the checks again on the cut text.
+- A refused text returns `None`.
 
-The checks for a link, a fence, and a tag run on a folded copy of the text (NFKC). So wide forms such as a full-width `https://` are caught.
-The kept text is not folded. The checks run before the cut and again after it.
+The loop refuses an empty text. It refuses a text with any of these:
 
-A link is any of these:
+- a scheme (`://`), `www.`, or `hxxp`
+- a script or data scheme such as `javascript:`, `vbscript:`, `data:`, or `mailto:`. The full list is in `_SHAPES`
+- `](` or a bracketed dot such as `[.]`
+- a code mark: any backtick, or three tildes
+- a bare domain: a dot with two or more letters on both sides, such as `example.com`, `example.co.uk`, `bit.ly`, `notes.ai`, or `main.py`
+- a short domain with a path: a name, a dot, two letters, and a slash, such as `t.me/x`
+- an IPv4 address, or `localhost` with a port
+- `@` between two word characters
+- an HTML entity such as `&#106;`, `&#x6a;`, or `&amp;`
+- a tag: `</`, `<!`, `<?`, or `<name>`, `<name/`, `<name />`, or `<name attribute=`
 
-- `://`
-- `www.`
-- `javascript:` or `vbscript:`
-- `data:`, `file:`, `mailto:`, `tel:`, `sms:`, or `blob:` followed by text
-- `](`
-- a word with a common web ending, such as `com`, `org`, `net`, or `io`. The full list is in `_LINK_SHAPES`
+Text such as `i<n correct` is not a tag. Every pattern scans in linear time. A test runs each one on 100,000 characters of hostile text.
 
-A code fence is three backticks or three tildes. A tag is `<` followed by a letter, `/`, `!`, or `?`.
-Every pattern scans in linear time. A test runs each one on 100,000 characters of hostile text.
+These checks are a list of shapes. They are not a proof. Some good text is refused, and some bad text passes:
 
-These checks are a list of shapes. They are not a proof:
-
-- A link with another ending passes. So does a spelled-out address.
-- Text such as `x<y` is refused, though it is not a tag.
+- Some good text is refused. The rule for a bare domain refuses `notes.ai`, `main.py`, `index.js`, and a sentence with no space after its full stop. The owner accepted these false positives.
+  The text `a<b>c` is refused too.
+- A domain with a one-letter label and no path passes, such as `t.co`.
+- A link with another shape passes. An address spelled out in words passes.
 - The text is still a model's words. It can be wrong, rude, or unhelpful. The loop does not judge meaning.
 - The list of unassigned characters comes from the Python version. A very new character stays on one version and goes on another.
+- The heuristics are tuned for English. Who checks them for other languages is an open decision.
 
-**The shell must show the text as plain text. It must never put the text in HTML or run it as markdown.** The cleaning is a second guard, not the first.
+The shell must show the text as plain text. It must never put the text in HTML or run it as markdown.
+The shell must also turn auto-linking and data detectors off for the text. Then nothing makes a link out of a number or a name.
+The cleaning is a second guard, not the first.
 
 ## Outcomes
 
@@ -193,60 +219,105 @@ The new event has the same `policyId`, `triggerEventId`, `offeredLevel`, `taskId
 The first event of the pair stays `pending` in the log. The log is append-only.
 
 An unknown offer id, or an offer that is already resolved, gives a `ResolveResult` with `resolved` false and the reason `unknown_offer`. It does not raise.
-A failed write gives the reason `log_failed`, and the offer stays pending.
+While one thread writes the outcome of an offer, another call for the same offer gets `unknown_offer`. So the log never holds two outcomes from one `resolve`.
+A failed write gives the reason `log_failed`, and the offer stays pending. A partial line gives the reason `log_damaged`.
+
+`ResolveResult` has these fields: `resolved`, `offer_id`, `outcome`, `reason`, `event_id`, `error_code`, and `maybe_written`.
+The `error_code` is the log code of a failed write. When the write gave an unclear result, `maybe_written` is true.
 
 `sweep()` marks every pending offer older than `offer_timeout_seconds` as `ignored`. An offer whose age equals the timeout is old enough.
 `on_event` also sweeps. So a forgotten offer cannot block the loop for ever. An offer that timed out does not block a new offer.
-The sweep runs after the evaluator has read the log. The outcome event of an offer restarts the count of its rule (see `docs/policy-evaluator.md`).
-An earlier sweep hides the event that triggered the call.
+If the sweep cannot write, the old offer stays and blocks the new one. See step 3 above.
 
 While an offer is pending, the loop makes no new offer. The reason is `offer_pending`.
 
+The outcome event of an offer does not restart the count of its rule. Only the first event of a pair does. See `docs/policy-evaluator.md`.
+So a failure that came while an offer was pending still counts after the student answers or the offer times out.
+
+## Writes that report an error
+
+A write of the log can raise an error with details. The loop reads two flags in the details: `maybeWritten` and `partialLine`.
+
+- No flag: the write failed and wrote nothing. An offer is dropped (`log_failed`). A resolve keeps the offer pending.
+- `maybeWritten` (for example `fsync_failed`): the event is possibly in the log. The loop reads the tail of the log and looks for the event id.
+  If the id is there, the write counts as done. An offer is returned, with the log code in `error_code`. A resolve is `resolved`, with `maybe_written` true.
+  If the id is not there, or the read cannot tell, the write counts as failed. There is no double outcome event.
+- `partialLine`: the write left a partial line. The log is damaged. An offer gives `log_damaged` with the log code. A resolve gives `log_damaged`.
+  The next event fails closed until the log reads clean.
+
+A failed offer write and a partial line count as failures toward the self-mute. A failed resolve does not.
+
 ## Mute
 
-`set_muted(True)` takes effect at once. It does not wait for a model call, because it uses a small lock that the call does not hold.
-A mute also applies to an offer being built: the loop checks the mute again before it writes the event.
-Muting does not delete pending offers. It marks each one `ignored` through `resolve` and returns the results.
-`set_muted(False)` also resets the count of failures in a row.
+The student can mute the loop with `set_muted(True)`. The loop can also mute itself. The two are separate:
 
-The mute is in memory only. The shell saves it and restores it at start.
+- `muted` is the choice of the student. The shell saves it and restores it at start.
+- `self_muted` is set after 3 failures in a row. The shell does not save it.
+- If either one is true, the loop makes no offer.
+
+`set_muted(True)` takes effect at once. It sets the flag before it writes anything, and it never waits for a model call or for the write of another thread.
+Muting does not delete pending offers. It marks each one `ignored` through `resolve` and returns the results.
+`set_muted(False)` clears `muted` and `self_muted`. If something was muted, it resets the count of failures. A call on a loop that is not muted keeps the count.
+
+Every call of `set_muted` adds one to the mute generation. A self-mute adds one too. The loop reads the generation before the model call and again before it writes.
+If the number changed, a mute and an unmute happened during the call, and the loop drops the offer.
+
+The shell must check `muted` again just before it shows an offer. A mute can land after `on_event` returned.
 
 ## Failures
 
-After an adapter error, a refused text, or a failed write, the loop remembers the trigger event id. It does not try that trigger again.
-The budget keeps the tokens that were spent. This stops a retry storm. The loop remembers the last 64 failed triggers.
-The loop can try a trigger again after the memory drops it.
+After an adapter error or a failed write, the loop remembers the trigger event id and passes it to the evaluator as an excluded trigger.
+The evaluator skips that trigger and tries the next rule. So a failed trigger does not hide the rules after it.
+The budget keeps the tokens that were spent. This stops a retry storm.
+
+- An error that can pass (`timeout`, `rate_limited`, `endpoint_unreachable`, the adapter flag `retryable`) is remembered until `offer_timeout_seconds` after the failure.
+  Then the loop can try the trigger again.
+- Any other error, a failed write, and a refused text are remembered for good, up to 64 triggers. The oldest are dropped first.
 
 After 3 failures in a row the loop mutes itself. The result of the third failure has two reasons: the reason of the failure and `self_muted_after_failures`.
-A success resets the count. The student unmutes with `set_muted(False)`.
+A success resets the count. The student ends the self-mute with `set_muted(False)`.
+The count rises for an adapter error, a failed write, and a partial line. It does not rise for a refused text.
+A refused text is a fault of the model's words, not of the system. The trigger is still remembered.
 
 The loop reports the adapter error `token_cap_reached` as `budget_exhausted`, not as a failure. The adapter refused before it sent anything.
 So nothing was spent, and a full budget is not the fault of the model. It does not count toward the self-mute.
 
 A damaged log does not count as a failure. It is a fault of the log, not of the model.
 
-## Counters
+The loop catches an error from the adapter call only. An error from the adapter other than `ModelAdapterError` is logged and becomes `model_failed` with the code `bad_response`.
+The log line holds the type and the places in the code (the logger `schola.agent_loop`, level warning). It never holds the message.
+A result of the wrong type also becomes `model_failed`. An error in the loop's own code is not caught. It reaches the caller, and it does not count as a model failure.
+
+## Counters and restart
 
 The loop keeps `offers_this_session` and `last_offer_at`. At start it rebuilds them from the log:
 
 - It reads the log in pages of 500 lines.
-- It looks at the `agent_offer` events of this session and this module.
+- It looks at the `agent_offer` events with the source `agent` of this session and this module.
 - `offers_this_session` is the number of pairs. An offer and its outcome events are one pair.
-- `last_offer_at` is the latest of the pair times. The time of a pair is the time of its first event, not of its outcome.
+- `last_offer_at` is the latest of the pair times. The time of a pair is the earliest time among its events that the loop can read.
+  A pair whose time cannot be read (such as the year 0000) is still counted. A time below 0 (such as the year 1) counts as 0.
+  Before each evaluation the loop also caps `last_offer_at` at the current time.
 
 The log keeps times in whole seconds. So the rebuilt `last_offer_at` is rounded down to the second.
+The loop reads zone offsets such as `+05:30` and fractions of a second, because another writer can write them.
 A restart does not reset the cap. If the log is damaged at start, the counters stay at zero. Then `on_event` fails closed until the log reads clean, and it rebuilds the counters.
-Before each evaluation the loop caps `last_offer_at` at the current time. So a clock that moved back does not make the evaluator refuse the state.
 
-A pending offer is in memory only. After a restart, the offer that was pending in the log is not restored. The shell can no longer resolve it.
-It stays `pending` in the log. The evaluator still counts it and does not offer its trigger again.
+A pending offer is in memory only. At start the loop finds each pair with no outcome event, in this session and module. It tries to append an `ignored` outcome for each pair.
+The first result of `on_event` reports the number of closed offers in `recovered`.
+A failed write does not block the loop. The pair stays counted, and the evaluator does not offer its trigger again.
+After a restart, `resolve` for the old offer id gives `unknown_offer`.
 
 ## Concurrency
 
-The server is threaded. `on_event` runs under one lock for its whole path, including the model call.
+The server is threaded. `on_event` runs under one lock (`_lock`) for its whole path, including the model call.
 So two threads with a limit of one make exactly one offer. The second thread waits, then reads the log that holds the first offer.
-A second lock guards the mute, the focus, the pending offers, and the counters. The loop holds it for short work only.
-`set_muted`, `resolve`, and `sweep` use only the second lock. So they never wait for a model call.
+
+A second lock (`_state_lock`) guards the mute flags, the mute generation, the focus, the pending offers, and the counters.
+The loop holds it for short work only. It never holds it during a log read or write, a model call, `clock()`, or `new_id()`.
+So these calls never wait for a model call: `set_muted`, `muted`, `self_muted`, `pending_offers`, and `resolve`.
+They never wait for the log write of another thread either.
+A test holds a write open for 1.5 seconds and shows that `set_muted` returns at once.
 The order is always the first lock, then the second.
 
 Calls to `on_event` queue behind a slow model call. The timeout of the adapter bounds the wait.
@@ -254,7 +325,7 @@ Calls to `on_event` queue behind a slow model call. The timeout of the adapter b
 ## Reading the log: cost
 
 The loop reads the last 200 events with `EventLog.read`. It asks for the line count first. Then it asks for the lines from `total - 200` on.
-It does not put the log in a prompt.
+It does not put the log in a prompt. An event of a type that no rule names does not read the log at all.
 
 `EventLog` checks the whole file once for each version of the file. It caches the check while the file is unchanged.
 Every append makes a new version. So each `on_event` that follows a write pays for one full check of the file. When an offer appends, it pays for a second check.
@@ -263,90 +334,106 @@ The cost grows with the size of the log. It is the known first-read cost of step
 These figures come from one Apple silicon Mac, Python 3.14. The events were 622 bytes each: a check result with 200 characters of evidence and four skills.
 The figure is the time of one `on_event` that makes an offer:
 
-- 84 events (52 KB): about 15 ms.
-- 842 events (0.5 MB): about 115 ms.
-- 4,214 events (2.6 MB): about 0.9 s.
-- 7,586 events (4.7 MB, 90 percent of the 5 MB cap): about 1.5 s. Five runs gave 1.2 s to 2.6 s.
-- The first read of the 4.7 MB log took about 3.6 s. Rebuilding the counters at start then took 63 ms.
+- 84 events (52 KB): about 10 ms.
+- 842 events (0.5 MB): about 80 ms.
+- 4,214 events (2.6 MB): about 0.4 s.
+- 7,586 events (4.7 MB, 90 percent of the 5 MB cap): about 0.7 s. The first read of that log took about 0.9 s, and the rebuild of the counters at start took 51 ms.
+
+An earlier run of the same script on the same Mac, with other jobs running, gave 15 ms, 115 ms, 0.9 s, and 1.5 s. So the figures move with the load of the machine.
 
 The cap is 5 MB. So a log near the cap costs seconds for each event. A real log has smaller events than these, so it holds more of them.
 Each figure is from one machine and one run. They are not a bound. Linux was not measured.
-A later step can lift this cost by reading only the tail of the file.
+A tail-only read of the file lifts this cost. That change is open. It needs a new reader in step E2.
 
 ## What the shell must do
 
-- Show `offer.text` as plain text.
+- Show `offer.text` as plain text, with auto-linking and data detectors off.
+- Check `muted` again just before it shows an offer.
 - Call `on_event` after each student or app event, from a background thread.
 - When the student opens a task, call `set_focus`.
 - Call `sweep` now and then. The page can do this on page show and page hide.
-- Save the mute. Call `set_muted` at start.
+- Save `muted` and nothing else. Call `set_muted` at start.
 - After the student accepts a hint offer, write a `hint_requested` event with the origin `agent-offer-accepted`. The loop does not write it. Then call `resolve(offer_id, 'accepted')`.
 - Treat `offer.level` as the most help the student can ask for. The evaluator already clamped it.
 
 ## Known limits
 
-- The outcome event of an offer restarts the count of its rule. So does every `agent_offer` event of that rule.
-  Events between the offer and its outcome do not count toward the next offer of that rule. This errs on the side of fewer offers. See "Open decisions".
-- A trigger that failed gets no offer. The student sees nothing for that event.
-- Nothing is stored for the mute, the focus, or the pending offers.
+- A trigger that failed for good gets no offer. The student sees nothing for that event.
+- Nothing is stored for the mute, the focus, or the pending offers. The pending offers of an earlier run are closed at start, on a best effort basis.
 - The model call holds the main lock. One slow call delays the next event. The timeout of the adapter is the bound.
 - If the process stops between the model call and the write, tokens were spent and no offer exists.
+- If a mute lands after the write and the `ignored` write then fails, the offer stays pending in memory and in the log. The next sweep tries again.
+  The shell must check `muted` before it shows an offer.
+- If the clock moves backwards, a pending offer stays until the clock catches up with its timeout. The loop caps `last_offer_at` at the current time, but it does not move `created_at`.
 - The sanitizer is a heuristic. See "The offer text".
 - The tests use a stub model. No real model, no real network, and no real shell ran. The behavior with real replies is untested.
-- The cost of reading the log grows with the log. See "Reading the log: cost".
+- The cost of reading the log grows with the log. A tail-only read is open. See "Reading the log: cost".
+- An event of a type that no rule names does not run the evaluator. Say a limit held back an offer, such as the gap. Then the next event of a trigger type brings the offer back.
+  An event of another type does not.
 - Python cannot hide an object from code in the same process. These limits stop mistakes and bad data. They do not stop a hostile program in the same process.
 - The tests ran on macOS only. Linux continuous integration is the final check. It has not run for this step.
 
 ## Open decisions for the owner
 
 - The values of `max_offers_per_session` and `min_gap_seconds` (`OfferLimits`), the token cap, `max_output_tokens`, and `offer_timeout_seconds`. None has a default.
-- Whether the outcome of an offer restarts the count of its rule. Today it does. A change in the evaluator can restart the count at the first event of a pair only.
-- Whether the loop closes a pending offer from an earlier run with an `ignored` event at start.
-- Whether the log read needs a faster path before the shell calls `on_event` on a long log.
+- Whether the log read needs a tail-only path before the shell calls `on_event` on a long log.
 - Who checks the heuristics of the offer text for languages other than English.
+- Whether the bare-domain rule keeps refusing file names such as `main.py`, or lists the web endings again.
 
 ## Tests
 
 `tests/test_agent_loop.py` uses no network and no real clock. The model is a stub that overrides `_send`. The log is a real `EventLog` in a temporary folder.
 The clock and the ids are injected.
 
-The 155 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS. The 197 tests of the evaluator also passed on the same four versions.
+The 241 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS. The 214 tests of the evaluator and the 54 tests of the event routes passed on the same four versions.
 
 - It builds a schema-valid `agent_offer` event for each kind of offer (hint, recall, review) and runs it through `learning_event.validate_event`.
 - It checks every reason code and the kind that goes with it.
 - It checks that the model is called before the event is written, and that a failed write drops the offer and keeps the counters.
-- It checks that the cap holds over 100 events, and that a restart rebuilds the counters from the log. It also checks a cap whose offers left the window.
+- It makes the log report `fsync_failed` with the event present, with the event absent, and with a partial line. It does this for an offer and for a resolve.
+  A resolve writes one outcome event, never two.
+- It makes the sweep write fail, and checks that no model call follows. It also checks that two offers are never pending.
+- It checks the cap over 100 events, and that a restart rebuilds the counters from the log. It also checks a cap whose offers left the window.
+- It checks a restart with a pending offer: the loop closes it, reports `recovered`, and answers a late resolve with `unknown_offer`.
+- It reads times with zone offsets and fractions, and with the years 0000 and 0001, and checks the clamps.
 - It checks that a spent budget makes no model call and no event.
-- It checks the mute at start, during the log read, during the model call, and in the gap between the last check and the write.
+- It checks the mute at start, during the log read, during the model call, and between the write and the commit.
+  It also checks the mute during a one and a half second append. A mute and an unmute during the call drop the offer.
+  The mute and the readers return at once while a model call or a write is slow.
+- It checks that `muted` and `self_muted` are separate. It also checks the cases where `set_muted(False)` resets the count of failures.
 - It runs two threads with a limit of one, with a barrier and a stub that waits. It makes exactly one offer. It also runs 12 threads against a cap of two.
-- It checks the failure rules: no retry of a failed trigger, a self-mute at 3 failures, a reset after a success, and a reset after an unmute.
+- It checks the failure rules. A failed trigger gets no retry. An error that can pass gets a retry after the timeout. Three failures give a self-mute. A success resets the count.
+  A refused text does not count, and a failed trigger does not hide another rule.
 - It checks a damaged log, a cut tail, an unreadable log, and a read report that is not `ok` on either read. All fail closed.
+- It checks an adapter that raises, an adapter that returns the wrong type, a memory error, and a bug in the loop's own code.
 - It scans every prompt that any test builds for banned markers, ids, digests, and paths. It also checks that the scan itself catches them.
-- It puts a key-shaped string or a path in the task label. The context guard stops it. The result does not echo it.
-- It checks the offer text cleaner on each kind of hidden character, link, fence, and tag. It also checks text that only looks a little like one.
-  It runs 3,000 random texts and 35 kinds of hostile text of 100,000 characters.
+- It puts a key-shaped string or a path in the task label. The loop refuses it with `bad_config`. A key that only the adapter knows reaches the context guard.
+- It checks the offer text cleaner on each kind of hidden character, link, domain, address, entity, code mark, and tag. It also checks text that only looks a little like one.
+  It checks every bypass of the security report. It runs 3,000 random texts, 71 kinds of hostile text of 100,000 characters, and 18 long runs.
 - It checks that the module imports only the standard library and the three local modules, and that it holds no changing global state.
 
 A stub model replaces the real one. No test uses a real model, a real network, or a real shell.
 
-A mutation pass changed the key rules one at a time and ran the tests. The changes cover these rules:
+A mutation pass changed the key rules one at a time and ran the tests. The mutation script is a throwaway tool. It is not part of the repository.
 
-- the cap and the counters
-- the mute checks before and after the call
-- the order of the model call and the write
-- the reads that fail closed
-- the text cleaner
-- the self-mute after 3 failures
-- the single pending offer
-- the locks and the outcome events
-- the session cap floor in the evaluator
+The first review round made 172 changes to the new and changed code:
 
-- The first pass made 156 changes. The tests caught 130. One change had a typo in its own pattern and ran nothing. The other 25 got new tests or a simpler rule in the code.
-- The second pass made 165 changes: the 156, with the typo fixed, and 9 more. The tests caught 162. Three survived.
-- A third run of those three changes, against the final tests, caught all three.
+- the trigger types, the recovery at start, and the counters
+- the time reader (zone sign, fraction, minutes, hours)
+- the mute generation, the cancel after the write, and the two kinds of mute
+- the ambiguous writes, the read that checks a write, and the partial line
+- the resolve claim, the sweep, and the failed trigger memory with its expiry
+- the label check, the prompt, and the result kinds
+- the text cleaner: the skeleton, the bare domain, the address shapes, the entity shapes, the tag, and the code marks
+- the evaluator: the first-event rule for the count and the excluded triggers
 
-One of the three needs a note. The change `offset += REBUILD_PAGE - 1` is equivalent at the real page size of 500.
-A line read twice changes nothing, because the loop counts pairs. A test with a page size of one catches it as an endless loop, and the run stops it at a time limit.
-So that kill is real but degenerate.
+The tests caught 156 and missed 16. New tests caught 13 of the 16. Three survive. Each is equivalent:
 
-The mutation script is a throwaway tool. It is not part of the repository.
+- `state ignores self mute` and `precommit ignores self mute`. Only the failure path of `on_event` sets the self-mute, and it runs under the main lock.
+  No thread can set it between the first mute check and the commit. So the second and third checks of it never see a change.
+- `partial after confirm`. A partial line makes the log unreadable, so the read that looks for the event always says no. The order of the two tests changes nothing.
+
+One change to `event_routes.py` (the check for the type `agent_offer`) was run by hand. The tests caught it.
+
+An earlier round made 165 changes to the first version of the loop. The tests caught 162.
+New tests killed the three that survived. One of them died as an endless loop, which the run stopped at a time limit.
