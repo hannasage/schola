@@ -16,7 +16,7 @@ Limits that no policy and no model output can change
 4. The agent cannot widen its own permissions. The format is closed: a key or an action that is not listed is an error.
 5. Offers are rate limited. `OfferLimits` has two required numbers and no defaults. The values are an open decision for the owner.
    The caller owns the counters (`offers_this_session`, `last_offer_at`) and must update them after each offer.
-   The session cap also counts the `agent_offer` events of this session in the window, so a counter that is too low does not lift it.
+   The session cap also counts the offers of this session in the window (each policy and trigger pair once), so a counter that is too low does not lift it.
 6. The student can mute the agent at any time. A muted state gives no offer, whatever the policy says.
 
 Rules
@@ -712,7 +712,8 @@ def evaluate(policy, events, *, state, limits):
     meta = {'events_read': len(facts), 'truncated': truncated}
     # One offer per trigger event, from any rule. The session count is the larger of the caller's counter and the offers in the window.
     offered_triggers = {fact.offer[1] for fact in facts if fact.offer is not None and fact.module == state.module_id}
-    session_offers = sum(1 for fact in facts if fact.offer is not None and fact.module == state.module_id and fact.session == state.session_id)
+    # An outcome (accepted, dismissed, ignored) is a new `agent_offer` event for the same policy and trigger, so count each pair once.
+    session_offers = len({fact.offer for fact in facts if fact.offer is not None and fact.module == state.module_id and fact.session == state.session_id})
 
     skipped = False
     winner = None

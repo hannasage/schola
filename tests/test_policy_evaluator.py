@@ -1060,6 +1060,55 @@ class SuppressionTests(unittest.TestCase):
             log.offer('other', log.opened(), outcome=outcome)
         self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(4)).suppressed_by, ('session_offer_cap',))
 
+    def test_an_offer_and_its_later_outcome_event_count_once(self):
+        # The log is append-only, so an outcome is a second `agent_offer` event with the same policy and trigger.
+        for outcome in ('accepted', 'dismissed', 'ignored'):
+            log = two_failures()
+            trigger = log.opened()
+            log.offer('other', trigger, outcome='pending')
+            log.offer('other', trigger, outcome=outcome)
+            self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(2)).action, 'offer_hint', outcome)
+            self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(1)).suppressed_by, ('session_offer_cap',), outcome)
+
+    def test_a_third_event_for_the_same_offer_still_counts_once(self):
+        log = two_failures()
+        trigger = log.opened()
+        for outcome in ('pending', 'accepted', 'ignored', 'dismissed'):
+            log.offer('other', trigger, outcome=outcome)
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(2)).action, 'offer_hint')
+
+    def test_two_offers_for_different_triggers_count_twice(self):
+        log = two_failures()
+        log.offer('other', log.opened(), outcome='pending')
+        log.offer('other', log.opened(), outcome='pending')
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(2)).suppressed_by, ('session_offer_cap',))
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(3)).action, 'offer_hint')
+
+    def test_the_same_trigger_offered_by_two_rules_counts_twice(self):
+        log = two_failures()
+        trigger = log.opened()
+        log.offer('other', trigger)
+        log.offer('another', trigger)
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(2)).suppressed_by, ('session_offer_cap',))
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(3)).action, 'offer_hint')
+
+    def test_pairs_are_counted_only_for_this_session_and_module(self):
+        log = two_failures()
+        trigger = log.opened()
+        log.offer('other', trigger, outcome='pending')
+        log.offer('other', trigger, outcome='accepted', session=SESSION_TWO)
+        log.offer('other', trigger, outcome='accepted', module='other')
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(2)).action, 'offer_hint')
+        self.assertEqual(run(self.rules, log.events, offers_this_session=0, limits=limits(1)).suppressed_by, ('session_offer_cap',))
+
+    def test_the_counter_still_lifts_the_floor_with_outcome_events(self):
+        log = two_failures()
+        trigger = log.opened()
+        log.offer('other', trigger, outcome='pending')
+        log.offer('other', trigger, outcome='accepted')
+        self.assertEqual(run(self.rules, log.events, offers_this_session=2, limits=limits(2)).suppressed_by, ('session_offer_cap',))
+        self.assertEqual(run(self.rules, log.events, offers_this_session=1, limits=limits(2)).action, 'offer_hint')
+
     def test_the_gap_is_never_read_from_event_times(self):
         log = self.offers_log(1)
         log.events[-1]['time'] = '2026-11-02T09:00:00Z'

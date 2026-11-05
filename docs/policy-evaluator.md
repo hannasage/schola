@@ -148,7 +148,9 @@ The spec says the engine enforces six limits. No policy and no model output chan
    A model cannot edit a policy, because the evaluator takes a checked, frozen object.
 5. **Offers are rate limited.** `OfferLimits` has two required numbers and no defaults: `max_offers_per_session` and `min_gap_seconds`.
    The values are an open decision for the owner.
-   The session cap uses the larger of two numbers. One is `offers_this_session` from the state. The other is the number of `agent_offer` events in the window, for this session and this module.
+   The session cap uses the larger of two numbers. One is `offers_this_session` from the state. The other is the number of offers in the window, for this session and this module.
+   The evaluator counts each pair of `policyId` and `triggerEventId` once. The log is append-only, so a later outcome (`accepted`, `dismissed`, or `ignored`)
+   is a new `agent_offer` event for the same pair. The offer and its outcome events count as one offer. Two triggers count as two offers.
    A counter that the caller forgot to update does not lift the cap.
    The gap uses `last_offer_at` from the state only. The evaluator never reads event times.
 6. **Mute always works.** A muted state makes the evaluator return `none` with the reason `muted`. It reads no event.
@@ -276,6 +278,8 @@ So a value forced into a frozen object with `object.__setattr__` is still caught
 - The policy has no way to say "at most one offer per rule", "only in a certain mode", or "only after a hint". These are not in the spec for this step.
 - The evaluator does not read the mode of the student (`coach`, `pair`, `show-me`).
 - The session cap counts offers found in the window. An offer older than the window is not found, so only the caller's counter remembers it.
+- An outcome event also counts as an offer by its rule for the epoch (see "Where the count starts"). So the outcome of an offer restarts the count of that rule
+  a second time. Events between the offer and its outcome no longer count toward that rule. This errs on the side of fewer offers.
 - Python cannot hide an object from code in the same process. A program in the same process is able to change a frozen policy.
   These limits stop mistakes and bad data. They do not stop a hostile program in the same process.
 - The tests ran on macOS only. Linux continuous integration is the final check. It has not run for this step.
@@ -290,7 +294,7 @@ So a value forced into a frozen object with `object.__setattr__` is still caught
 ## Tests
 
 `tests/test_policy_evaluator.py` uses no network, no disk, and no clock. It builds events that the real event validator accepts.
-The 191 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
+The 197 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
 
 - It checks the constants kept in code against the schema files. A drift fails a test.
 - It tests each policy fault and the closed objects.
