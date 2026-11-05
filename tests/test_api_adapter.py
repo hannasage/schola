@@ -3,6 +3,7 @@
 A fake provider runs on a loopback port in a thread. The tests never use the real network and never call a real provider.
 """
 import contextlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -25,8 +26,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import api_adapter
-import model_adapter as ma
 from api_adapter import ApiAdapter
+import model_adapter as ma
 from model_adapter import ApiKey, CompletionRequest, Message, ModelAdapterError, TokenBudget
 
 SECRET = 'sk-TESTSECRETVALUE0123456789abcdef'
@@ -112,6 +113,24 @@ def free_port():
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         return probe.getsockname()[1]
+
+
+class NeverFires:
+    """A timer that does nothing, so a test can show that the time limits of the sockets alone end a call."""
+
+    def __init__(self, interval, function):
+        self.daemon = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
+def ma_message_limit():
+    import model_adapter
+    return model_adapter.MAX_MESSAGE_CHARS
 
 
 def call(budget=None, text='Hello.', max_output_tokens=100):
@@ -250,7 +269,8 @@ class EndpointRuleTests(Case):
                {'read_timeout': True}, {'total_timeout': float('inf')}, {'total_timeout': float('nan')}, {'total_timeout': '5'},
                {'total_timeout': 601}, {'max_response_bytes': 0}, {'max_response_bytes': True}, {'max_response_bytes': 1.5},
                {'max_response_bytes': api_adapter.MAX_RESPONSE_BYTES_LIMIT + 1}, {'ssl_context': 'ctx'}, {'resolver': 'dns'},
-               {'connect_timeout': 5, 'total_timeout': 1}, {'connect_timeout': 2, 'total_timeout': 1.9}]
+               {'connect_timeout': 5, 'total_timeout': 1}, {'connect_timeout': 2, 'total_timeout': 1.9}, {'read_timeout': 5, 'total_timeout': 4},
+               {'connect_timeout': 5, 'read_timeout': 1, 'total_timeout': 4}, {'connect_timeout': 1, 'read_timeout': 5, 'total_timeout': 4}]
         for options in bad:
             with self.subTest(options=options):
                 self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), **options)
@@ -258,7 +278,7 @@ class EndpointRuleTests(Case):
                    total_timeout=600, max_response_bytes=api_adapter.MAX_RESPONSE_BYTES_LIMIT, ssl_context=ssl.create_default_context())
 
     def test_the_total_time_may_equal_the_connect_time(self):
-        ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), connect_timeout=2, total_timeout=2)
+        ApiAdapter('https://example.com/v1', 'm', ApiKey(SECRET), connect_timeout=2, read_timeout=2, total_timeout=2)
 
     def test_a_context_with_no_floor_is_raised_to_tls_12_not_refused(self):
         # A plain context can report MINIMUM_SUPPORTED (it does on some Linux systems). That must not turn a caller away.
@@ -682,13 +702,14 @@ class ReplyShapeTests(Case):
         for usage in ({'prompt_tokens': 0, 'completion_tokens': 0}, {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}):
             result = self.run_reply(ok_payload(usage=usage))
             self.assertFalse(result.usage_reported)
-            self.assertEqual(result.tokens_charged, 100)
+            self.assertEqual(result.tokens_charged, 102)
             self.assertIn('no usage', result.notice)
 
-    def test_zero_usage_next_to_an_empty_reply_is_reported(self):
-        result = self.run_reply(ok_payload(text='', finish='length', usage={'prompt_tokens': 0, 'completion_tokens': 0}))
-        self.assertTrue(result.usage_reported)
-        self.assertEqual(result.tokens_charged, 0)
+    def test_an_input_count_of_zero_is_unusable_even_next_to_an_empty_reply(self):
+        for usage in ({'prompt_tokens': 0, 'completion_tokens': 0}, {'prompt_tokens': 0, 'completion_tokens': 9}):
+            result = self.run_reply(ok_payload(text='', finish='length', usage=usage))
+            self.assertFalse(result.usage_reported)
+            self.assertEqual(result.tokens_charged, 102)
 
     def test_total_tokens_is_ignored_and_the_two_counts_decide(self):
         result = self.run_reply(ok_payload(usage={'prompt_tokens': 3, 'completion_tokens': 4, 'total_tokens': 999}))
@@ -709,8 +730,8 @@ class ReplyShapeTests(Case):
                 result = self.adapter(provider).complete(call(budget, max_output_tokens=400))
                 self.assertFalse(result.usage_reported)
                 self.assertIsNone(result.usage)
-                self.assertEqual(result.tokens_charged, 400)
-                self.assertEqual(budget.spent, 400)
+                self.assertEqual(result.tokens_charged, 402)
+                self.assertEqual(budget.spent, 402)
                 self.assertIn('no usage', result.notice)
 
     def test_bad_shapes_are_bad_responses(self):
@@ -732,8 +753,8 @@ class ReplyShapeTests(Case):
                 self.assertEqual(str(error), NO_CHOICES if name == 'choices empty' else EXPECTED_FORMAT)
                 # A 200 reply was billed. The usage is charged when it can be read, and the request maximum when it cannot.
                 readable = name in ('no choices',)
-                self.assertEqual(error.tokens_charged, 19 if readable else 100)
-                self.assertEqual(budget.spent, 19 if readable else 100)
+                self.assertEqual(error.tokens_charged, 19 if readable else 102)
+                self.assertEqual(budget.spent, 19 if readable else 102)
 
     def test_a_billed_reply_with_no_usable_text_charges_its_usage(self):
         usage = {'prompt_tokens': 30, 'completion_tokens': 12}
@@ -756,7 +777,7 @@ class ReplyShapeTests(Case):
             provider = self.provider(reply_json(payload))
             budget = TokenBudget(1000)
             error = self.assertCode('bad_response', self.adapter(provider).complete, call(budget, max_output_tokens=300))
-            self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+            self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
 
     def test_a_refusal_is_a_reply_with_a_content_filter_stop(self):
         usage = {'prompt_tokens': 30, 'completion_tokens': 12}
@@ -777,7 +798,7 @@ class ReplyShapeTests(Case):
 
     def test_a_refusal_with_no_usage_is_charged_the_maximum(self):
         result = self.run_reply({'choices': [{'message': {'content': None, 'refusal': 'No.'}, 'finish_reason': 'stop'}]})
-        self.assertEqual((result.stop_reason, result.usage_reported, result.tokens_charged), ('content_filter', False, 100))
+        self.assertEqual((result.stop_reason, result.usage_reported, result.tokens_charged), ('content_filter', False, 102))
 
     def test_an_error_object_in_a_200_reply_maps_through_the_status_table(self):
         usage = {'prompt_tokens': 30, 'completion_tokens': 12}
@@ -794,6 +815,28 @@ class ReplyShapeTests(Case):
         provider = self.provider(reply_json({'error': {'message': 'x', 'code': 429}, 'usage': usage}))
         error = self.assertCode('rate_limited', self.adapter(provider).complete, call())
         self.assertEqual(error.tokens_charged, 42)
+
+    def test_usage_with_an_input_count_of_zero_next_to_an_error_is_not_charged(self):
+        provider = self.provider(reply_json({'error': {'message': 'x', 'code': 429}, 'usage': {'prompt_tokens': 0, 'completion_tokens': 9}}))
+        error = self.assertCode('rate_limited', self.adapter(provider).complete, call())
+        self.assertEqual(error.tokens_charged, 0)
+
+    def test_an_error_code_in_a_body_says_the_provider_put_it_there(self):
+        provider = self.provider(reply_json({'error': {'message': 'x', 'code': 401}}))
+        error = self.assertCode('auth_failed', self.adapter(provider).complete, call())
+        self.assertIn('in the body of a 200 reply', str(error))
+        self.assertIn('refused the API key', str(error))
+
+    def test_a_code_that_is_not_plain_ascii_digits_is_ignored(self):
+        for code in ('\u0664\u0662\u0669', '\uff14\uff12\uff19', '\u00b2\u00b2\u00b2', ' 429', '4 9', '+29', '0x1', '42\u0669'):
+            with self.subTest(code=code):
+                provider = self.provider(reply_json({'error': {'message': 'x', 'code': code}}))
+                error = self.assertCode('bad_response', self.adapter(provider).complete, call())
+                self.assertIn('holds an error', str(error))
+
+    def test_an_error_code_given_as_digits_is_read(self):
+        provider = self.provider(reply_json({'error': {'message': 'x', 'status': '503'}}))
+        self.assertCode('endpoint_unreachable', self.adapter(provider).complete, call(), retryable=True)
 
     def test_an_error_object_with_no_usable_code_is_a_bad_response_that_charges_nothing(self):
         for error_value in ({'message': 'x'}, {'message': 'x', 'code': 'insufficient_quota'}, {'code': 99}, {'code': 700}, {'code': True}, {'code': None},
@@ -1025,7 +1068,7 @@ class SizeAndTimeTests(Case):
                 pass
         provider = self.provider(responder)
         started = time.monotonic()
-        self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=1.0, total_timeout=0.6).complete, call(), retryable=True)
+        self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=0.6, total_timeout=0.6).complete, call(), retryable=True)
         self.assertLess(time.monotonic() - started, 3)
 
     def test_slow_headers_are_cut_by_the_total_time_limit(self):
@@ -1040,7 +1083,7 @@ class SizeAndTimeTests(Case):
                 pass
         provider = self.provider(responder)
         started = time.monotonic()
-        self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=1.0, total_timeout=0.6).complete, call())
+        self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=0.6, total_timeout=0.6).complete, call())
         self.assertLess(time.monotonic() - started, 3)
 
     def test_a_silent_server_hits_the_read_timeout(self):
@@ -1144,12 +1187,64 @@ class NetworkFailureTests(Case):
             connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % (len(body) + 500) + body)
         error = self.assertCode('bad_response', self.adapter_at(self.raw_server(short)).complete, call())
         self.assertIn('ended early', str(error))
-        self.assertEqual(error.tokens_charged, 100)
+        self.assertEqual(error.tokens_charged, 102)
 
     def test_a_chunked_body_cut_short_is_a_bad_response(self):
         def short(connection):
             connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n{"choices"')
         self.assertCode('bad_response', self.adapter_at(self.raw_server(short)).complete, call())
+
+    def test_a_body_that_breaks_in_the_middle_of_a_200_reply_is_billed_like_a_short_body(self):
+        head = b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+
+        def reset(connection):
+            connection.sendall(head + b'Content-Length: 1000\r\n\r\n{"choices"')
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b'\x01\x00\x00\x00\x00\x00\x00\x00')
+        cases = {
+            'cut chunk': lambda connection: connection.sendall(head + b'Transfer-Encoding: chunked\r\n\r\n20\r\n{"choices"'),
+            'reset': reset,
+            'over-long chunk line': lambda connection: connection.sendall(head + b'Transfer-Encoding: chunked\r\n\r\n' + b'a' * 70000),
+            'bad chunk size': lambda connection: connection.sendall(head + b'Transfer-Encoding: chunked\r\n\r\nzz\r\n{}\r\n0\r\n\r\n'),
+            'short length': lambda connection: connection.sendall(head + b'Content-Length: 1000\r\n\r\n{"choices"'),
+        }
+        for name, handler in cases.items():
+            with self.subTest(name=name):
+                budget = TokenBudget(1000)
+                code = 'endpoint_unreachable' if name == 'reset' else 'bad_response'
+                error = self.assertCode(code, self.adapter_at(self.raw_server(handler)).complete, call(budget, max_output_tokens=300))
+                self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
+
+    def test_a_length_that_cannot_be_read_is_billed_and_never_skips_the_charge(self):
+        body = json.dumps(ok_payload()).encode()
+        for name, length in (('superscript', '\u00b2'.encode('utf-8')), ('arabic digits', '\u0661\u0662\u0663'.encode('utf-8')), ('thousands of digits', b'9' * 5000),
+                             ('words', b'many'), ('negative', b'-5'), ('two numbers', b'12, 12'), ('fullwidth', '\uff11\uff12'.encode('utf-8'))):
+            with self.subTest(name=name):
+                def handler(connection, length=length):
+                    connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ' + length + b'\r\n\r\n' + body)
+                budget = TokenBudget(1000)
+                error = self.assertCode('bad_response', self.adapter_at(self.raw_server(handler)).complete, call(budget, max_output_tokens=300))
+                self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
+                self.assertIn('length', str(error))
+
+    def test_a_length_is_read_only_from_plain_ascii_digits(self):
+        for text, expected in (('12', 12), (' 12 ', 12), ('0', 0), ('\u0663', None), ('\uff11', None), ('', None), ('-1', None), ('1_0', None), ('9' * 5000, None)):
+            with self.subTest(text=text[:10]):
+                self.assertEqual(api_adapter._length(text), expected)
+
+    def test_a_memory_error_while_the_body_is_read_passes_through_and_charges_the_hold(self):
+        provider = self.provider(reply_json(ok_payload()))
+        budget = TokenBudget(1000)
+        with mock.patch('http.client.HTTPResponse.read1', side_effect=MemoryError()):
+            with self.assertRaises(MemoryError):
+                self.adapter(provider).complete(call(budget))
+        self.assertEqual((budget.spent, budget._reserved), (102, 0))
+
+    def test_a_good_length_is_read(self):
+        body = json.dumps(ok_payload()).encode()
+
+        def handler(connection):
+            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() + b' \r\n\r\n' + body)
+        self.assertEqual(self.adapter_at(self.raw_server(handler)).complete(call()).text, 'Hello from the model.')
 
     def test_a_giant_header_block_is_refused(self):
         def flood(connection):
@@ -1221,7 +1316,7 @@ class DeadlineTests(Case):
             calls.append((address, timeout))
             time.sleep(timeout)
             raise socket.timeout('timed out')
-        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=1, total_timeout=1, resolver=lambda host, port, *a, **k: [
+        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=1, read_timeout=1, total_timeout=1, resolver=lambda host, port, *a, **k: [
             (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port)), (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', port))])
         started = time.monotonic()
         with mock.patch('socket.create_connection', side_effect=connector):
@@ -1239,7 +1334,7 @@ class DeadlineTests(Case):
             calls.append(timeout)
             time.sleep(timeout)
             raise socket.timeout('timed out')
-        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=1, total_timeout=1.5, resolver=lambda host, port, *a, **k: [
+        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=1, read_timeout=1.5, total_timeout=1.5, resolver=lambda host, port, *a, **k: [
             (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port)), (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', port))])
         started = time.monotonic()
         with mock.patch('socket.create_connection', side_effect=connector):
@@ -1264,7 +1359,7 @@ class DeadlineTests(Case):
     def test_a_name_lookup_that_hangs_ends_at_the_total_time(self):
         release = threading.Event()
         self.addCleanup(release.set)
-        adapter = ApiAdapter('https://api.example.com/v1', 'm', ApiKey(SECRET), connect_timeout=0.5, total_timeout=0.5,
+        adapter = ApiAdapter('https://api.example.com/v1', 'm', ApiKey(SECRET), connect_timeout=0.5, read_timeout=0.5, total_timeout=0.5,
                              resolver=lambda *a, **k: release.wait(10) and [])
         started = time.monotonic()
         self.assertCode('timeout', adapter.complete, call(), retryable=True)
@@ -1272,7 +1367,7 @@ class DeadlineTests(Case):
 
     def test_a_silent_tls_server_ends_at_the_total_time(self):
         port = self.silent_server()
-        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, read_timeout=5, total_timeout=0.3)
+        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, read_timeout=0.3, total_timeout=0.3)
         started = time.monotonic()
         error = self.assertCode('timeout', adapter.complete, call(), retryable=True)
         self.assertLess(time.monotonic() - started, 1.5)
@@ -1293,7 +1388,7 @@ class DeadlineTests(Case):
             opened.append(real(*args, **kwargs))
             return opened[-1]
         port = self.silent_server()
-        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, total_timeout=0.3)
+        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, read_timeout=0.3, total_timeout=0.3)
         with mock.patch('socket.create_connection', side_effect=connector):
             self.assertCode('timeout', adapter.complete, call())
         self.assertEqual(len(opened), 1)
@@ -1307,7 +1402,7 @@ class DeadlineTests(Case):
             sock = real(*args, **kwargs)
             time.sleep(0.5)
             return sock
-        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=1, read_timeout=5, total_timeout=1)
+        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=1, read_timeout=1, total_timeout=1)
         started = time.monotonic()
         with mock.patch('socket.create_connection', side_effect=slow_connect):
             self.assertCode('timeout', adapter.complete, call())
@@ -1322,7 +1417,7 @@ class DeadlineTests(Case):
             opened.append(real(*args, **kwargs))
             time.sleep(0.4)
             return opened[-1]
-        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, total_timeout=0.3)
+        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, read_timeout=0.3, total_timeout=0.3)
         with mock.patch('socket.create_connection', side_effect=late_connect):
             self.assertCode('timeout', adapter.complete, call())
         self.assertEqual(opened[0].fileno(), -1)
@@ -1333,7 +1428,7 @@ class DeadlineTests(Case):
         def slow_lookup(host, port, *args, **kwargs):
             time.sleep(0.3)
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
-        adapter = ApiAdapter(f'http://localhost:{provider.port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.5, read_timeout=5, total_timeout=0.5, resolver=slow_lookup)
+        adapter = ApiAdapter(f'http://localhost:{provider.port}/v1', 'm', ApiKey(SECRET), connect_timeout=0.5, read_timeout=0.5, total_timeout=0.5, resolver=slow_lookup)
         started = time.monotonic()
         self.assertCode('timeout', adapter.complete, call())
         self.assertLess(time.monotonic() - started, 0.75)
@@ -1352,11 +1447,77 @@ class DeadlineTests(Case):
             connection.sock = HalfOpen()
             closed.wait(5)
             raise OSError('closed')
-        adapter = ApiAdapter('http://127.0.0.1:9/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, total_timeout=0.3)
+        adapter = ApiAdapter('http://127.0.0.1:9/v1', 'm', ApiKey(SECRET), connect_timeout=0.3, read_timeout=0.3, total_timeout=0.3)
         started = time.monotonic()
         with mock.patch('api_adapter._PinnedConnection.connect', connect):
             self.assertCode('timeout', adapter.complete, call())
         self.assertLess(time.monotonic() - started, 2)
+
+    def test_a_server_that_never_reads_cannot_hold_a_large_send_past_the_total_time(self):
+        port = self.silent_server()
+        text = '\u4f60' * ma_message_limit()  # each character is sent as a six byte escape, so the request is about 2.4 MB
+        budget = TokenBudget(10 ** 7)
+        adapter = ApiAdapter(f'http://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), connect_timeout=1, read_timeout=1, total_timeout=1)
+        guard = ma.context_guard
+        guarded = []
+
+        def timed_guard(*arguments):
+            guard(*arguments)  # the scan of the text is work before the clock of the call starts, and its cost depends on the machine
+            guarded.append(time.monotonic())
+
+        def attempt():
+            guarded.clear()
+            request = CompletionRequest([Message('user', text)] * 4, 100, budget)
+            error = self.assertCode('timeout', adapter.complete, request, retryable=True)
+            return time.monotonic() - guarded[0], error, request
+        with mock.patch('model_adapter.context_guard', timed_guard):
+            for number in range(10):
+                elapsed, error, request = attempt()
+                self.assertLess(elapsed, 1.6, f'attempt {number}: {elapsed:.2f} s')
+                # Nothing when the request never went out in full. The whole hold when the system buffers took all of it, because the provider can bill it.
+                self.assertIn(error.tokens_charged, (0, request.hold_tokens))
+            with mock.patch('api_adapter.threading.Timer', NeverFires):  # the limits of the sockets alone must end it
+                for number in range(3):
+                    elapsed, _, _ = attempt()
+                    self.assertLess(elapsed, 1.6, f'attempt {number} without the timer: {elapsed:.2f} s')
+
+    def test_a_server_that_closes_the_connection_cannot_hold_a_slow_body_past_the_total_time(self):
+        def responder(handler, body):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Content-Length', '1000')
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            try:
+                for _ in range(100):
+                    handler.wfile.write(b' ')
+                    handler.wfile.flush()
+                    time.sleep(0.15)
+            except OSError:
+                pass
+            handler.close_connection = True
+        provider = self.provider(responder)
+        started = time.monotonic()
+        self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=0.6, total_timeout=0.6).complete, call(), retryable=True)
+        self.assertLess(time.monotonic() - started, 2.0)
+        with mock.patch('api_adapter.threading.Timer', NeverFires):
+            started = time.monotonic()
+            self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=0.6, total_timeout=0.6).complete, call())
+            self.assertLess(time.monotonic() - started, 1.2)
+
+    def test_each_wait_is_armed_with_the_time_that_is_left(self):
+        provider = self.provider()
+        seen = []
+        original = socket.socket.settimeout
+
+        def spy(sock, value):
+            seen.append(value)
+            return original(sock, value)
+        adapter = self.adapter(provider, connect_timeout=5, read_timeout=5, total_timeout=5)
+        with mock.patch.object(socket.socket, 'settimeout', spy):
+            adapter.complete(call())
+        self.assertTrue(len(seen) >= 4, seen)  # connect, headers, body, reply head, each read
+        self.assertTrue(all(0 < value <= 5 for value in seen if value is not None), seen)
 
     def test_a_valid_reply_that_was_read_in_full_is_not_turned_into_a_timeout(self):
         class FiresAtOnce:
@@ -1373,6 +1534,58 @@ class DeadlineTests(Case):
         with mock.patch('api_adapter.threading.Timer', FiresAtOnce):
             result = self.adapter(provider).complete(call())
         self.assertEqual(result.text, 'Hello from the model.')
+
+    def connection(self, **options):
+        values = {'host': '127.0.0.1', 'port': 80, 'addresses': ['127.0.0.1'], 'context': None, 'connect_timeout': 1, 'read_timeout': 5,
+                  'deadline': time.monotonic() + 2}
+        values.update(options)
+        return api_adapter._PinnedConnection(**values)
+
+    def test_every_send_and_read_is_armed_with_the_smaller_of_the_read_time_and_what_is_left(self):
+        class Recorder:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def sendall(self, data):
+                pass
+
+            def close(self):
+                pass
+        sent = self.connection()
+        sent.sock = sent._live = recorder = Recorder()
+        sent.send(b'x')
+        self.assertEqual(len(recorder.timeouts), 1)
+        self.assertTrue(0 < recorder.timeouts[0] <= 2, recorder.timeouts)  # not the read time of 5
+        waiting = self.connection()
+        waiting.sock = waiting._live = recorder = Recorder()
+        with self.assertRaises(http.client.ResponseNotReady):
+            waiting.getresponse()
+        self.assertEqual(len(recorder.timeouts), 1)
+        self.assertTrue(0 < recorder.timeouts[0] <= 2, recorder.timeouts)
+        short = self.connection(read_timeout=0.5)
+        short.sock = short._live = recorder = Recorder()
+        short.arm()
+        self.assertEqual(recorder.timeouts, [0.5])
+
+    def test_a_new_connection_is_armed_when_it_is_open(self):
+        class Recorder:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def close(self):
+                pass
+        recorder = Recorder()
+        connection = self.connection()
+        with mock.patch('socket.create_connection', return_value=recorder):
+            connection.connect()
+        self.assertEqual(len(recorder.timeouts), 1)
+        self.assertTrue(0 < recorder.timeouts[0] <= 2, recorder.timeouts)
 
     def test_the_tls_settings_are_checked_again_at_connect_time(self):
         for change in (lambda context: setattr(context, 'check_hostname', False), lambda context: setattr(context, 'verify_mode', ssl.CERT_OPTIONAL),
@@ -1394,7 +1607,7 @@ class ChargeTests(Case):
         provider = self.provider(lambda handler, body: release.wait(5))
         budget = TokenBudget(1000)
         error = self.assertCode('timeout', self.adapter(provider, read_timeout=0.3, total_timeout=30).complete, call(budget, max_output_tokens=300), retryable=True)
-        self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+        self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
         self.assertEqual(len(provider.requests), 1)
 
     def test_a_total_time_cut_during_the_reply_charges_the_maximum(self):
@@ -1412,8 +1625,8 @@ class ChargeTests(Case):
                 pass
         provider = self.provider(responder)
         budget = TokenBudget(1000)
-        error = self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=1.0, total_timeout=0.5).complete, call(budget, max_output_tokens=300))
-        self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+        error = self.assertCode('timeout', self.adapter(provider, connect_timeout=0.5, read_timeout=0.5, total_timeout=0.5).complete, call(budget, max_output_tokens=300))
+        self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
 
     def test_a_retry_loop_over_timeouts_ends_at_the_cap(self):
         release = threading.Event()
@@ -1430,7 +1643,7 @@ class ChargeTests(Case):
                 if error.code == 'token_cap_reached':
                     break
         self.assertEqual(codes, ['timeout', 'timeout', 'timeout', 'token_cap_reached'])
-        self.assertEqual((budget.spent, len(provider.requests)), (900, 3))
+        self.assertEqual((budget.spent, len(provider.requests)), (906, 3))
 
     def test_a_timeout_before_anything_was_sent_charges_nothing(self):
         budget = TokenBudget(1000)
@@ -1455,7 +1668,7 @@ class ChargeTests(Case):
         provider = self.provider(lambda handler, body: send(handler, 200, b' ' * 2_000_000))
         budget = TokenBudget(1000)
         error = self.assertCode('response_too_large', self.adapter(provider).complete, call(budget, max_output_tokens=300))
-        self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+        self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
 
     def test_a_body_with_no_length_that_runs_past_the_cap_charges_the_maximum(self):
         def responder(handler, body):
@@ -1472,12 +1685,12 @@ class ChargeTests(Case):
         provider = self.provider(responder)
         budget = TokenBudget(1000)
         error = self.assertCode('response_too_large', self.adapter(provider, max_response_bytes=10_000).complete, call(budget, max_output_tokens=300))
-        self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+        self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
 
     def test_a_declared_length_over_the_cap_charges_the_maximum(self):
         provider = self.provider(lambda handler, body: send(handler, 200, b' ' * 3000))
         error = self.assertCode('response_too_large', self.adapter(provider, max_response_bytes=1000).complete, call(max_output_tokens=300))
-        self.assertEqual(error.tokens_charged, 300)
+        self.assertEqual(error.tokens_charged, 302)
 
     def test_a_200_reply_that_cannot_be_read_charges_the_maximum(self):
         good = json.dumps(ok_payload()).encode()
@@ -1490,7 +1703,7 @@ class ChargeTests(Case):
                 provider = self.provider(responder)
                 budget = TokenBudget(1000)
                 error = self.assertCode('bad_response', self.adapter(provider).complete, call(budget, max_output_tokens=300))
-                self.assertEqual((error.tokens_charged, budget.spent), (300, 300))
+                self.assertEqual((error.tokens_charged, budget.spent), (302, 302))
 
     def test_a_retry_loop_over_unreadable_replies_ends_at_the_cap(self):
         provider = self.provider(reply_raw(b'<html>', content_type='text/html'))
@@ -1536,8 +1749,9 @@ class UnexpectedFailureTests(Case):
                 self.assertCode('bad_response', self.adapter_at().complete, call())
         text = '\n'.join(logs.output)
         self.assertIn('RuntimeError', text)
-        self.assertIn('Traceback', text)
+        self.assertIn('api_adapter.py:', text)
         self.assertNotIn(SECRET, text)
+        self.assertNotIn('boom', text)
 
     def test_the_retryable_flag_of_an_unexpected_failure_is_kept(self):
         class Flaky(Exception):
@@ -1551,7 +1765,7 @@ class UnexpectedFailureTests(Case):
         with mock.patch('api_adapter._PinnedConnection.request', side_effect=MemoryError()):
             with self.assertRaises(MemoryError):
                 self.adapter_at().complete(call(budget))
-        self.assertEqual((budget.spent, budget._reserved), (0, 0))
+        self.assertEqual((budget.spent, budget._reserved), (102, 0))  # the send began, so the whole hold is charged
 
 
 class BudgetBeforeIoTests(Case):
@@ -1576,7 +1790,7 @@ class BudgetBeforeIoTests(Case):
         adapter = self.adapter(provider)
         result = adapter.complete(call(budget, max_output_tokens=100))
         self.assertFalse(result.usage_reported)
-        self.assertEqual(budget.spent, 100)
+        self.assertEqual(budget.spent, 102)
         self.assertCode('token_cap_reached', adapter.complete, call(budget))
         self.assertEqual(len(provider.requests), 1)
 
@@ -1752,6 +1966,74 @@ class TlsTests(Case):
             self.assertCode('endpoint_unreachable', adapter.complete, call())
         self.assertEqual(len(opened), 1)
         self.assertEqual(opened[0].fileno(), -1)
+
+    def test_a_tls_server_that_goes_silent_after_the_handshake_cannot_hold_the_call_past_the_total_time(self):
+        context = self.server_context(self.both)
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(5)
+        held = []
+        self.addCleanup(lambda: [connection.close() for connection in held])
+        self.addCleanup(listener.close)
+
+        def serve():
+            while True:
+                try:
+                    raw, _ = listener.accept()
+                except OSError:
+                    return
+                try:
+                    held.append(context.wrap_socket(raw, server_side=True))  # the handshake finishes, then nothing is read or sent
+                except OSError:
+                    continue
+        threading.Thread(target=serve, daemon=True).start()
+        port = listener.getsockname()[1]
+        adapter = ApiAdapter(f'https://127.0.0.1:{port}/v1', 'm', ApiKey(SECRET), ssl_context=self.client_context(self.both), connect_timeout=1, read_timeout=1, total_timeout=1)
+        for attempt in range(5):
+            started = time.monotonic()
+            self.assertCode('timeout', adapter.complete, call(), retryable=True)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.6, f'attempt {attempt}: {elapsed:.2f} s')
+        with mock.patch('api_adapter.threading.Timer', NeverFires):
+            started = time.monotonic()
+            self.assertCode('timeout', adapter.complete, call())
+            self.assertLess(time.monotonic() - started, 1.6)
+
+    def test_a_refused_context_is_left_as_it_was(self):
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.MINIMUM_SUPPORTED)
+        capped = ssl.create_default_context()
+        capped.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', DeprecationWarning)
+                capped.maximum_version = ssl.TLSVersion.TLSv1_1
+        except ValueError:
+            self.skipTest('this system cannot cap TLS at 1.1')
+        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=capped)
+        self.assertEqual(capped.minimum_version, ssl.TLSVersion.MINIMUM_SUPPORTED)
+
+    def test_a_context_that_only_asks_for_an_optional_certificate_is_refused_and_left_as_it_was(self):
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        context.verify_mode = ssl.CERT_OPTIONAL
+        self.assertTrue(context.check_hostname)
+        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.MINIMUM_SUPPORTED)
+
+    def test_a_context_whose_lowest_version_is_above_its_highest_is_refused(self):
+        context = ssl.create_default_context()
+        try:
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
+        except ValueError:
+            self.skipTest('this system does not let a context hold a lowest version above its highest')
+        self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_3)
 
     def test_the_default_context_checks_certificates_and_hostnames(self):
         adapter = ApiAdapter('https://127.0.0.1:1/v1', 'm', ApiKey(SECRET))

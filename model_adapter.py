@@ -208,12 +208,19 @@ class TokenBudget:
                 hold.active = False
 
     def _finish(self, hold, charge):
-        """Free a hold and charge `charge` tokens. Does nothing for a hold that is already settled."""
+        """Free a hold and charge `charge` tokens. Does nothing for a hold that is already settled.
+
+        `hold.active` is the one record of whether a hold is still owed, and it goes false before the counters change, so
+        no interrupt can release or leak a hold twice. A charge that is not a plain whole number of 0 or more is replaced by
+        the whole hold. No charge goes above twice the hold.
+        """
         with self._lock:
             if hold.active:
-                self._reserved -= hold.amount
-                self._spent += charge
                 hold.active = False
+                self._reserved -= hold.amount
+                if type(charge) is not int or charge < 0:
+                    charge = hold.amount
+                self._spent += min(charge, 2 * hold.amount)
 
 
 # ----------------------------------------------------------------------
@@ -280,6 +287,16 @@ class CompletionRequest:
             raise _invalid('A request needs a TokenBudget.')
         object.__setattr__(self, 'messages', tuple(messages))
 
+    @property
+    def input_estimate(self):
+        """About how many tokens the messages take: 3 characters a token, rounded up."""
+        return -(-sum(len(message.text) for message in self.messages) // 3)
+
+    @property
+    def hold_tokens(self):
+        """What the call holds in the budget, and what it is charged when the true cost is not known."""
+        return self.input_estimate + self.max_output_tokens
+
 
 @dataclasses.dataclass(frozen=True)
 class RawCompletion:
@@ -309,11 +326,31 @@ class CompletionResult:
 # The context guard
 # ----------------------------------------------------------------------
 
-# The guard reads two views of each message: the text with invisible characters removed and compatibility forms folded
-# (NFKC), and the same text with all white space removed. The second view finds a key that was split by spaces or lines.
-_INVISIBLE = {ord(char): None for char in '\u00ad\u034f\u061c\u180e\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e'
-              '\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068\u2069\ufeff'}
+# The guard reads three views of each message, all after Unicode NFKC folding. The key view has the invisible characters deleted.
+# The compact view is the key view with all white space removed, so a key split by spaces or lines still shows. The path view
+# has the invisible characters turned into spaces, so they cannot glue a word onto a path.
+_FILLERS = '\u115f\u1160\u3164\uffa0\u2800'
 _WHITESPACE = re.compile(r'\s+')
+
+
+def _invisible(char):
+    """True for a character that shows nothing: format, control (not white space), and combining marks, and the blank fillers."""
+    category = unicodedata.category(char)
+    return category in ('Cf', 'Mn', 'Me') or (category == 'Cc' and not char.isspace()) or char in _FILLERS
+
+
+def _strip(text, replacement):
+    """The text with every invisible character deleted (`None`) or replaced. The table is made from the distinct characters only."""
+    hidden = [char for char in set(text) if _invisible(char)]
+    return text.translate(dict.fromkeys(map(ord, hidden), replacement)) if hidden else text
+
+
+def _views(text):
+    """(key view, path view) of a text. Hidden characters go first, so a combining mark cannot change the letter before it."""
+    keys = _strip(unicodedata.normalize('NFKC', _strip(text, None)), None)
+    paths = _strip(unicodedata.normalize('NFKC', _strip(text, ' ')), ' ')
+    return keys, paths
+
 
 # Shapes of secrets that are common and easy to spot. This is a short list of patterns, not a scanner. It misses what it
 # does not know, and it can refuse text that only looks like a key. Every pattern here must scan in linear time.
@@ -338,7 +375,7 @@ _COMPACT_SHAPES = tuple((re.compile(pattern), word) for pattern, word in (
     (_B + r'sb_secret_[A-Za-z0-9_-]{16,}', 'sb_secret_'),
 ))
 _SPACED_SHAPES = tuple((re.compile(pattern, flags), word) for pattern, flags, word in (
-    (r'-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----', 0, '-----begin'),
+    (r'-----BEGIN [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,40}-----', 0, '-----begin'),
     (r'\bbearer\s+[A-Za-z0-9._~+/=-]{20,}', re.IGNORECASE, 'bearer'),
     (r'\bauthorization["\']?\s*[:=]\s*["\']?basic\s+[A-Za-z0-9+/]{12,}', re.IGNORECASE, 'authorization'),
     (r'(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@', 0, '://'),
@@ -350,20 +387,22 @@ _KEYWORD = re.compile(r'(?:api[_-]?key|secret(?:[_-]?access)?(?:[_-]?key)?|token
 _KEYWORD_WORDS = ('api', 'secret', 'token', 'passwd', 'password')
 _JWT_RUN = re.compile(r'[A-Za-z0-9_.-]+')
 
-# Paths. A path starts at the start of the text or after white space, a quote, a bracket, or one of < > : = , ; | & !
-# (or after "-" that follows white space). A "/" inside a word ("and/or", "km/h", "1/2") starts nothing.
+# Paths. A path starts at the start of the text or after any character that is not part of a word or of a path
+# (a letter, a digit, or one of . _ - / \), or after "-" that follows white space. A "/" inside a word ("and/or", "km/h", "1/2")
+# starts nothing. A path ends at white space, a quote, a bracket, or one of < > | * ? , ; and also at : = & !, so a second path glued on
+# with one of those marks is read on its own.
 _STOP = r'''\s'"`<>|*?,;()\[\]{}'''
-_SET = r'''\s'"`(\[{<>:=,;|&!'''
-_START = r'(?:^|(?<=[' + _SET + r'])|(?<=\s-))'
-_FILE_URL = re.compile(r'(?<![A-Za-z0-9+.-])file://[^' + _STOP + r']*', re.IGNORECASE)
-_URL = re.compile(r'''(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s'"`<>]*''')
-_POSIX_PATH = re.compile(_START + r'(?P<slashes>/+)(?P<rest>[^' + _STOP + r'/][^' + _STOP + r']*)')
-_HOME_PATH = re.compile(_START + r'~[\w.-]*/[^' + _STOP + r']*')
-_DRIVE_PATH = re.compile(r'(?<!\w)[A-Za-z]:[\\/][^' + _STOP + r']+')
-_UNC_PATH = re.compile(r'(?<![\\\w])\\\\[^' + _STOP + r'\\]+\\[^' + _STOP + r']*')
+_PSTOP = _STOP + r':=&!'
+_START = r'(?:(?<![\w.\-/\\])|(?<=\s-))'
+_FILE_URL = re.compile(r'(?<![A-Za-z0-9+.-])file://[^' + _PSTOP + r']*', re.IGNORECASE)
+_URL = re.compile(r'''(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s'"`<>,;)]*''')
+_POSIX_PATH = re.compile(_START + r'(?P<slashes>/+)(?P<rest>[^' + _PSTOP + r'/][^' + _PSTOP + r']*)')
+_HOME_PATH = re.compile(_START + r'~[\w.-]*/[^' + _PSTOP + r']*')
+_DRIVE_PATH = re.compile(r'(?<!\w)[A-Za-z]:[\\/][^' + _PSTOP + r']+')
+_UNC_PATH = re.compile(r'(?<![\\\w])\\\\[^' + _PSTOP + r'\\]+\\[^' + _PSTOP + r']*')
 _ENV_PATH = re.compile(r'(?<![\w$])\$\{?[A-Za-z_][A-Za-z0-9_]*\}?[\\/]|%[A-Za-z_][A-Za-z0-9_]*%[\\/]')
 _CLOSING_TAG = re.compile(r'</[A-Za-z][A-Za-z0-9-]*\s*>')
-_DRIVE_TAIL = re.compile(r'(?:^|(?<=\W))[A-Za-z]:$')
+_DRIVE_TAIL = re.compile(r'(?<![\w/\\.\-])[A-Za-z]:$')
 _TRAVERSAL = re.compile(r'(?<![\w.])\.\.(?![\w.])')
 _WINDOWS_ROOT = re.compile(r'[A-Za-z]:[\\/]')
 _DRIVE_ONLY = re.compile(r'[a-z]:\\?')
@@ -394,7 +433,7 @@ def _roots(allowed_paths):
         if not isinstance(text, str) or not (text.startswith('/') or _is_windows(text)):
             raise _invalid('An allowed path must be an absolute path.')
         path, separator = _normal(text)
-        if not path.strip('/') or _DRIVE_ONLY.fullmatch(path):
+        if not path.strip('/\\') or _DRIVE_ONLY.fullmatch(path):
             raise _invalid('An allowed path cannot be the root of everything. Name a folder.')
         roots.append((path, separator, bool(_WHITESPACE.search(path))))
     return tuple(roots)
@@ -482,7 +521,8 @@ def context_guard(messages, allowed_paths=(), secrets=()):
 
     This is a small guard on what reaches a model. It does not choose what goes into a message. That choice
     is work for the policy and agent steps (E5 and E6).
-    It looks at text only, after it folds compatibility forms (NFKC) and removes invisible characters. It finds
+    It looks at text only, after it folds compatibility forms (NFKC). For keys it deletes the invisible characters; for paths it
+    turns them into spaces. It also reads the messages joined together, so a key split over two messages shows. It finds
     absolute paths (POSIX, home, Windows, UNC, `file:` URLs, and environment variables such as `$HOME/`) and `..`
     segments. It does not follow links and it does not check relative paths. It can refuse text that only looks
     like a key or a path. The error names the message number and never repeats the text.
@@ -503,16 +543,20 @@ def context_guard(messages, allowed_paths=(), secrets=()):
         total += len(message.text)
         if total > MAX_TOTAL_CHARS:
             raise _invalid(f'The messages are too long to check. Send at most {MAX_TOTAL_CHARS} characters.')
-        spaced = unicodedata.normalize('NFKC', message.text).translate(_INVISIBLE)
-        compact = _WHITESPACE.sub('', spaced)
-        if any(value in compact for value in held) or _looks_like_secret(spaced, compact):
+        keys, paths = _views(message.text)
+        compact = _WHITESPACE.sub('', keys)
+        if any(value in compact for value in held) or _looks_like_secret(keys, compact):
             raise _invalid(f'Message {number} holds text that looks like a secret key. Schola sent nothing.')
-        if _path_problem(spaced, roots):
+        if _path_problem(paths, roots):
             raise _invalid(f'Message {number} names a file path outside the allowed folders. Schola sent nothing.')
         compacts.append(compact)
     joined = ''.join(compacts)
     if any(value in joined for value in held):
         raise _invalid('The messages together hold a secret key. Schola sent nothing.')
+    if len(compacts) > 1:
+        lowered = joined.lower()
+        if any(word in lowered and shape.search(joined) for shape, word in _COMPACT_SHAPES):
+            raise _invalid('The messages together hold text that looks like a secret key. Schola sent nothing.')
 
 
 # ----------------------------------------------------------------------
@@ -551,9 +595,12 @@ class ModelAdapter:
         return text
 
     def _unexpected(self, error):
-        """Log an exception that nobody planned for, with its traceback and without any held key. Return the error to raise."""
-        detail = self._scrub(''.join(traceback.format_exception(type(error), error, error.__traceback__)))
-        _LOG.error('A model adapter failed in an unexpected way:\n%s', detail)
+        """Log the type and the code places of an exception that nobody planned for, and return the error to raise."""
+        # Only the type and the places in the code go to the log. The message is dropped, because a key can hide in it in a spelling
+        # that no search finds (quoted, escaped, encoded). A person who needs the message can attach a debugger.
+        places = ' < '.join(f'{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}'
+                            for frame in reversed(traceback.extract_tb(error.__traceback__)[-12:]))
+        _LOG.error('A model adapter failed in an unexpected way: %s at %s', type(error).__name__, places)
         return ModelAdapterError('The model adapter failed in an unexpected way.', 'bad_response', retryable=bool(getattr(error, 'retryable', False)))
 
     def complete(self, request):
@@ -561,28 +608,35 @@ class ModelAdapter:
             raise _invalid('Send a CompletionRequest.')
         context_guard(request.messages, self._allowed_paths, self._secrets)
         budget = request.budget
-        # Reserve the input (about 3 characters a token, rounded up) and the longest reply the request allows.
-        reserve = -(-sum(len(message.text) for message in request.messages) // 3) + request.max_output_tokens
         hold = _Hold()
+        started = no_transport = False
         try:
-            budget._begin(reserve, hold)  # raises token_cap_reached before any network work
+            budget._begin(request.hold_tokens, hold)  # raises token_cap_reached before any network work
             failure = result = None
             try:
+                started = True
                 result = self._result(request, self._send(request))
             except ModelAdapterError as error:
                 failure = error
-            except (MemoryError, _NoTransport):
+            except _NoTransport:
+                no_transport = True
+                raise
+            except MemoryError:
                 raise
             except Exception as error:
                 # Raised below, outside this block, so no traceback holds the original error or anything it printed.
                 failure = self._unexpected(error)
             if failure is not None:
-                budget._finish(hold, failure.tokens_charged)
+                budget._finish(hold, getattr(failure, 'tokens_charged', None))
                 raise failure
             budget._finish(hold, result.tokens_charged)
             return result
         finally:
-            budget._abort(hold)  # does nothing once the hold is settled; frees it after an interrupt
+            # A hold that is still open here means an interrupt or a memory error. If the send began, the request may have gone
+            # out and may be billed, so the whole hold is charged. Before the send, or with no transport, nothing is charged.
+            if started and not no_transport:
+                budget._finish(hold, hold.amount)
+            budget._abort(hold)
 
     def _result(self, request, raw):
         if not isinstance(raw, RawCompletion) or not isinstance(raw.text, str) or raw.stop_reason not in STOP_REASONS \
@@ -591,14 +645,21 @@ class ModelAdapter:
         text = self._scrub(raw.text)
         redacted = text != raw.text
         usage = raw.usage
-        if usage is not None and usage.total == 0 and raw.text:
-            usage = None  # zero tokens next to a reply with text cannot be true
+        if usage is not None and usage.input_tokens == 0:
+            usage = None  # a reply cannot cost nothing to read
+        hold = request.hold_tokens
         notices = []
         if usage is None:
-            charged = request.max_output_tokens
-            notices.append(f'The provider reported no usage that Schola can use. Schola counted the request maximum of {charged} tokens as spent.')
+            charged = hold
+            notices.append(f'The provider reported no usage that Schola can use. Schola counted the whole hold of {charged} tokens as spent.')
         else:
-            charged = usage.total
+            # The provider can under-count. The charge is at least a share of the input and of the reply, and at most twice the hold.
+            charged = max(usage.total, request.input_estimate // 4 + len(raw.text) // 8)
+            if charged > usage.total:
+                notices.append(f'Schola counted more than the provider reported, to cover the input and the reply ({charged} tokens).')
+            if charged > 2 * hold:
+                charged = 2 * hold
+                notices.append(f'The charge is capped at twice the hold ({charged} tokens).')
         if redacted:
             notices.append('Schola redacted the API key from the reply text.')
         return CompletionResult(text, usage, raw.stop_reason, usage is not None, charged, ' '.join(notices) or None, redacted)

@@ -319,10 +319,10 @@ class TokenBudgetTests(unittest.TestCase):
         self.assertEqual(adapter.calls, 1)
 
     def test_a_call_may_overshoot_the_cap_when_the_provider_counts_more_and_the_next_is_refused(self):
-        budget = TokenBudget(100)
-        adapter = FakeAdapter(reply(usage=(500, 500)))
-        adapter.complete(request(budget, max_output_tokens=50))
-        self.assertEqual((budget.spent, budget.remaining), (1000, 0))
+        budget = TokenBudget(40)
+        adapter = FakeAdapter(reply(usage=(35, 25)))
+        adapter.complete(request(budget, max_output_tokens=30))  # the hold is 32; 60 is within twice the hold and passes the cap of 40
+        self.assertEqual((budget.spent, budget.remaining), (60, 0))
         refused(self, 'token_cap_reached', adapter.complete, request(budget, max_output_tokens=1))
 
     def test_a_failed_call_charges_nothing_and_frees_its_reservation(self):
@@ -508,16 +508,16 @@ class CompleteTests(unittest.TestCase):
         result = FakeAdapter(reply(usage=None)).complete(request(budget, max_output_tokens=250))
         self.assertIsNone(result.usage)
         self.assertFalse(result.usage_reported)
-        self.assertEqual(result.tokens_charged, 250)
-        self.assertEqual(budget.spent, 250)
+        self.assertEqual(result.tokens_charged, 252)  # the whole hold: 2 for the input and 250 for the reply
+        self.assertEqual(budget.spent, 252)
         self.assertIn('no usage', result.notice)
-        self.assertIn('250', result.notice)
+        self.assertIn('252', result.notice)
 
     def test_missing_usage_can_spend_the_budget(self):
         budget = TokenBudget(100)
         adapter = FakeAdapter(reply(usage=None))
         adapter.complete(request(budget, max_output_tokens=98))
-        self.assertEqual(budget.spent, 98)
+        self.assertEqual(budget.spent, 100)
         refused(self, 'token_cap_reached', adapter.complete, request(budget, max_output_tokens=1))
 
     def test_zero_usage_next_to_text_is_not_free(self):
@@ -526,14 +526,33 @@ class CompleteTests(unittest.TestCase):
             result = FakeAdapter(reply('Some text.', usage=usage)).complete(request(budget, max_output_tokens=250))
             self.assertFalse(result.usage_reported)
             self.assertIsNone(result.usage)
-            self.assertEqual((result.tokens_charged, budget.spent), (250, 250))
+            self.assertEqual((result.tokens_charged, budget.spent), (252, 252))
             self.assertIn('no usage', result.notice)
 
-    def test_zero_usage_next_to_no_text_is_reported_as_it_is(self):
-        budget = TokenBudget(1000)
-        result = FakeAdapter(reply('', usage=(0, 0), stop='length')).complete(request(budget, max_output_tokens=250))
-        self.assertTrue(result.usage_reported)
-        self.assertEqual((result.tokens_charged, budget.spent), (0, 0))
+    def test_an_input_count_of_zero_is_not_usable_even_with_no_text(self):
+        for text, usage in (('', (0, 0)), ('', (0, 5)), ('Some text.', (0, 5))):
+            with self.subTest(text=text, usage=usage):
+                budget = TokenBudget(1000)
+                result = FakeAdapter(reply(text, usage=usage, stop='length')).complete(request(budget, max_output_tokens=250))
+                self.assertFalse(result.usage_reported)
+                self.assertEqual((result.tokens_charged, budget.spent), (252, 252))
+
+    def test_the_charge_is_at_least_a_floor_made_from_the_input_and_the_reply(self):
+        budget = TokenBudget(100_000)
+        text = 'w' * 8000
+        result = FakeAdapter(reply(text, usage=(1, 1))).complete(request(budget, text='q' * 4000, max_output_tokens=2000))
+        # input estimate 1334 // 4 = 333, reply 8000 // 8 = 1000
+        self.assertEqual(result.tokens_charged, 1333)
+        self.assertIn('more than the provider reported', result.notice)
+        result = FakeAdapter(reply('ok', usage=(100, 100))).complete(request(budget, text='q' * 30, max_output_tokens=2000))
+        self.assertEqual((result.tokens_charged, result.notice), (200, None))
+
+    def test_a_charge_above_twice_the_hold_is_capped_with_a_notice(self):
+        budget = TokenBudget(100_000)
+        result = FakeAdapter(reply(usage=(50_000, 50_000))).complete(request(budget, max_output_tokens=50))
+        self.assertEqual((result.tokens_charged, budget.spent), (104, 104))  # the hold is 2 + 50
+        self.assertIn('capped', result.notice)
+        self.assertEqual(result.usage, Usage(50_000, 50_000))
 
     def test_an_error_charges_the_tokens_it_carries(self):
         budget = TokenBudget(1000)
@@ -632,12 +651,11 @@ class CompleteTests(unittest.TestCase):
         refused(self, 'invalid_request', FakeAdapter().complete, request(budget, text='read /etc/passwd', max_output_tokens=90))
         FakeAdapter().complete(request(budget, max_output_tokens=90))
 
-    def test_an_interrupt_frees_the_reservation_and_passes_through(self):
-        budget = TokenBudget(100)
+    def test_an_interrupt_after_the_send_began_charges_the_whole_hold_and_passes_through(self):
+        budget = TokenBudget(1000)
         with self.assertRaises(KeyboardInterrupt):
             FakeAdapter(error=KeyboardInterrupt()).complete(request(budget, max_output_tokens=90))
-        self.assertEqual((budget.spent, budget._reserved), (0, 0))
-        FakeAdapter().complete(request(budget, max_output_tokens=90))
+        self.assertEqual((budget.spent, budget._reserved), (92, 0))  # the request may have gone out, so it may be billed
 
     def test_an_interrupt_between_the_reservation_and_the_send_frees_it(self):
         budget = TokenBudget(1000)
@@ -651,11 +669,88 @@ class CompleteTests(unittest.TestCase):
                 FakeAdapter().complete(request(budget))
         self.assertEqual(budget._reserved, 0)
 
-    def test_memory_errors_pass_through_and_free_the_reservation(self):
+    def test_memory_errors_pass_through_and_charge_the_hold_like_any_interrupt(self):
         budget = TokenBudget(1000)
         with self.assertRaises(MemoryError):
             FakeAdapter(error=MemoryError()).complete(request(budget))
+        self.assertEqual((budget.spent, budget._reserved), (102, 0))
+
+    def test_an_interrupt_in_the_hold_step_charges_nothing(self):
+        budget = TokenBudget(1000)
+        original = TokenBudget._begin
+
+        def begin_then_interrupt(self, reserve, hold):
+            original(self, reserve, hold)
+            raise KeyboardInterrupt()
+        with mock.patch.object(TokenBudget, '_begin', begin_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                FakeAdapter().complete(request(budget))
         self.assertEqual((budget.spent, budget._reserved), (0, 0))
+
+    def test_a_bad_charge_from_an_adapter_is_replaced_by_the_whole_hold(self):
+        class Charging(ma.ModelAdapter):
+            def __init__(self, charge, **options):
+                super().__init__(**options)
+                self.charge = charge
+
+            def _send(self, call):
+                return reply()
+
+            def _result(self, call, raw):
+                result = super()._result(call, raw)
+                return ma.CompletionResult(result.text, result.usage, result.stop_reason, True, self.charge)
+        for charge in (-10 ** 9, 'abc', True, None, 1.5, [3], float('nan')):
+            with self.subTest(charge=charge):
+                budget = TokenBudget(100_000)
+                Charging(charge).complete(request(budget))
+                self.assertEqual((budget.spent, budget._reserved), (102, 0))
+        for charge, expected in ((0, 0), (7, 7), (204, 204), (205, 204), (10 ** 12, 204)):
+            with self.subTest(charge=charge):
+                budget = TokenBudget(100_000)
+                Charging(charge).complete(request(budget))
+                self.assertEqual(budget.spent, expected)
+
+    def test_a_bad_charge_on_an_error_is_replaced_by_the_whole_hold(self):
+        for charge in (-10 ** 9, 'abc', True, None, 2.5):
+            with self.subTest(charge=charge):
+                error = ModelAdapterError('Odd.', 'bad_response')
+                error.tokens_charged = charge
+                budget = TokenBudget(100_000)
+                refused(self, 'bad_response', FakeAdapter(error=error).complete, request(budget))
+                self.assertEqual((budget.spent, budget._reserved), (102, 0))
+        error = ModelAdapterError('Odd.', 'bad_response')
+        error.tokens_charged = 10 ** 12
+        budget = TokenBudget(100_000)
+        refused(self, 'bad_response', FakeAdapter(error=error).complete, request(budget))
+        self.assertEqual(budget.spent, 204)
+
+    def test_a_hold_is_settled_once_whatever_happens(self):
+        budget = TokenBudget(1000)
+        hold = ma._Hold()
+        budget._begin(100, hold)
+        budget._finish(hold, 40)
+        budget._finish(hold, 40)
+        budget._abort(hold)
+        self.assertEqual((budget.spent, budget._reserved, hold.active), (40, 0, False))
+
+    def test_the_hold_is_inactive_before_the_counters_change(self):
+        seen = []
+        hold = ma._Hold()
+
+        class Watching(TokenBudget):
+            def __setattr__(self, name, value):
+                if name in ('_spent', '_reserved') and '_lock' in self.__dict__:
+                    seen.append((name, hold.active))
+                super().__setattr__(name, value)
+        budget = Watching(1000)
+        budget._begin(100, hold)
+        seen.clear()
+        budget._finish(hold, 40)
+        self.assertEqual(seen, [('_reserved', False), ('_spent', False)])
+
+    def test_a_request_knows_its_hold(self):
+        call = CompletionRequest([Message('user', 'x' * 7), Message('system', 'y' * 3)], 50, TokenBudget(1000))
+        self.assertEqual((call.input_estimate, call.hold_tokens), (4, 54))
 
     def test_only_the_missing_transport_raises_not_implemented_through(self):
         class Odd(ma.ModelAdapter):
@@ -673,9 +768,25 @@ class CompleteTests(unittest.TestCase):
             refused(self, 'bad_response', adapter.complete, request())
         text = '\n'.join(logs.output)
         self.assertIn('RuntimeError', text)
-        self.assertIn('Traceback', text)
+        self.assertIn('test_model_adapter.py:', text)  # where it happened
+        self.assertIn('_send', text)
         self.assertNotIn(SECRET, text)
-        self.assertIn('[redacted]', text)
+        self.assertNotIn('boom', text)  # the message is dropped, so a key in any spelling cannot get in
+
+    def test_the_log_holds_no_key_in_any_spelling(self):
+        import base64
+        import urllib.parse
+        key = ApiKey('sk-ab"cd\\ef/gh+ij=kl')
+        value = key.reveal_for_transport()
+        spellings = [value, repr(value), json.dumps(value), value.encode('unicode_escape').decode(), urllib.parse.quote(value),
+                     base64.b64encode(('Bearer ' + value).encode()).decode(), base64.b64encode((value + ':x').encode()).decode()]
+        adapter = FakeAdapter(error=RuntimeError(' '.join(spellings)), secrets=[key])
+        with self.assertLogs('schola.model_adapter', 'ERROR') as logs:
+            refused(self, 'bad_response', adapter.complete, request())
+        text = '\n'.join(logs.output)
+        for spelling in spellings:
+            self.assertNotIn(spelling, text)
+        self.assertNotIn(value[:8], text)
 
     def test_the_retryable_flag_of_an_unexpected_exception_is_kept(self):
         class Flaky(Exception):
@@ -828,7 +939,7 @@ class ContextGuardTests(unittest.TestCase):
                 self.assertRefused(text)
 
     def test_roots_of_everything_are_refused(self):
-        for root in ('/', '//', '/.', '/a/..', 'C:\\', 'c:/', 'D:\\.'):
+        for root in ('/', '//', '/.', '/a/..', 'C:\\', 'c:/', 'D:\\.', '\\\\', '\\\\\\'):
             with self.subTest(root=root):
                 refused(self, 'invalid_request', ma.context_guard, [Message('user', 'x')], allowed_paths=[root])
         ma.context_guard([Message('user', 'x')], allowed_paths=['C:\\Work', '/a'])
@@ -855,6 +966,80 @@ class ContextGuardTests(unittest.TestCase):
         for text in ('\u0438/\u0438\u043b\u0438', '\u65e5\u672c/\u4e2d\u56fd', '\u0627/\u0628', 'caf\u00e9/th\u00e9', 'x\u0438/y'):
             with self.subTest(text=text):
                 self.check(text)
+
+    def test_a_path_glued_to_an_allowed_path_by_a_mark_is_checked_on_its_own(self):
+        roots = ['/allowed/proj']
+        for text in ('/allowed/proj/bin:/etc/passwd', '/allowed/proj/x=/etc/passwd', '/allowed/proj/x&/etc/passwd', '/allowed/proj/x!/etc/passwd',
+                     '--volume /allowed/proj:/etc/shadow', 'http://x.com,/etc/passwd', 'http://x.com;/etc/passwd', '(http://x.com)/etc/passwd',
+                     'C:\\Users\\me\\proj\\a:C:\\Windows\\x', '/allowed/proj/a:~/secret', '/allowed/proj/a:\\\\server\\share\\x'):
+            with self.subTest(text=text):
+                self.assertRefused(text, allowed_paths=roots + ['C:\\Users\\me\\proj'])
+
+    def test_a_mark_after_a_path_that_starts_no_second_path_is_fine(self):
+        roots = ['/allowed/proj', 'C:\\Users\\me\\proj']
+        for text in ('/allowed/proj/a.py:12:5', '/allowed/proj/a.py: error', '/allowed/proj/a=1', 'see /allowed/proj/a.py:12', 'https://host/a/b',
+                     'C:\\Users\\me\\proj\\a.py:12', '/allowed/proj/a!', 'at /allowed/proj/a.py:12:5: x=1&y=2'):
+            with self.subTest(text=text):
+                self.check(text, allowed_paths=roots)
+
+    def test_a_path_starts_after_any_mark_that_is_not_part_of_a_word(self):
+        for text in ('x)/etc/passwd', 'x]/etc/passwd', 'x}/etc/passwd', 'x*/etc/passwd', 'x%/etc/passwd', 'x@/etc/passwd', 'x#/etc/passwd', 'x^/etc/passwd',
+                     'x+/etc/passwd', 'x?/etc/passwd', 'x$/etc/passwd', 'x~/etc/passwd', 'x\u201c/etc/passwd'):
+            with self.subTest(text=text):
+                self.assertRefused(text)
+        for text in ('a.b/c', 'a-b/c', 'a_b/c', 'x1/y', '3/4', 'and/or', 'km/h', '\u0438/\u0438\u043b\u0438', 'caf\u00e9/th\u00e9'):
+            with self.subTest(text=text):
+                self.check(text)
+
+    def test_invisible_characters_do_not_hide_a_key(self):
+        shapes = ['sk-abcdefghijklmnopqrstuvwxyz012345', 'AKIAABCDEFGHIJKLMNOP', 'password=abcdefghij0123456789']
+        marks = ['\ufe0f', '\U000e0041', '\u206a', '\u3164', '\u2800', '\u0301', '\x00', '\u115f', '\u1160', '\uffa0', '\ufe00', '\U000e0100',
+                 '\u200b', '\u2060', '\u0483', '\x01', '\x7f', '\u00ad']
+        for shape in shapes:
+            for mark in marks:
+                with self.subTest(shape=shape[:6], mark=mark):
+                    self.assertRefused(shape[:5] + mark + shape[5:])
+                    self.assertRefused(mark.join(shape))
+
+    def test_invisible_characters_do_not_hide_a_held_key(self):
+        key = ApiKey('short-key-12345')
+        for mark in ('\ufe0f', '\U000e0041', '\u206a', '\u3164', '\u2800', '\u0301', '\x00', '\u200b'):
+            with self.subTest(mark=repr(mark)):
+                self.assertRefused('short-' + mark + 'key-12345', secrets=[key])
+                self.assertRefused(mark.join('short-key-12345'), secrets=[key])
+
+    def test_an_invisible_character_replaced_by_a_space_does_not_hide_a_path(self):
+        for mark in ('\u200b', '\ufe0f', '\u206a', '\u3164', '\u2800', '\x00', '\u0301', '\U000e0041'):
+            with self.subTest(mark=repr(mark)):
+                self.assertRefused('open' + mark + '/etc/passwd')
+                self.assertRefused('cat' + mark + '..' + mark)
+
+    def test_ordinary_white_space_is_not_removed(self):
+        self.check('a\tb\nc\rd e')
+        self.assertRefused('see\t/etc/passwd')
+        self.assertRefused('see\n/etc/passwd')
+        self.assertRefused('see\x0b/etc/passwd')
+
+    def test_a_key_split_over_two_messages_is_refused(self):
+        pairs = [('sk-abcdefgh', 'ijklmnopqrstuvwxyz012345'), ('AKIAABCD', 'EFGHIJKLMNOP'), ('ghp_abcdefghijklmnopqrstu', 'vwxyz0123456789'),
+                 ('sk-abcdefgh', '\n ijklmnopqrstuvwxyz012345')]
+        for first, second in pairs:
+            with self.subTest(first=first):
+                error = refused(self, 'invalid_request', ma.context_guard, [Message('user', first), Message('user', second)])
+                self.assertNotIn(first, str(error))
+        ma.context_guard([Message('user', 'Hello there'), Message('user', 'How are you today')])
+
+    def test_a_private_key_header_scan_is_fast_even_when_it_is_cut_into_four_messages(self):
+        text = ('-----BEGIN ' + 'PRIVATE KEY ' * 9000)[:ma.MAX_MESSAGE_CHARS]
+        for messages in ([Message('user', text)], [Message('user', text)] * 4):
+            started = time.process_time()
+            try:
+                ma.context_guard(messages)
+            except ModelAdapterError:
+                pass
+            self.assertLess(time.process_time() - started, 0.2)
+        self.assertRefused('-----BEGIN ' + 'A' * 40 + 'PRIVATE KEY-----')
+        self.check('-----BEGIN ' + 'A' * 41 + 'PRIVATE KEY-----')  # a header is short; a longer run is not one
 
     def test_the_scan_has_a_length_cap(self):
         refused(self, 'invalid_request', ma.context_guard, [Message('user', 'a' * ma.MAX_MESSAGE_CHARS)] * 5)
@@ -956,7 +1141,22 @@ class ContextGuardTests(unittest.TestCase):
             'keyword value': 'token=' + 'a' * (size - 6), 'password mix': 'a_password=' * 9000, 'unc': '\\\\a' * 25000, 'unicode': '\u0438/' * 50000,
             'zero width': 's\u200b' * 50000, 'credentials': 'x://a:' * 16666, 'pem': '-----BEGIN ' * 9000, 'basic': 'authorization: basic ' * 4700,
             'angle': '<' * size, 'html': '</div>' * 16666, 'long run': 'a-' * 50000, 'newlines': '\n' * size, 'mixed': 'sk-a/ token= ~ \\\\x:/' * 4000,
+            'token spaces': ' token=' + ' ' * size, 'dollar words': ' $a' * 33333, 'percent words': '%a' * 50000, 'marks': ':/' * 25000 + '=/' * 25000,
+            'glued': '/a:' * 33333, 'glued 2': '/a=/b&' * 16666, 'combining': 'a\u0301' * 50000, 'filler': '\u3164' * size, 'variation': 'a\ufe0f' * 50000,
         }
+        for number in (1, 2, 3):  # one pathological input for every pattern in the module
+            texts[f'pem {number}'] = ('-----BEGIN ' + 'PRIVATE KEY ' * 9000) if number == 1 else ('-----BEGIN ' + 'A' * size if number == 2 else '-----BEGIN A ' * 8000)
+        texts.update({
+            'bearer spaces': 'bearer' + ' ' * size, 'bearer run': 'bearer ' + 'a' * size, 'bearers': 'bearer a' * 12000,
+            'authorization spaces': 'authorization' + ' ' * size, 'authorization colon': 'authorization:' + ' ' * size, 'authorization basic': 'authorization: basic ' + 'a' * size,
+            'authorizations': 'authorization:basic a' * 4500, 'url creds 1': 'a://' + 'b:' * 50000, 'url creds 2': 'a://' + ':' * size, 'url creds 3': 'a://b' + ':c' * 33000,
+            'keyword spaces': 'password' + ' ' * size, 'keyword colon': 'password=' + ' ' * size, 'keyword quote': 'password="' + 'a' * size,
+            'keywords': 'secret_key=' * 9000, 'jwt dots': '.eyJ' * 25000, 'jwt long': 'eyJ' + 'a' * 50000 + '.eyJ' + 'a' * 49000, 'sk long': 'sk-' + 'a' * size,
+            'aws long': 'AKIA' + 'A' * size, 'ghp': 'ghp_' * 25000, 'xox': 'xoxb-' * 20000, 'AIza': 'AIza' * 25000, 'sg': 'SG.' + 'a' * size, 'sgs': 'SG.aaaaaaaaaaaaaaaa.' * 4700,
+            'ya29': 'ya29.' * 20000, 'drive long': 'C:\\' + 'a' * size, 'drive many': 'C:\\a' * 20000, 'unc many': '\\\\a\\b' * 20000, 'env long': '$' + 'a' * size,
+            'env braces': '${' * 50000, 'env many': '$a/' * 33000, 'home long': '~' + 'a' * size, 'home many': '~a/' * 33000, 'file long': 'file://' + 'a' * size,
+            'tags': '</a' * 33000, 'tags 2': '</' + 'a' * size, 'drive tail': 'a:/' + 'b:/' * 30000,
+        })
         for name, text in texts.items():
             with self.subTest(name=name):
                 started = time.process_time()  # CPU time, so a busy machine does not fail the test

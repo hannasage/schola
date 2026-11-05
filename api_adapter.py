@@ -26,8 +26,9 @@ Limits on every call
   name lookup, each connection try, the TLS handshake, the send, and the reply. The total must be at least the connect time.
 * The reply body is read in pieces and refused once it passes the cap (1 MB by default).
 * The reply must be one JSON object of the expected shape. Anything else is `bad_response`.
-* A 200 reply that cannot be used was billed: the error carries the usage of the body, or `max_output_tokens` when the
-  usage is unreadable. A timeout after the request was sent carries `max_output_tokens`. Other failures carry nothing.
+* A 200 reply that cannot be used was billed: the error carries the usage of the body, or the whole hold (the input estimate plus
+  `max_output_tokens`) when the usage is unreadable. A body that breaks in the middle, and a timeout after the request was sent,
+  carry the whole hold. Other failures carry nothing.
 
 An error message is a fixed sentence. It never holds the key, the URL, the address, the operating system's
 error text, or any text from the provider. Errors are raised after the handler that caught the problem has
@@ -172,6 +173,17 @@ def _tls_ok(context):
             and (context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED or context.maximum_version >= ssl.TLSVersion.TLSv1_2))
 
 
+def _tls_acceptable(context):
+    """True when a context checks certificates and host names and its highest TLS version is not below 1.2 (or below its own lowest).
+
+    This is tested before anything is changed, so a context that is refused is left as it was.
+    """
+    if not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+        return False
+    top = context.maximum_version
+    return top == ssl.TLSVersion.MAXIMUM_SUPPORTED or top >= max(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+
 def _raise_tls_floor(context):
     """Raise the lowest TLS version of a context to 1.2 when it is lower.
 
@@ -195,12 +207,38 @@ class _PinnedConnection(http.client.HTTPConnection):
     def __init__(self, host, port, addresses, context, connect_timeout, read_timeout, deadline):
         super().__init__(host, port, timeout=connect_timeout)
         self._addresses, self._context, self._read_timeout, self._deadline = addresses, context, read_timeout, deadline
+        self._live = None
+
+    def _left(self):
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('the call ran out of time')
+        return left
 
     def _remaining(self):
-        remaining = self._deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError('the call ran out of time')
-        return min(self.timeout, remaining)
+        return min(self.timeout, self._left())
+
+    def arm(self):
+        """Set the time limit of the next send or read: the read time, or what is left of the total if that is less.
+
+        A shutdown from the timer thread does not reliably wake a blocked send or TLS read on every system, so every
+        wait carries its own limit as well.
+        """
+        self.live().settimeout(min(self._read_timeout, self._left()))
+
+    def live(self):
+        """The socket in use. `http.client` drops `self.sock` as soon as a reply says "connection: close", but the reply still reads from it."""
+        return self._live if self._live is not None else self.sock
+
+    def send(self, data):
+        if self.sock is None and self.auto_open:
+            self.connect()
+        self.arm()
+        super().send(data)
+
+    def getresponse(self):
+        self.arm()
+        return super().getresponse()
 
     def connect(self):
         if self._context is not None and not _tls_ok(self._context):
@@ -216,13 +254,13 @@ class _PinnedConnection(http.client.HTTPConnection):
             break
         else:
             raise last
-        self.sock = sock  # set at once, so the timer can close a socket that is still in the handshake
+        self.sock = self._live = sock  # set at once, so the timer can close a socket that is still in the handshake
         if self._context is not None:
             # A failure here leaves the raw socket in `self.sock`, and `close()` of the connection closes it.
             sock.settimeout(self._remaining())
             sock = self._context.wrap_socket(sock, server_hostname=self.host)
-            self.sock = sock
-        sock.settimeout(self._read_timeout)
+            self.sock = self._live = sock
+        self.arm()
 
 
 def _first_fields(items):
@@ -255,7 +293,20 @@ def _usage(document):
     counts = (usage.get('prompt_tokens'), usage.get('completion_tokens'))
     if any(isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= ma.MAX_TOKEN_COUNT for count in counts):
         return None
+    if counts[0] == 0:
+        return None  # the provider read the input, so a count of zero for it cannot be right
     return Usage(*counts)
+
+
+def _length(text):
+    """The value of a Content-Length header, or None when it is not plain ASCII digits that `int` can read."""
+    text = text.strip()
+    if not (text.isascii() and text.isdecimal()):
+        return None
+    try:
+        return int(text)
+    except ValueError:  # a number of thousands of digits
+        return None
 
 
 def _media(header):
@@ -323,13 +374,16 @@ def _body_error(value, usage):
     if isinstance(value, dict):
         for key in ('code', 'status'):
             candidate = value.get(key)
-            if isinstance(candidate, str) and candidate.isdigit() and len(candidate) == 3:
+            if isinstance(candidate, str) and len(candidate) == 3 and candidate.isascii() and candidate.isdecimal():
                 candidate = int(candidate)
             if isinstance(candidate, int) and 400 <= candidate <= 599:  # a bool is 0 or 1, so it never gets here
                 number = candidate
                 break
-    error = _status_error(number) if number is not None else None
-    return _billed(error or _bad('The provider reply holds an error.'), usage, 0)
+    mapped = _status_error(number) if number is not None else None
+    if mapped is not None:
+        # Same code and retry advice as the status table, but the sentence says where the provider put it.
+        mapped = ModelAdapterError(f'The provider reported this in the body of a 200 reply: {mapped}', mapped.code)  # the retry advice comes from the code
+    return _billed(mapped or _bad('The provider reply holds an error.'), usage, 0)
 
 
 _RETRY_WORTHY_TLS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
@@ -379,14 +433,16 @@ class ApiAdapter(ma.ModelAdapter):
             raise ma._invalid('max_tokens_field must be max_tokens or max_completion_tokens.')
         if not all(_number(value, 0, MAX_TIMEOUT) for value in (connect_timeout, read_timeout, total_timeout)):
             raise ma._invalid(f'Each timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}.')
-        if total_timeout < connect_timeout:
-            raise ma._invalid('The total time must be at least the connect time.')
+        if total_timeout < connect_timeout or total_timeout < read_timeout:
+            raise ma._invalid('The total time must be at least the connect time and at least the read time.')
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or not 1 <= max_response_bytes <= MAX_RESPONSE_BYTES_LIMIT:
             raise ma._invalid(f'max_response_bytes must be a whole number from 1 to {MAX_RESPONSE_BYTES_LIMIT}.')
         if ssl_context is None:
             ssl_context = ssl.create_default_context()
-        if isinstance(ssl_context, ssl.SSLContext):
-            _raise_tls_floor(ssl_context)
+        if not _tls_acceptable(ssl_context):
+            raise ma._invalid('The TLS context must check certificates and host names, and it must not cap TLS below 1.2. '
+                              'Schola raises its lowest version to TLS 1.2 for you.')
+        _raise_tls_floor(ssl_context)
         if not _tls_ok(ssl_context):
             raise ma._invalid('The TLS context must check certificates and host names, and it must not cap TLS below 1.2. '
                               'Schola raises its lowest version to TLS 1.2 for you.')
@@ -473,18 +529,18 @@ class ApiAdapter(ma.ModelAdapter):
         """Do the call. Return (error, reply). This never raises for a network or protocol problem.
 
         One monotonic deadline covers the name lookup, each connection try, the TLS handshake, the send, and the reply.
-        A request that was sent and then timed out was probably billed, so that timeout charges `max_output_tokens`.
+        A request that was sent and then timed out was probably billed, so that timeout charges the whole hold.
         """
         deadline = time.monotonic() + self._total_timeout
         expired = threading.Event()
         connection = timer = None
         error = raw = None
         sent = waited = False
-        max_output = request.max_output_tokens
+        hold = request.hold_tokens
 
         def expire():
             expired.set()
-            sock = connection.sock if connection is not None else None
+            sock = connection.live() if connection is not None else None
             if sock is not None:
                 for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
                     try:
@@ -502,7 +558,7 @@ class ApiAdapter(ma.ModelAdapter):
                                            self._connect_timeout, self._read_timeout, deadline)
             connection.request('POST', endpoint.path + '/chat/completions', self._body(request), self._headers())
             sent = True
-            error, raw = self._read(connection.getresponse(), max_output)
+            error, raw = self._read(connection, connection.getresponse(), hold)
         except MemoryError:
             raise
         except ModelAdapterError as caught:
@@ -521,54 +577,64 @@ class ApiAdapter(ma.ModelAdapter):
         if error is None and raw is not None:
             return None, raw  # a reply that was read in full is a reply, whatever the clock says
         if expired.is_set() or waited:
-            return _timeout(max_output if sent else 0), None
+            return _timeout(hold if sent else 0), None
         return error, raw
 
-    def _read(self, response, max_output):
+    def _read(self, connection, response, hold):
         failure = _status_error(response.status)
         if failure is not None:
             return failure, None  # the body of an error reply is never read; nothing is charged
-        # From here the provider answered 200, so the call was billed. A reply that cannot be read is charged `max_output`.
+        # From here the provider answered 200, so the call was billed. A reply that cannot be read is charged the whole hold.
         encoding = (response.getheader('Content-Encoding') or 'identity').strip().lower()
         media, charset = _media(response.getheader('Content-Type') or '')
         if encoding != 'identity' or not _json_media(media) or charset not in (None, 'utf-8'):
-            return _billed(_bad(), None, max_output), None
+            return _billed(_bad(), None, hold), None
         declared = response.getheader('Content-Length')
-        declared = int(declared) if declared is not None and declared.strip().isdigit() else None
-        if declared is not None and declared > self._max_bytes:
-            return _billed(_too_large(), None, max_output), None
+        if declared is not None:
+            declared = _length(declared)
+            if declared is None:
+                return _billed(_bad('The provider sent a length that cannot be read.'), None, hold), None
+            if declared > self._max_bytes:
+                return _billed(_too_large(), None, hold), None
         pieces, total = [], 0
-        while True:
-            piece = response.read(_CHUNK)
-            if not piece:
-                break
-            total += len(piece)
-            if total > self._max_bytes:
-                return _billed(_too_large(), None, max_output), None
-            pieces.append(piece)
+        try:
+            while True:
+                connection.arm()
+                piece = response.read1(_CHUNK)
+                if not piece:
+                    break
+                total += len(piece)
+                if total > self._max_bytes:
+                    return _billed(_too_large(), None, hold), None
+                pieces.append(piece)
+        except MemoryError:
+            raise
+        except Exception as caught:
+            # The body broke in the middle of a reply the provider billed: a reset, a cut chunk, an over-long line, a timeout.
+            return _billed(_classify(caught) or _bad(), None, hold), None
         if declared is not None and total != declared:
-            return _billed(_bad('The provider reply ended early.'), None, max_output), None
-        return self._parse(b''.join(pieces), max_output)
+            return _billed(_bad('The provider reply ended early.'), None, hold), None
+        return self._parse(b''.join(pieces), hold)
 
-    def _parse(self, body, max_output):
+    def _parse(self, body, hold):
         try:
             document = json.loads(body.decode('utf-8'), parse_int=_parse_int, parse_constant=_reject_constant)
         except (ValueError, RecursionError):
-            return _billed(_bad(), None, max_output), None
+            return _billed(_bad(), None, hold), None
         if not isinstance(document, dict):
-            return _billed(_bad(), None, max_output), None
+            return _billed(_bad(), None, hold), None
         usage = _usage(document)
         if document.get('error') is not None:
             return _body_error(document['error'], usage), None
         choices = document.get('choices')
         if not isinstance(choices, list):
-            return _billed(_bad(), usage, max_output), None
+            return _billed(_bad(), usage, hold), None
         if not choices:
-            return _billed(_bad('The provider reply holds no choices.'), usage, max_output), None
+            return _billed(_bad('The provider reply holds no choices.'), usage, hold), None
         choice = choices[0]
         message = choice.get('message') if isinstance(choice, dict) else None
         if not isinstance(message, dict):
-            return _billed(_bad(), usage, max_output), None
+            return _billed(_bad(), usage, hold), None
         finish = choice.get('finish_reason')
         text = message.get('content')
         if text is None:
@@ -578,5 +644,5 @@ class ApiAdapter(ma.ModelAdapter):
             if message.get('tool_calls') or finish in ('tool_calls', 'function_call'):
                 return None, RawCompletion('', usage, 'other')
         if not isinstance(text, str) or not ma._encodable(text):
-            return _billed(_bad(), usage, max_output), None
+            return _billed(_bad(), usage, hold), None
         return None, RawCompletion(text, usage, _STOP_REASONS.get(finish, 'other') if isinstance(finish, str) else 'other')
