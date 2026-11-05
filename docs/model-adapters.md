@@ -9,9 +9,10 @@ The code is `model_adapter.py` and `api_adapter.py`.
 `types/model-adapter.d.ts` types the error payload and nothing else. A request and a result get types once a route sends them.
 The tests are `tests/test_model_adapter.py` and `tests/test_api_adapter.py`.
 The code uses only the Python standard library.
-It needs Python 3.10 or later. The two test files passed on 3.10, 3.11, 3.12, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
+It needs Python 3.10 or later. The three test modules (`test_model_adapter`, `test_api_adapter`, and `test_local_adapter`) passed on 3.10, 3.12, 3.13, and 3.14, all on macOS. Python 3.9 fails some of them, so it is not supported.
 The tests use the explicit range list for address checks and do not depend on the `ipaddress` tables of one Python version.
 Nothing calls these adapters yet. No route, screen, or agent loop uses them in this step.
+Step E4 added the local adapter, a subclass of the API adapter. `docs/local-adapter.md` describes it.
 
 ## Terms
 
@@ -314,12 +315,15 @@ The operating system and Python's default context decide which certificate autho
 - The adapter does not read a provider's `Retry-After` header.
 - The token count comes from the provider. Schola cannot check the numbers, and the input estimate is rough.
 - A connection that breaks before any reply byte arrives counts as nothing in the budget. The provider can still bill for such a call. Schola cannot see it.
-- Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.11, 3.12, and 3.14.
+  This holds even when the request was fully sent. A server can take the request and then reset the connection, and the call costs nothing in the budget.
+  The cap never moves on such a failure, so a retry loop never ends by itself. A caller that retries needs its own limit on attempts.
+  Schola does not charge the hold here, because the rule above is part of the documented charging rules and the tests check it.
+- Windows and Linux are untested. The tests ran on macOS, with Python 3.10, 3.12, 3.13, and 3.14.
+- A reply with a correct `Content-Length` and `Connection: close` failed on Python 3.12 and later in the first version of this adapter. The step E4 work fixed it (see `docs/local-adapter.md`). The tests now send that header in every framing.
 
 ## Not built in this step
 
 - The command line bridge. Nobody checked whether provider terms allow it.
-- The local adapter (step E4). This adapter already accepts a loopback endpoint with no key. Nobody checked which local runtimes work.
 - Key storage. Where keys live on each platform is an open decision.
 - The default token cap. The cap is required until that decision is made.
 - The offer rate limit, the policy evaluator, and the agent loop (steps E5 and E6).

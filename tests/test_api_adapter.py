@@ -3,13 +3,17 @@
 A fake provider runs on a loopback port in a thread. The tests never use the real network and never call a real provider.
 """
 import contextlib
+import copy
+import errno
 import http.client
 import json
 import os
+import pickle
 from pathlib import Path
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -59,6 +63,14 @@ def send(handler, status=200, body=b'', headers=None, content_type='application/
     handler.wfile.write(body)
 
 
+_plain_send = send
+
+
+def closing_send(handler, status=200, body=b'', headers=None, **options):
+    """`send` with `Connection: close` added, as Go, h11, Node, and cpp-httplib servers answer a request that asks for it."""
+    _plain_send(handler, status, body, {**(headers or {}), 'Connection': 'close'}, **options)
+
+
 def reply_json(payload, status=200, **options):
     return lambda handler, body: send(handler, status, json.dumps(payload).encode('utf-8'), **options)
 
@@ -70,7 +82,7 @@ def reply_raw(body, status=200, **options):
 class Provider:
     """A fake OpenAI-format endpoint. `responder(handler, request_body)` writes the reply. `requests` records each request."""
 
-    def __init__(self, responder=None, tls=None):
+    def __init__(self, responder=None, tls=None, host='127.0.0.1'):
         self.requests = []
         self.responder = responder or reply_json(ok_payload())
         provider = self
@@ -78,22 +90,29 @@ class Provider:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = 'HTTP/1.1'
 
-            def do_POST(self):
+            def handle_request(self, method):
                 length = int(self.headers.get('Content-Length') or 0)
                 body = self.rfile.read(length)
-                provider.requests.append({'method': 'POST', 'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()}, 'body': body})
+                provider.requests.append({'method': method, 'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()}, 'body': body})
                 provider.responder(self, body)
+
+            def do_POST(self):
+                self.handle_request('POST')
+
+            def do_GET(self):
+                self.handle_request('GET')
 
             def log_message(self, *args):
                 pass
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
+            address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
 
             def handle_error(self, request, client_address):
                 pass
 
-        self.server = Server(('127.0.0.1', 0), Handler)
+        self.server = Server((host, 0), Handler)
         if tls is not None:
             self.server.socket = tls.wrap_socket(self.server.socket, server_side=True)
         self.port = self.server.server_port
@@ -2055,6 +2074,405 @@ class TlsTests(Case):
         weak.append(context)
         for context in weak:
             self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', 'm', ApiKey(SECRET), ssl_context=context)
+
+
+class TransportSeamTests(Case):
+    """The shared transport (`_roundtrip`) and its hook (`_classify_error`) that a subclass reuses. The API adapter's own calls must not change."""
+
+    def parse_text(self, body, hold):
+        return None, body.decode('utf-8')
+
+    def test_a_get_goes_out_with_no_body_and_no_content_type_and_still_has_the_key(self):
+        provider = self.provider(reply_json({'ok': True}))
+        adapter = self.adapter(provider)
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text)
+        self.assertIsNone(error)
+        self.assertEqual(reply, '{"ok": true}')
+        sent = provider.requests[0]
+        self.assertEqual((sent['method'], sent['path'], sent['body']), ('GET', '/v1/models', b''))
+        self.assertNotIn('content-type', sent['headers'])
+        self.assertNotIn('content-length', sent['headers'])
+        self.assertEqual(sent['headers']['accept'], 'application/json')
+        self.assertEqual(sent['headers']['authorization'], 'Bearer ' + SECRET)
+
+    def test_a_post_still_has_a_json_body_and_content_type(self):
+        provider = self.provider()
+        self.adapter(provider).complete(call())
+        sent = provider.requests[0]
+        self.assertEqual((sent['method'], sent['path']), ('POST', '/v1/chat/completions'))
+        self.assertEqual(sent['headers']['content-type'], 'application/json')
+        self.assertEqual(int(sent['headers']['content-length']), len(sent['body']))
+
+    def test_a_roundtrip_with_no_hold_charges_nothing_for_any_billed_failure(self):
+        for responder in (reply_raw(b'not json'), reply_raw(b'[1]'), reply_json({'error': {'code': 500}}), reply_raw(b'x' * 5000)):
+            with self.subTest():
+                adapter = self.adapter(self.provider(responder), max_response_bytes=2000)
+                error, reply = adapter._roundtrip('GET', '/models', None, 0, adapter._parse)
+                self.assertIsNone(reply)
+                self.assertEqual(error.tokens_charged, 0)
+
+    def test_a_roundtrip_can_take_its_own_read_and_total_limits(self):
+        provider = self.provider(lambda handler, body: time.sleep(3))
+        adapter = self.adapter(provider)
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.5, 0.5))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_a_short_total_also_shortens_a_long_connect_time_so_a_hung_lookup_cannot_outlast_it(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), connect_timeout=60, read_timeout=60, total_timeout=60,
+                             resolver=lambda host, port, *a, **k: release.wait(30))
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.5, 0.5))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_the_model_name_rule_is_one_function(self):
+        for good in ('m', 'llama3.2:latest', 'hf.co/u/m:Q4', 'a@b+c#d~e-f_g', 'x' * 200):
+            self.assertTrue(api_adapter.model_name_ok(good), good)
+        for bad in ('', 'x' * 201, 'a b', 'a\n', 'é', None, 5, b'm', ['m']):
+            self.assertFalse(api_adapter.model_name_ok(bad), bad)
+            self.assertCode('invalid_request', ApiAdapter, 'https://example.com/v1', bad, ApiKey(SECRET))
+
+    def test_a_roundtrip_deadline_alone_ends_a_body_that_drips_when_the_timer_does_nothing(self):
+        def drip(handler, body):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.end_headers()
+            try:
+                for _ in range(100):
+                    handler.wfile.write(b' ')
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(drip), connect_timeout=30, read_timeout=30, total_timeout=60)
+        with mock.patch('api_adapter.threading.Timer', NeverFires):
+            for _ in range(2):
+                started = time.monotonic()
+                error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.6, 0.6))
+                self.assertEqual(error.code, 'timeout')
+                self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_the_read_and_total_limits_of_a_roundtrip_are_not_mixed_up(self):
+        def slow_body(handler, body):
+            data = b'{"ok": true}'
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Content-Length', str(len(data)))
+            handler.end_headers()
+            try:
+                for index in range(len(data)):  # each wait is short, the whole reply takes about 1.2 seconds
+                    handler.wfile.write(data[index:index + 1])
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(slow_body), connect_timeout=30, read_timeout=30, total_timeout=60)
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(0.6, 8))
+        self.assertIsNone(error, error)
+        self.assertEqual(reply, '{"ok": true}')
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(8, 0.5))
+        self.assertEqual(error.code, 'timeout')
+
+    def test_the_timer_follows_the_total_of_the_roundtrip_when_headers_drip_in(self):
+        def responder(handler, body):
+            handler.wfile.write(b'HTTP/1.1 200 OK\r\n')
+            try:
+                for index in range(100):
+                    handler.wfile.write(f'X-Slow-{index}: y\r\n'.encode())
+                    handler.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        adapter = self.adapter(self.provider(responder), connect_timeout=30, read_timeout=30, total_timeout=60)
+        started = time.monotonic()
+        error, reply = adapter._roundtrip('GET', '/models', None, 0, self.parse_text, limits=(30, 0.6))
+        self.assertEqual(error.code, 'timeout')
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_the_api_adapter_words_a_refused_connection_as_before(self):
+        adapter = ApiAdapter(f'http://127.0.0.1:{free_port()}/v1', 'm', ApiKey(SECRET))
+        error = self.assertCode('endpoint_unreachable', adapter.complete, call(), retryable=True)
+        self.assertEqual(str(error), 'Schola could not reach the endpoint.')
+
+    def test_a_connect_failure_keeps_its_errno_and_says_whether_an_address_refused(self):
+        adapter = ApiAdapter('http://127.0.0.1:1/v1', 'm', ApiKey(SECRET))
+        cases = ((ConnectionRefusedError(errno.ECONNREFUSED, 'x'), errno.ECONNREFUSED, True), (OSError(errno.EADDRNOTAVAIL, 'x'), errno.EADDRNOTAVAIL, False),
+                 (PermissionError(errno.EACCES, 'x'), errno.EACCES, False), (OSError(errno.EMFILE, 'x'), errno.EMFILE, False),
+                 (OSError(errno.ENETUNREACH, 'x'), errno.ENETUNREACH, False), (ConnectionAbortedError(errno.ECONNABORTED, 'x'), errno.ECONNABORTED, True))
+        for error, number, refused in cases:
+            with self.subTest(errno=number), mock.patch('socket.create_connection', side_effect=error):
+                self.assertCode('endpoint_unreachable', adapter.complete, call(), retryable=True)
+                with self.assertRaises(api_adapter.ConnectFailed) as caught:
+                    api_adapter._PinnedConnection('127.0.0.1', 1, ['127.0.0.1'], None, 1, 1, time.monotonic() + 5).connect()
+                self.assertEqual((caught.exception.errno, caught.exception.refused), (number, refused))
+        with mock.patch('socket.create_connection', side_effect=socket.timeout('timed out')):
+            self.assertCode('timeout', adapter.complete, call(), retryable=True)
+
+    def test_a_refusal_on_any_address_is_what_the_failure_reports(self):
+        for order in ((OSError(errno.EADDRNOTAVAIL, 'x'), ConnectionRefusedError(errno.ECONNREFUSED, 'x')),
+                      (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), OSError(errno.EADDRNOTAVAIL, 'x'))):
+            with self.subTest(order=[type(e).__name__ for e in order]), mock.patch('socket.create_connection', side_effect=list(order)):
+                connection = api_adapter._PinnedConnection('localhost', 1, ['::1', '127.0.0.1'], None, 1, 1, time.monotonic() + 5)
+                with self.assertRaises(api_adapter.ConnectFailed) as caught:
+                    connection.connect()
+                self.assertEqual((caught.exception.errno, caught.exception.refused), (errno.ECONNREFUSED, True))
+
+    def test_a_timeout_on_any_address_is_a_timeout_whatever_the_other_addresses_said(self):
+        two = lambda host, port, *a, **k: [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', port)), (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+        for order in ((socket.timeout('t'), ConnectionRefusedError(errno.ECONNREFUSED, 'x')), (ConnectionRefusedError(errno.ECONNREFUSED, 'x'), socket.timeout('t'))):
+            with self.subTest(first=type(order[0]).__name__), mock.patch('socket.create_connection', side_effect=list(order)):
+                adapter = ApiAdapter('http://localhost:80/v1', 'm', ApiKey(SECRET), resolver=two)
+                self.assertCode('timeout', adapter.complete, call(), retryable=True)
+
+    def test_a_connect_failure_can_be_copied_and_pickled_and_keeps_what_it_knows(self):
+        original = api_adapter.ConnectFailed(errno.ECONNREFUSED, 'no connection', True)
+        for name, clone in (('copy', copy.copy(original)), ('deepcopy', copy.deepcopy(original)), ('pickle', pickle.loads(pickle.dumps(original)))):
+            with self.subTest(how=name):
+                self.assertIsInstance(clone, api_adapter.ConnectFailed)
+                self.assertEqual((clone.errno, clone.refused, clone.strerror), (errno.ECONNREFUSED, True, 'no connection'))
+        self.assertFalse(pickle.loads(pickle.dumps(api_adapter.ConnectFailed(errno.EMFILE, 'x', False))).refused)
+        self.assertFalse(api_adapter.ConnectFailed(errno.EMFILE, 'x').refused)
+
+    def test_a_subclass_can_reword_a_network_error_and_nothing_else(self):
+        class Reworded(ApiAdapter):
+            def _classify_error(self, caught):
+                if isinstance(caught, api_adapter.ConnectFailed):
+                    return ModelAdapterError('Fixed sentence.', 'endpoint_unreachable', retryable=True)
+                return super()._classify_error(caught)
+        down = Reworded(f'http://127.0.0.1:{free_port()}/v1', 'm', ApiKey(SECRET))
+        self.assertEqual(str(self.assertCode('endpoint_unreachable', down.complete, call())), 'Fixed sentence.')
+        slow = Reworded(self.provider(lambda handler, body: time.sleep(3)).url(), 'm', ApiKey(SECRET), connect_timeout=0.5, read_timeout=0.5, total_timeout=0.5)
+        self.assertCode('timeout', slow.complete, call())
+
+
+class ConnectionCloseTests(Case):
+    """A reply with `Connection: close` (the adapter asks for it, and many servers echo it). `http.client` closes the socket
+    as soon as the body is read, so the reader must not touch the socket again.
+    The first version of these tests missed this: the fake server sent no `Connection` header in its replies.
+    """
+
+    GOOD = json.dumps(ok_payload()).encode()
+
+    def chunked(self, body, status=200):
+        def responder(handler, request_body):
+            handler.send_response(status)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            for start in range(0, len(body), 11):
+                piece = body[start:start + 11]
+                handler.wfile.write(f'{len(piece):x}\r\n'.encode() + piece + b'\r\n')
+            handler.wfile.write(b'0\r\n\r\n')
+        return responder
+
+    def neither(self, body, status=200):
+        return lambda handler, request_body: _plain_send(handler, status, body, {'Connection': 'close'}, length=False)
+
+    def with_length(self, body, status=200):
+        return lambda handler, request_body: _plain_send(handler, status, body, {'Connection': 'close'})
+
+    def shapes(self, body, status=200):
+        return {'length': self.with_length(body, status), 'chunked': self.chunked(body, status), 'neither': self.neither(body, status)}
+
+    def test_a_good_reply_is_a_reply_with_every_framing(self):
+        for name, responder in self.shapes(self.GOOD).items():
+            with self.subTest(framing=name):
+                budget = TokenBudget(100_000)
+                result = self.adapter(self.provider(responder)).complete(call(budget))
+                self.assertEqual((result.text, result.usage_reported, budget.spent), ('Hello from the model.', True, 19))
+
+    def test_a_get_is_read_with_every_framing(self):
+        for name, responder in self.shapes(b'{"ok": true}').items():
+            with self.subTest(framing=name):
+                adapter = self.adapter(self.provider(responder))
+                error, reply = adapter._roundtrip('GET', '/models', None, 0, lambda body, hold: (None, body.decode()))
+                self.assertIsNone(error)
+                self.assertEqual(reply, '{"ok": true}')
+
+    def test_a_body_that_cannot_be_used_is_billed_the_same_with_every_framing(self):
+        for label, body, status, code in (('bad json', b'not json', 200, 'bad_response'), ('empty choices', b'{"choices": []}', 200, 'bad_response'),
+                                          ('error object', b'{"error": {"code": 429}}', 200, 'rate_limited'),
+                                          ('server error', b'{"error": "x"}', 500, 'endpoint_unreachable'), ('auth', b'x', 401, 'auth_failed'),
+                                          ('redirect', b'x', 302, 'unsafe_endpoint')):
+            for name, responder in self.shapes(body, status).items():
+                with self.subTest(case=label, framing=name):
+                    reference = self.adapter(self.provider(lambda handler, b, body=body, status=status: _plain_send(handler, status, body))).complete
+                    expected = self.assertCode(code, reference, call(TokenBudget(100_000)))
+                    budget = TokenBudget(100_000)
+                    error = self.assertCode(code, self.adapter(self.provider(responder)).complete, call(budget))
+                    self.assertEqual((error.tokens_charged, budget.spent), (expected.tokens_charged, expected.tokens_charged))
+
+    def test_a_body_over_the_cap_is_refused_with_every_framing(self):
+        body = self.GOOD + b' ' * 3000
+        for name, responder in self.shapes(body).items():
+            with self.subTest(framing=name):
+                self.assertCode('response_too_large', self.adapter(self.provider(responder), max_response_bytes=2000).complete, call())
+
+    def test_a_body_that_ends_early_is_still_an_error_with_a_length(self):
+        def short(handler, request_body):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Content-Length', '500')
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(b'{"choices":')
+        error = self.assertCode('bad_response', self.adapter(self.provider(short)).complete, call(TokenBudget(100_000)))
+        self.assertGreater(error.tokens_charged, 0)
+
+    def test_a_body_read_to_its_declared_length_wins_over_a_late_socket_error(self):
+        body = json.dumps(ok_payload()).encode()
+
+        class Response:
+            status = 200
+
+            def __init__(self, failure):
+                self.calls, self.failure = 0, failure
+
+            def getheader(self, name):
+                return {'Content-Type': 'application/json', 'Content-Length': str(len(body))}.get(name)
+
+            closes_after_the_body = False
+            chunked = False
+
+            def isclosed(self):
+                return self.closes_after_the_body and self.calls >= 1
+
+            def read1(self, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return body
+                raise self.failure
+
+        class Connection:
+            def arm(self):
+                pass
+        adapter = ApiAdapter('http://127.0.0.1:1/v1', 'm', None)
+        for failure in (OSError(errno.EBADF, 'Bad file descriptor'), TimeoutError(), ConnectionResetError()):
+            with self.subTest(failure=type(failure).__name__):
+                error, raw = adapter._read(Connection(), Response(failure), 50, adapter._parse, '/chat/completions')
+                self.assertIsNone(error)
+                self.assertEqual(raw.text, 'Hello from the model.')
+        done = Response(OSError(errno.EBADF, 'Bad file descriptor'))
+        done.closes_after_the_body = True
+        error, raw = adapter._read(Connection(), done, 50, adapter._parse, '/chat/completions')
+        self.assertIsNone(error)
+        self.assertEqual(done.calls, 1)  # a closed response is not read again
+
+        class Short(Response):
+            def read1(self, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return body[:10]
+                raise OSError(errno.EBADF, 'Bad file descriptor')
+        error, raw = adapter._read(Connection(), Short(OSError()), 50, adapter._parse, '/chat/completions')
+        self.assertEqual((error.code, error.tokens_charged, raw), ('endpoint_unreachable', 50, None))
+
+    def test_a_chunked_stream_that_stops_short_is_an_error_even_when_content_length_matches_what_arrived(self):
+        piece = json.dumps(ok_payload()).encode()
+
+        def head(handler, length):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.send_header('Content-Length', str(length))  # http.client ignores this for a chunked reply
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+
+        def reset(handler):
+            handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))  # close() sends a reset
+            handler.connection.close()
+
+        def no_terminator(end):
+            def responder(handler, request_body):
+                head(handler, len(piece))
+                handler.wfile.write(f'{len(piece):x}\r\n'.encode() + piece + b'\r\n')  # the whole body, and no 0-size last chunk
+                handler.wfile.flush()
+                end(handler)
+            return responder
+
+        def cut_chunk(end):
+            def responder(handler, request_body):
+                head(handler, 40)
+                handler.wfile.write(b'270f\r\n' + piece[:40])  # the chunk says 9999 bytes and 40 arrive
+                handler.wfile.flush()
+                end(handler)
+            return responder
+        cases = {'no terminator, FIN': (no_terminator(lambda handler: None), 'bad_response'), 'no terminator, reset': (no_terminator(reset), 'endpoint_unreachable'),
+                 'cut chunk, FIN': (cut_chunk(lambda handler: None), 'bad_response'), 'cut chunk, reset': (cut_chunk(reset), 'endpoint_unreachable')}
+        for name, (responder, code) in cases.items():
+            with self.subTest(case=name):
+                budget = TokenBudget(100_000)
+                request = call(budget)
+                error = self.assertCode(code, self.adapter(self.provider(responder)).complete, request)
+                self.assertEqual((error.tokens_charged, budget.spent), (request.hold_tokens, request.hold_tokens))
+
+    def test_a_fake_response_that_is_chunked_never_counts_as_whole_after_an_error(self):
+        body = json.dumps(ok_payload()).encode()
+
+        class Response:
+            status = 200
+            chunked = 1
+            calls = 0
+
+            def getheader(self, name):
+                return {'Content-Type': 'application/json', 'Content-Length': str(len(body))}.get(name)
+
+            def isclosed(self):
+                return False
+
+            def read1(self, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return body
+                raise OSError(errno.EBADF, 'Bad file descriptor')
+
+        class Connection:
+            def arm(self):
+                pass
+        adapter = ApiAdapter('http://127.0.0.1:1/v1', 'm', None)
+        error, raw = adapter._read(Connection(), Response(), 50, adapter._parse, '/chat/completions')
+        self.assertEqual((error.code, error.tokens_charged, raw), ('endpoint_unreachable', 50, None))
+
+    def test_arm_does_not_touch_a_closed_socket_and_still_stops_at_the_deadline(self):
+        connection = api_adapter._PinnedConnection('127.0.0.1', 1, ['127.0.0.1'], None, 1, 1, time.monotonic() + 5)
+        closed = socket.socket()
+        closed.close()
+        connection._live = closed
+        connection.arm()  # no error
+        connection._deadline = time.monotonic() - 1
+        with self.assertRaises(TimeoutError):
+            connection.arm()
+
+
+class ClosingReplyShapeTests(ReplyShapeTests):
+    """Every reply-shape test again, with `Connection: close` on every reply."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(globals(), {'send': closing_send})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class ClosingStatusTests(StatusTests):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(globals(), {'send': closing_send})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class ClosingChargeTests(ChargeTests):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(globals(), {'send': closing_send})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 if __name__ == '__main__':
