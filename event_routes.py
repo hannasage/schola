@@ -19,6 +19,7 @@ Who may write which event
 These routes are open to the page, so they take events with `source: "student"`
 only. Any other source, or none, is refused. An event with the source `app` or
 `agent` can come only through `event_log.EventLog.append` inside the server process.
+An `agent_offer` event is refused from the page with the code `type_forbidden`, even with the source `student`.
 A page also cannot fill the log: once the log is 80% full the page gets `log_reserved`. This keeps a web client
 from forging a `check_result` or any other event that the app alone writes.
 The contract does not tell a real student event from a made-up one, so a page
@@ -40,6 +41,8 @@ DELETE_ROUTES = ('/api/events',)
 REFLECTION_PREFIX = '/api/reflections/'
 # The one source the page may claim. The in-process API writes the others.
 _PAGE_SOURCE = 'student'
+# The one type the page may never write, whatever its source. Only the agent writes an `agent_offer`.
+_AGENT_TYPE = 'agent_offer'
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 5000
 _LOG_LOCK = threading.Lock()
@@ -128,6 +131,9 @@ def handle_post(server, events, path, payload, headers):
         if event.get('source') != _PAGE_SOURCE:
             raise EventLogError('The page can add events from the student only. The app and the agent write their own events.',
                                 'source_forbidden', 403, field='event.source')
+        if event.get('type') == _AGENT_TYPE:
+            raise EventLogError('The page cannot add an agent_offer event. The agent writes its own offers.',
+                                'type_forbidden', 403, field='event.type')
         return 201, events.append(event, from_page=True)
     if path == '/api/reflections':
         _only(payload, ('text',), '{text}')

@@ -146,7 +146,7 @@ def limits(max_offers=3, gap=0):
 def run(rules, events, **changes):
     """Evaluate with an easy default state. `rules` is a list of rule dicts."""
     state_changes = {key: changes.pop(key) for key in list(changes) if key in SessionState.__dataclass_fields__}
-    return evaluate(TutorPolicy.from_dict(policy_data(*rules)), events, state=state(**state_changes), limits=changes.pop('limits', limits()))
+    return evaluate(TutorPolicy.from_dict(policy_data(*rules)), events, state=state(**state_changes), limits=changes.pop('limits', limits()), **changes)
 
 
 def refused(test, code, function, *args, path=None, **kwargs):
@@ -1851,6 +1851,64 @@ class EpochTests(unittest.TestCase):
         log.check('passed', evidence='x')
         self.assertEqual(run([target], log.events).suppressed_by, ('no_match',))
 
+    def test_an_outcome_event_does_not_restart_the_count_again(self):
+        # The log is append-only: the outcome of an offer is a second event of the same pair. Only the first event restarts the count.
+        for outcome in ('accepted', 'dismissed', 'ignored'):
+            log = Log()
+            log.check('failed')
+            trigger = log.check('failed')
+            log.offer('help', trigger, outcome='pending')
+            log.offer('help', trigger, outcome=outcome)
+            target = rule('help', count=2)
+            self.assertEqual(run([target], log.events).suppressed_by, ('no_match',), outcome)
+            log.check('failed')
+            self.assertEqual(run([target], log.events).suppressed_by, ('no_match',), outcome)
+            log.check('failed')
+            self.assertEqual(run([target], log.events).action, 'offer_hint', outcome)
+
+    def test_a_failure_between_an_offer_and_its_outcome_still_counts(self):
+        log = Log()
+        log.check('failed')
+        trigger = log.check('failed')
+        log.offer('help', trigger, outcome='pending')
+        log.check('failed')
+        log.offer('help', trigger, outcome='ignored')
+        self.assertEqual(run([rule('help', count=2)], log.events).suppressed_by, ('no_match',))
+        log.check('failed')
+        decision = run([rule('help', count=2)], log.events)
+        self.assertEqual((decision.action, decision.trigger_event_id), ('offer_hint', log.events[-1]['eventId']))
+
+    def test_a_second_offer_for_a_new_trigger_restarts_the_count(self):
+        log = Log()
+        log.check('failed')
+        first = log.check('failed')
+        log.offer('help', first, outcome='pending')
+        second = log.check('failed')
+        log.offer('help', second, outcome='pending')
+        log.check('failed')
+        self.assertEqual(run([rule('help', count=2)], log.events).suppressed_by, ('no_match',))
+
+    def test_an_outcome_whose_first_event_left_the_window_restarts_the_count(self):
+        log = Log()
+        trigger = log.check('failed')
+        log.offer('help', trigger, outcome='pending')
+        for _ in range(pe.MAX_EVENTS_READ):
+            log.opened()
+        log.offer('help', trigger, outcome='accepted')
+        log.check('failed')
+        self.assertEqual(run([rule('help', count=2)], log.events).suppressed_by, ('no_match',))
+        log.check('failed')
+        self.assertEqual(run([rule('help', count=2)], log.events).action, 'offer_hint')
+
+    def test_the_same_pair_on_different_rules_is_two_pairs(self):
+        log = Log()
+        log.check('failed')
+        trigger = log.check('failed')
+        log.offer('other', trigger, outcome='pending')
+        log.offer('help', trigger, outcome='pending')
+        log.check('failed')
+        self.assertEqual(run([rule('help', count=2)], log.events).suppressed_by, ('no_match',))
+
     def test_a_none_rule_has_its_own_epoch_too(self):
         log = Log()
         log.check('failed')
@@ -1858,6 +1916,91 @@ class EpochTests(unittest.TestCase):
         log.check('passed')
         decision = run([rule('quiet', count=2, action={'type': 'none'}), rule('loud', event='task_opened')], log.events)
         self.assertEqual(decision.suppressed_by, ('no_match',))
+
+
+class ExcludedTriggerTests(unittest.TestCase):
+    """The caller can skip trigger events that failed before, so a failed trigger does not hide the rules after it."""
+
+    def setUp(self):
+        self.log = Log()
+        self.first = self.log.check('failed')
+        self.opened = None
+
+    def run_excluding(self, rules, excluded, **changes):
+        return run(rules, self.log.events, exclude_triggers=frozenset(excluded), **changes)
+
+    def test_the_default_excludes_nothing(self):
+        self.assertEqual(run([rule('a')], self.log.events).action, 'offer_hint')
+        self.assertEqual(run([rule('a')], self.log.events, exclude_triggers=frozenset()).action, 'offer_hint')
+
+    def test_an_excluded_trigger_is_skipped_with_its_own_code(self):
+        decision = self.run_excluding([rule('a')], [self.first['eventId']])
+        self.assertEqual(brief(decision), D('none', None, None, ('trigger_failed',), False))
+        self.assertIn('trigger_failed', pe.SUPPRESSION_CODES)
+
+    def test_the_next_rule_is_tried(self):
+        self.opened = self.log.opened()
+        rules = [rule('a'), rule('b', event='task_opened', action={'type': 'ask_recall'})]
+        decision = self.run_excluding(rules, [self.first['eventId']])
+        self.assertEqual((decision.action, decision.rule_id, decision.trigger_event_id), ('ask_recall', 'b', self.opened['eventId']))
+        self.assertEqual(run(rules, self.log.events).rule_id, 'a')
+
+    def test_a_trigger_that_is_not_excluded_still_wins(self):
+        second = self.log.check('failed')
+        decision = self.run_excluding([rule('a')], [self.first['eventId']])
+        self.assertEqual((decision.action, decision.trigger_event_id), ('offer_hint', second['eventId']))
+
+    def test_the_code_comes_after_already_offered(self):
+        log = Log()
+        trigger = log.check('failed')
+        log.offer('x', trigger)
+        failed = log.opened()
+        rules = [rule('a', where={'status': 'failed'}), rule('b', event='task_opened')]
+        decision = run(rules, log.events, exclude_triggers=frozenset([failed['eventId']]))
+        self.assertEqual(decision.suppressed_by, ('already_offered', 'trigger_failed'))
+        self.assertEqual(run(rules, log.events).rule_id, 'b')
+
+    def test_the_rate_limit_does_not_see_an_excluded_trigger(self):
+        decision = self.run_excluding([rule('a')], [self.first['eventId']], limits=limits(0))
+        self.assertEqual(decision.suppressed_by, ('trigger_failed',))
+        self.assertIsNone(decision.suppressed_rule_id)
+
+    def test_a_repeat_rule_skips_only_the_excluded_groups(self):
+        log = Log()
+        log.check('failed', evidence='x')
+        a = log.check('failed', evidence='x')
+        log.check('failed', evidence='y')
+        b = log.check('failed', evidence='y')
+        target = rule('a', count=2, repeat=True)
+        decision = run([target], log.events, exclude_triggers=frozenset([b['eventId']]))
+        self.assertEqual(decision.trigger_event_id, a['eventId'])
+        decision = run([target], log.events, exclude_triggers=frozenset([a['eventId'], b['eventId']]))
+        self.assertEqual(decision.suppressed_by, ('trigger_failed',))
+
+    def test_a_none_rule_ignores_the_exclusion(self):
+        decision = self.run_excluding([rule('quiet', action={'type': 'none'})], [self.first['eventId']])
+        self.assertEqual((decision.action, decision.rule_id), ('none', 'quiet'))
+
+    def test_a_muted_state_stays_muted(self):
+        self.assertEqual(self.run_excluding([rule('a')], [self.first['eventId']], muted=True).suppressed_by, ('muted',))
+
+    def test_the_argument_is_checked_before_anything_is_read(self):
+        for bad in (None, [], (), {'x'}, ['00000001-0000-4000-8000-000000000000'], 'x', frozenset(['x']), frozenset([5]), frozenset([None]),
+                    frozenset([UPPER_UUID]), frozenset([RiggedStr(TRIG)])):
+            refused(self, 'bad_exclusion', run, [rule('a')], self.log.events, exclude_triggers=bad)
+            refused(self, 'bad_exclusion', run, [rule('a')], self.log.events, exclude_triggers=bad, muted=True)
+
+    def test_a_subclass_of_frozenset_is_refused(self):
+        class Odd(frozenset):
+            pass
+
+        refused(self, 'bad_exclusion', run, [rule('a')], self.log.events, exclude_triggers=Odd())
+        self.assertIn('bad_exclusion', pe.EVALUATION_ERROR_CODES)
+
+    def test_the_set_is_not_changed(self):
+        excluded = frozenset([self.first['eventId']])
+        self.run_excluding([rule('a')], excluded)
+        self.assertEqual(excluded, frozenset([self.first['eventId']]))
 
 
 class PurityTests(unittest.TestCase):

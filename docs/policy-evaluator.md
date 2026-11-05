@@ -46,6 +46,7 @@ decision = evaluate(
     state=SessionState(muted=False, now=1000.0, offers_this_session=0, last_offer_at=None,
                        task_id='t1', session_id='...', module_id='m1'),
     limits=OfferLimits(max_offers_per_session=..., min_gap_seconds=...),   # both required
+    exclude_triggers=frozenset(),                        # optional: ids of trigger events that failed before (see "Excluded triggers")
 )
 decision.action          # 'none', 'offer_hint', 'ask_recall', or 'suggest_review'
 decision.level           # the highest hint level the agent is allowed to offer, for 'offer_hint' only
@@ -113,7 +114,8 @@ Every text value must be an exact Python `str`. A subclass of `str` is refused, 
 
 A rule counts events from its epoch only. The epoch starts after the latest of these:
 
-1. The last offer by this rule in the module. The rule needs new events for its next offer.
+1. The last new offer by this rule in the module. A new offer is the first `agent_offer` event of a pair of `policyId` and `triggerEventId`.
+   The rule needs new events for its next offer. A later event of the same pair is an outcome (`accepted`, `dismissed`, or `ignored`). It does not restart the count.
 2. For a `check_result` trigger, the last `passed` check in the same scope and the same module.
    A rule that counts `passed` checks is not restarted by them. The passed check itself is not counted.
 3. For scope `task`, the last `task_finished` event of the task in focus. A rule that counts `task_finished` events is not restarted by it.
@@ -123,6 +125,11 @@ Examples, with a rule that needs two failed checks:
 - fail, fail, pass: no offer. The pass restarts the count.
 - fail, pass, fail, fail: an offer, for the last failure.
 - fail, fail, offer, fail: no offer. Two more failures give the next offer.
+- fail, fail, offer, outcome, fail, fail: an offer. The outcome does not restart the count.
+- fail, fail, offer, fail, outcome, fail: an offer. Both failures came after the offer, and the outcome between them does not hide the first one.
+
+The first event of a pair can be older than the window. Then the first outcome event of that pair in the window counts as the first, and it restarts the count.
+This errs on the side of fewer offers.
 
 ### Actions
 
@@ -183,9 +190,19 @@ The reasons in `suppressed_by` come from a closed list:
 - `session_offer_cap`: the session already holds `max_offers_per_session` offers.
 - `min_gap`: the last offer is less than `min_gap_seconds` old.
 - `already_offered`: a rule matched, but its trigger event already has an `agent_offer` from some rule.
+- `trigger_failed`: a rule matched, but the caller listed its trigger event in `exclude_triggers`. The evaluator went on to the next rule.
 - `no_match`: no rule matched.
 
 When both limits stop an offer, the reasons come in this order: `session_offer_cap`, then `min_gap`.
+When no rule wins, `already_offered` comes before `trigger_failed`. A decision with neither reason has `no_match`.
+
+### Excluded triggers
+
+The caller can pass `exclude_triggers`, a frozenset of trigger event ids. The agent loop uses it for a trigger whose offer failed (a model error or a failed write).
+A rule whose newest fresh trigger event is in the set does not win. The evaluator records `trigger_failed` and tries the next rule.
+So a failed trigger does not hide the rules after it. A rule with `repeat` and more than one trigger event skips only the excluded ones.
+A `none` rule ignores the set, and a muted state ignores it too.
+The argument must be a frozenset (not a subclass) of lowercase UUIDs. Anything else gives `bad_exclusion`, before the evaluator reads any event.
 
 ### How the evaluator picks a rule
 
@@ -263,7 +280,7 @@ The path is JSON-pointer-like, such as `/rules/0/trigger/count`. It holds only f
 - Policy codes for the shape: `not_an_object`, `unknown_key`, `missing_key`, `wrong_type`.
 - Policy codes for the values: `bad_id`, `bad_value`, `out_of_range`, `too_many_rules`, `duplicate_rule_id`.
 - Policy codes for the meaning: `unknown_action`, `unknown_event`, `bad_condition`, `unsupported_version`.
-- Evaluation codes: `bad_policy`, `bad_events`, `bad_event`, `bad_state`, `bad_limits`, `bad_decision`.
+- Evaluation codes: `bad_policy`, `bad_events`, `bad_event`, `bad_state`, `bad_limits`, `bad_exclusion`, `bad_decision`.
 
 The code checks the state and the limits when it builds them. It checks them again at each call.
 So a value forced into a frozen object with `object.__setattr__` is still caught, except `muted`, which counts as muted.
@@ -274,12 +291,11 @@ So a value forced into a frozen object with `object.__setattr__` is still caught
 - It is a choice that "the same result" includes `evidence`. The rule is strict: two failures with different notes are two different results.
 - An attempt that left the window no longer unlocks the upper levels. A student with a long log sees lower levels than the ladder allows. That is the safe direction.
 - The ladder checks that an attempt exists for the task in focus. It does not check that the attempt is recent, and it does not check the module version.
-- A passed check restarts the count of a `check_result` rule, and a finished task restarts a task-scope rule. These are the only restarts. Other events never restart a count.
+- A passed check restarts the count of a `check_result` rule, and a finished task restarts a task-scope rule. A new offer by the rule restarts it too. These are the only restarts.
+  Other events never restart a count.
 - The policy has no way to say "at most one offer per rule", "only in a certain mode", or "only after a hint". These are not in the spec for this step.
 - The evaluator does not read the mode of the student (`coach`, `pair`, `show-me`).
 - The session cap counts offers found in the window. An offer older than the window is not found, so only the caller's counter remembers it.
-- An outcome event also counts as an offer by its rule for the epoch (see "Where the count starts"). So the outcome of an offer restarts the count of that rule
-  a second time. Events between the offer and its outcome no longer count toward that rule. This errs on the side of fewer offers.
 - Python cannot hide an object from code in the same process. A program in the same process is able to change a frozen policy.
   These limits stop mistakes and bad data. They do not stop a hostile program in the same process.
 - The tests ran on macOS only. Linux continuous integration is the final check. It has not run for this step.
@@ -294,13 +310,15 @@ So a value forced into a frozen object with `object.__setattr__` is still caught
 ## Tests
 
 `tests/test_policy_evaluator.py` uses no network, no disk, and no clock. It builds events that the real event validator accepts.
-The 197 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
+The 214 tests passed on Python 3.10, 3.12, 3.13, and 3.14, on macOS.
 
 - It checks the constants kept in code against the schema files. A drift fails a test.
 - It tests each policy fault and the closed objects.
 - It tests the three limits that the format must make impossible to state: done-marking, scripts, and permissions.
 - It tests every ladder level with and without an attempt. A random search looks for an offer above the ladder.
 - It tests mute, the caps, the gap, rule order, scope, count, repeat, the epoch, the window, and the repeat guard.
+- It tests that an outcome event does not restart the count. It also tests the case where the offer left the window, and the first outcome in the window restarts the count.
+- It tests `exclude_triggers`: the skip, the next rule, the reason code, repeat groups, the type checks, and the mute.
 - It tests every event type and every field that is read, with wrong types, wrong patterns, and strings that lie about equality.
 - It tests that inputs stay unchanged, also with inputs that raise on any change.
 - It tests that the module imports only a few standard modules and holds no changing global state.
