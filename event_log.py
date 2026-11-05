@@ -35,8 +35,10 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import time
+import uuid
 
 try:
     import fcntl
@@ -50,9 +52,17 @@ from local_store import StoreError
 EVENTS_DIRECTORY = '_events'
 LOG_FILE = 'events.jsonl'
 LOCK_FILE = '.events.lock'
+REFLECTIONS_DIRECTORY = 'reflections'
+REFLECTION_VERSION = 1
+# The longest reflection, in characters. It matches `charCount` in contracts/learning-event.v1.schema.json.
+MAX_REFLECTION_CHARS = 10000
+# The biggest reflection file. 10000 characters take at most 6 bytes each as JSON text, plus the fields around them.
+MAX_REFLECTION_BYTES = 64 * 1024
 LOCK_TIMEOUT_SECONDS = 2.0
 _LOCK_POLL_SECONDS = 0.005
 
+_REFLECTION_ID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.ASCII)
+_REFLECTION_FIELDS = {'version', 'reflectionId', 'charCount', 'text'}
 _REFUSALS = {'invalid': ('invalid_event', 422), 'unsupported_version': ('unsupported_version', 409), 'too_large': ('event_too_large', 413)}
 
 
@@ -117,11 +127,12 @@ def _scan(data, signature):
 
 
 class EventLog:
-    def __init__(self, data_dir, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    def __init__(self, data_dir, lock_timeout=None):
         self.data = Path(data_dir).absolute()
         self.folder = self.data / EVENTS_DIRECTORY
         self.path = self.folder / LOG_FILE
-        self.lock_timeout = lock_timeout
+        self.reflections = self.folder / REFLECTIONS_DIRECTORY
+        self.lock_timeout = LOCK_TIMEOUT_SECONDS if lock_timeout is None else lock_timeout
         self._state = None  # the last scan of the file, reused while the file is unchanged
 
     # ------------------------------------------------------------------
@@ -394,3 +405,120 @@ class EventLog:
                 raise EventLogError(f'The event log was removed, but Schola could not flush the folder to disk ({_errno_name(error)}).',
                                     'fsync_failed', details={'removed': True}) from error
         return {'deleted': True}
+
+    # ------------------------------------------------------------------
+    # Reflections
+    # ------------------------------------------------------------------
+
+    def _make_reflection_folder(self):
+        self._make_folder()
+        self._safe(self.reflections)
+        try:
+            os.mkdir(self.reflections, 0o700)
+        except FileExistsError:
+            return
+        except OSError as error:
+            raise EventLogError(f'Schola could not create the reflection folder ({_errno_name(error)}). Nothing was saved.',
+                                'write_failed', details={'partialLine': False, 'maybeWritten': False}) from error
+        try:
+            _fsync_dir(self.folder)
+        except OSError as error:
+            raise EventLogError(f'Schola could not flush the reflection folder to disk ({_errno_name(error)}). Nothing was saved.',
+                                'fsync_failed', details={'partialLine': False, 'maybeWritten': False}) from error
+
+    def save_reflection(self, text):
+        """Store one reflection in its own file. Returns `{reflectionId, charCount}`.
+
+        The text is 1 to 10000 characters. It goes to a temporary file, is flushed, and is renamed into place, so a
+        crash leaves no half-written reflection. The text is never part of an error message.
+        """
+        if not isinstance(text, str) or not 1 <= len(text) <= MAX_REFLECTION_CHARS:
+            raise EventLogError(f'A reflection is text of 1 to {MAX_REFLECTION_CHARS} characters. Nothing was saved.', 'invalid_reflection', 422, field='text')
+        identifier = str(uuid.uuid4())
+        record = {'version': REFLECTION_VERSION, 'reflectionId': identifier, 'charCount': len(text), 'text': text}
+        try:
+            data = (json.dumps(record, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+        except UnicodeError:
+            raise EventLogError('A reflection must be UTF-8 text. Nothing was saved.', 'invalid_reflection', 422, field='text') from None
+        self._make_reflection_folder()
+        self._write_once(self.reflections / f'.touchline-{identifier}.tmp', self.reflections / f'{identifier}.json', data)
+        return {'reflectionId': identifier, 'charCount': len(text)}
+
+    def _write_once(self, temp, final, data):
+        """Write a file with a temporary file, a flush, a rename, and a flush of its folder. A crash leaves the file whole or absent."""
+        descriptor, renamed = None, False
+        try:
+            try:
+                descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                written = os.write(descriptor, data)
+            except OSError as error:
+                raise EventLogError(f'Schola could not write the reflection ({_errno_name(error)}). Nothing was saved.',
+                                    'write_failed', details={'partialLine': False, 'maybeWritten': False}) from error
+            if written != len(data):
+                raise EventLogError('The write stopped early. Nothing was saved.', 'write_failed', details={'partialLine': False, 'maybeWritten': False})
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                raise EventLogError(f'Schola could not flush the reflection to disk ({_errno_name(error)}). Nothing was saved.',
+                                    'fsync_failed', details={'partialLine': False, 'maybeWritten': False}) from error
+            try:
+                os.close(descriptor)
+                descriptor = None
+                os.replace(temp, final)
+            except OSError as error:
+                raise EventLogError(f'Schola could not finish the reflection ({_errno_name(error)}). Nothing was saved.',
+                                    'write_failed', details={'partialLine': False, 'maybeWritten': False}) from error
+            renamed = True
+        finally:
+            # Cleanup must not hide the error that is on its way out. A temporary file left behind holds a whole copy and no id anyone can fetch.
+            if descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            if not renamed:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp)
+        try:
+            _fsync_dir(final.parent)
+        except OSError as error:
+            raise EventLogError(f'The reflection was saved, but Schola could not flush its folder to disk ({_errno_name(error)}). Read it back before you rely on it.',
+                                'fsync_failed', details={'partialLine': False, 'maybeWritten': True}) from error
+
+    def get_reflection(self, reflection_id):
+        """The stored reflection `{reflectionId, charCount, text}`. An id that is not a lowercase UUID is refused before any file is touched."""
+        if not isinstance(reflection_id, str) or _REFLECTION_ID.fullmatch(reflection_id) is None:
+            raise EventLogError('A reflection id is a lowercase UUID.', 'invalid_reflection_id', 400, field='reflectionId')
+        path = self._safe(self.reflections / f'{reflection_id}.json')
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        except (FileNotFoundError, NotADirectoryError):
+            raise EventLogError('There is no reflection with this id.', 'reflection_not_found', 404) from None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise EventLogError('Data paths cannot be symbolic links.', 'unsafe_path') from error
+            raise EventLogError(f'The reflection cannot be read ({_errno_name(error)}).', 'reflection_unreadable') from error
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_REFLECTION_BYTES:
+                raise EventLogError('The saved reflection is damaged. Schola left it as it is.', 'reflection_corrupt')
+            with os.fdopen(descriptor, 'rb') as handle:
+                descriptor = None  # the file object owns it now
+                data = handle.read(MAX_REFLECTION_BYTES + 1)
+        except OSError as error:
+            raise EventLogError(f'The reflection cannot be read ({_errno_name(error)}).', 'reflection_unreadable') from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        # Every message below leaves out the stored text on purpose.
+        damaged = EventLogError('The saved reflection is damaged. Schola left it as it is.', 'reflection_corrupt')
+        if len(data) > MAX_REFLECTION_BYTES:
+            raise damaged
+        try:
+            record = json.loads(data.decode('utf-8'))
+        except (ValueError, RecursionError):
+            raise damaged from None
+        if (not isinstance(record, dict) or set(record) != _REFLECTION_FIELDS or record['version'] != REFLECTION_VERSION
+                or type(record['version']) is not int or record['reflectionId'] != reflection_id or type(record['charCount']) is not int
+                or not isinstance(record['text'], str) or not 1 <= len(record['text']) <= MAX_REFLECTION_CHARS
+                or record['charCount'] != len(record['text'])):
+            raise damaged
+        return {'reflectionId': reflection_id, 'charCount': record['charCount'], 'text': record['text']}
