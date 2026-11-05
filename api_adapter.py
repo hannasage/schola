@@ -22,9 +22,12 @@ Endpoint rules
 
 Limits on every call
 --------------------
-* A connect timeout, a read timeout for each wait, and a total time for the whole call.
+* A connect timeout, a read timeout for each wait, and a total time for the whole call. One monotonic deadline covers the
+  name lookup, each connection try, the TLS handshake, the send, and the reply. The total must be at least the connect time.
 * The reply body is read in pieces and refused once it passes the cap (1 MB by default).
 * The reply must be one JSON object of the expected shape. Anything else is `bad_response`.
+* A 200 reply that cannot be used was billed: the error carries the usage of the body, or `max_output_tokens` when the
+  usage is unreadable. A timeout after the request was sent carries `max_output_tokens`. Other failures carry nothing.
 
 An error message is a fixed sentence. It never holds the key, the URL, the address, the operating system's
 error text, or any text from the provider. Errors are raised after the handler that caught the problem has
@@ -39,6 +42,7 @@ import re
 import socket
 import ssl
 import threading
+import time
 from urllib.parse import urlsplit
 
 import model_adapter as ma
@@ -143,6 +147,10 @@ def _embedded(address):
     return None
 
 
+# Ranges that are refused whatever the running Python says about them. Its tables differ between versions.
+_BLOCKED = tuple(ipaddress.ip_network(text) for text in ('192.88.99.0/24', '100.64.0.0/10', '198.18.0.0/15', 'fec0::/10', '2001:db8::/32', '64:ff9b:1::/48'))
+
+
 def address_allowed(address, loopback_host):
     """True when `address` is fit for the host kind: only loopback for a loopback host, only public otherwise."""
     if getattr(address, 'scope_id', None):
@@ -153,35 +161,53 @@ def address_allowed(address, loopback_host):
     if loopback_host:
         return address.is_loopback
     return address.is_global and not (address.is_private or address.is_loopback or address.is_link_local or address.is_multicast
-                                      or address.is_reserved or address.is_unspecified)
+                                      or address.is_reserved or address.is_unspecified or getattr(address, 'is_site_local', False)
+                                      or any(address in network for network in _BLOCKED))
+
+
+def _tls_ok(context):
+    """True when a TLS context checks certificates and host names and allows TLS 1.2 or later only."""
+    return (isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+            and context.minimum_version >= ssl.TLSVersion.TLSv1_2)
 
 
 class _PinnedConnection(http.client.HTTPConnection):
-    """A connection that goes to an address the adapter already checked, and keeps the host name for the Host header and TLS."""
+    """A connection that goes to an address the adapter already checked, and keeps the host name for the Host header and TLS.
 
-    def __init__(self, host, port, addresses, context, connect_timeout, read_timeout):
+    Every wait is cut by `deadline`, a `time.monotonic()` value: each connection try, and the TLS handshake.
+    """
+
+    def __init__(self, host, port, addresses, context, connect_timeout, read_timeout, deadline):
         super().__init__(host, port, timeout=connect_timeout)
-        self._addresses, self._context, self._read_timeout = addresses, context, read_timeout
+        self._addresses, self._context, self._read_timeout, self._deadline = addresses, context, read_timeout, deadline
+
+    def _remaining(self):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('the call ran out of time')
+        return min(self.timeout, remaining)
 
     def connect(self):
+        if self._context is not None and not _tls_ok(self._context):
+            raise ModelAdapterError('The TLS settings no longer check certificates and host names. Schola sent nothing.', 'unsafe_endpoint')
         last = None
         for address in self._addresses:
+            wait = self._remaining()
             try:
-                sock = socket.create_connection((address, self.port), self.timeout)
+                sock = socket.create_connection((address, self.port), wait)
             except OSError as error:
                 last = error
                 continue
             break
         else:
             raise last
+        self.sock = sock  # set at once, so the timer can close a socket that is still in the handshake
         if self._context is not None:
-            try:
-                sock = self._context.wrap_socket(sock, server_hostname=self.host)
-            except BaseException:
-                sock.close()
-                raise
+            # A failure here leaves the raw socket in `self.sock`, and `close()` of the connection closes it.
+            sock.settimeout(self._remaining())
+            sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            self.sock = sock
         sock.settimeout(self._read_timeout)
-        self.sock = sock
 
 
 def _first_fields(items):
@@ -228,6 +254,10 @@ def _media(header):
     return pieces[0].lower(), charset
 
 
+def _json_media(media):
+    return media == 'application/json' or (media.startswith('application/') and media.endswith('+json'))
+
+
 def _status_error(status):
     """The error for an HTTP status that is not 200, or None for 200."""
     if status == 200:
@@ -240,15 +270,22 @@ def _status_error(status):
         return ModelAdapterError('The provider says there were too many requests or the quota is used. Try again later.', 'rate_limited')
     if status in (408, 504):
         return ModelAdapterError(f'The provider timed out (HTTP {status}).', 'timeout')
+    if status in (501, 505):
+        return ModelAdapterError(f'The provider does not support this request (HTTP {status}).', 'bad_response')
     if 500 <= status < 600:
         return ModelAdapterError(f'The provider had a server error (HTTP {status}).', 'endpoint_unreachable')
+    if status == 402:
+        return ModelAdapterError('The provider asks for payment or says the quota is used up (HTTP 402). Check billing and the plan.', 'invalid_request')
+    if status in (400, 422):
+        return ModelAdapterError(f'The provider refused the request (HTTP {status}). Check the model name and the output limit field (max_tokens_field).',
+                                 'invalid_request')
     if 400 <= status < 500:
         return ModelAdapterError(f'The provider refused the request (HTTP {status}). Check the base URL and the model name.', 'invalid_request')
     return ModelAdapterError(f'The provider answered with an unexpected status (HTTP {status}).', 'bad_response')
 
 
-def _timeout():
-    return ModelAdapterError('The provider did not answer in time.', 'timeout')
+def _timeout(tokens_charged=0):
+    return ModelAdapterError('The provider did not answer in time.', 'timeout', tokens_charged=tokens_charged)
 
 
 def _too_large():
@@ -259,26 +296,55 @@ def _bad(message='The provider reply was not in the expected format.'):
     return ModelAdapterError(message, 'bad_response')
 
 
+def _billed(error, usage, unreadable):
+    """Set what the budget counts for a 200 reply that cannot be used: the usage it carries, else `unreadable`."""
+    error.tokens_charged = usage.total if usage is not None else unreadable
+    return error
+
+
+def _body_error(value, usage):
+    """The error for a 200 reply that holds an `error` object. A number in `code` or `status` goes through the status table."""
+    number = None
+    if isinstance(value, dict):
+        for key in ('code', 'status'):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.isdigit() and len(candidate) == 3:
+                candidate = int(candidate)
+            if isinstance(candidate, int) and 400 <= candidate <= 599:  # a bool is 0 or 1, so it never gets here
+                number = candidate
+                break
+    error = _status_error(number) if number is not None else None
+    return _billed(error or _bad('The provider reply holds an error.'), usage, 0)
+
+
+_RETRY_WORTHY_TLS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
+
+
 def _classify(error):
-    """Turn a network or protocol exception into a typed error with a fixed sentence. Nothing of `error` goes in the sentence."""
+    """Turn a network or protocol exception into a typed error with a fixed sentence, or None if it is not one we know.
+
+    Nothing of `error` goes in the sentence.
+    """
+    if isinstance(error, TimeoutError):
+        return _timeout()
     if isinstance(error, ssl.SSLCertVerificationError):
         return ModelAdapterError('The TLS certificate of the endpoint could not be verified.', 'endpoint_unreachable', retryable=False)
     if isinstance(error, ssl.SSLError):
-        return ModelAdapterError('Schola could not make a secure (TLS) connection to the endpoint.', 'endpoint_unreachable', retryable=False)
-    if isinstance(error, TimeoutError):
-        return _timeout()
+        return ModelAdapterError('Schola could not make a secure (TLS) connection to the endpoint.', 'endpoint_unreachable',
+                                 retryable=isinstance(error, _RETRY_WORTHY_TLS))
     if isinstance(error, OSError):
         return ModelAdapterError('Schola could not reach the endpoint.', 'endpoint_unreachable')
     if isinstance(error, (http.client.HTTPException, ValueError)):
         return _bad()
-    return _bad('The model adapter failed in an unexpected way.')
+    return None
 
 
 class ApiAdapter(ma.ModelAdapter):
     """Call an OpenAI-format chat endpoint.
 
     `max_tokens_field` is the name of the output limit in the request: `max_tokens` (the common one) or `max_completion_tokens`.
-    `ssl_context` must check certificates and host names. `resolver` replaces `socket.getaddrinfo`; tests use it.
+    `ssl_context` must check certificates and host names and allow TLS 1.2 or later only. `resolver` replaces
+    `socket.getaddrinfo`; tests use it. The total time must be at least the connect time.
     A loopback endpoint may run without a key (`api_key=None`).
     """
 
@@ -297,12 +363,16 @@ class ApiAdapter(ma.ModelAdapter):
             raise ma._invalid('max_tokens_field must be max_tokens or max_completion_tokens.')
         if not all(_number(value, 0, MAX_TIMEOUT) for value in (connect_timeout, read_timeout, total_timeout)):
             raise ma._invalid(f'Each timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}.')
+        if total_timeout < connect_timeout:
+            raise ma._invalid('The total time must be at least the connect time.')
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or not 1 <= max_response_bytes <= MAX_RESPONSE_BYTES_LIMIT:
             raise ma._invalid(f'max_response_bytes must be a whole number from 1 to {MAX_RESPONSE_BYTES_LIMIT}.')
         if ssl_context is None:
             ssl_context = ssl.create_default_context()
-        elif not isinstance(ssl_context, ssl.SSLContext) or ssl_context.verify_mode != ssl.CERT_REQUIRED or not ssl_context.check_hostname:
-            raise ma._invalid('The TLS context must check certificates and host names.')
+            if ssl_context.minimum_version < ssl.TLSVersion.TLSv1_2:
+                ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        elif not _tls_ok(ssl_context):
+            raise ma._invalid('The TLS context must check certificates and host names and allow TLS 1.2 or later only.')
         if resolver is not None and not callable(resolver):
             raise ma._invalid('The resolver must be a function.')
         super().__init__(allowed_paths=allowed_paths, secrets=() if api_key is None else (api_key,))
@@ -320,7 +390,10 @@ class ApiAdapter(ma.ModelAdapter):
     # ------------------------------------------------------------------
 
     def _lookup(self):
-        """Resolve the host with a time limit. A lookup that outlasts the connect timeout is abandoned on its own thread."""
+        """Resolve the host within the connect time. The lookup is the first step, and the connect time is never above the total.
+
+        A lookup that outlasts the connect time is abandoned on its own thread.
+        """
         outcome = {}
         host, port, resolver = self._endpoint.host, self._endpoint.port, self._resolver
 
@@ -337,7 +410,10 @@ class ApiAdapter(ma.ModelAdapter):
             raise _timeout()
         if 'found' not in outcome:
             raise ModelAdapterError('Schola could not find the endpoint host.', 'endpoint_unreachable')
-        return _first_fields(outcome['found'])  # None for an answer of the wrong shape; the caller treats it like an empty list
+        found = _first_fields(outcome['found'])
+        if found is None:
+            raise _bad('The name lookup gave an answer that Schola cannot read.')
+        return found
 
     def _addresses(self):
         """The addresses to connect to, checked. Every address the host resolves to must pass, or the call is refused."""
@@ -377,55 +453,73 @@ class ApiAdapter(ma.ModelAdapter):
         return raw
 
     def _exchange(self, request):
-        """Do the call. Return (error, reply). This never raises for a network or protocol problem."""
+        """Do the call. Return (error, reply). This never raises for a network or protocol problem.
+
+        One monotonic deadline covers the name lookup, each connection try, the TLS handshake, the send, and the reply.
+        A request that was sent and then timed out was probably billed, so that timeout charges `max_output_tokens`.
+        """
+        deadline = time.monotonic() + self._total_timeout
         expired = threading.Event()
         connection = timer = None
         error = raw = None
-        try:
-            addresses = self._addresses()
-            endpoint = self._endpoint
-            connection = _PinnedConnection(endpoint.host, endpoint.port, addresses, self._ssl_context if endpoint.scheme == 'https' else None,
-                                           self._connect_timeout, self._read_timeout)
+        sent = waited = False
+        max_output = request.max_output_tokens
 
-            def expire():
-                expired.set()
-                sock = connection.sock
-                if sock is not None:
+        def expire():
+            expired.set()
+            sock = connection.sock if connection is not None else None
+            if sock is not None:
+                for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
+                        action()
                     except OSError:
                         pass
 
+        try:
             timer = threading.Timer(self._total_timeout, expire)
             timer.daemon = True
             timer.start()
+            addresses = self._addresses()
+            endpoint = self._endpoint
+            connection = _PinnedConnection(endpoint.host, endpoint.port, addresses, self._ssl_context if endpoint.scheme == 'https' else None,
+                                           self._connect_timeout, self._read_timeout, deadline)
             connection.request('POST', endpoint.path + '/chat/completions', self._body(request), self._headers())
-            error, raw = self._read(connection.getresponse())
+            sent = True
+            error, raw = self._read(connection.getresponse(), max_output)
+        except MemoryError:
+            raise
         except ModelAdapterError as caught:
             error = caught
         except Exception as caught:
             error = _classify(caught)
+            if error is None:
+                error = self._unexpected(caught)
+            elif isinstance(caught, TimeoutError):
+                waited = True
         finally:
             if timer is not None:
                 timer.cancel()
             if connection is not None:
                 connection.close()
-        if expired.is_set():
-            return _timeout(), None
+        if error is None and raw is not None:
+            return None, raw  # a reply that was read in full is a reply, whatever the clock says
+        if expired.is_set() or waited:
+            return _timeout(max_output if sent else 0), None
         return error, raw
 
-    def _read(self, response):
+    def _read(self, response, max_output):
         failure = _status_error(response.status)
         if failure is not None:
-            return failure, None  # the body of an error reply is never read
+            return failure, None  # the body of an error reply is never read; nothing is charged
+        # From here the provider answered 200, so the call was billed. A reply that cannot be read is charged `max_output`.
         encoding = (response.getheader('Content-Encoding') or 'identity').strip().lower()
         media, charset = _media(response.getheader('Content-Type') or '')
-        if encoding != 'identity' or not (media == 'application/json' or media.endswith('+json')) or charset not in (None, 'utf-8'):
-            return _bad(), None
+        if encoding != 'identity' or not _json_media(media) or charset not in (None, 'utf-8'):
+            return _billed(_bad(), None, max_output), None
         declared = response.getheader('Content-Length')
         declared = int(declared) if declared is not None and declared.strip().isdigit() else None
         if declared is not None and declared > self._max_bytes:
-            return _too_large(), None
+            return _billed(_too_large(), None, max_output), None
         pieces, total = [], 0
         while True:
             piece = response.read(_CHUNK)
@@ -433,21 +527,39 @@ class ApiAdapter(ma.ModelAdapter):
                 break
             total += len(piece)
             if total > self._max_bytes:
-                return _too_large(), None
+                return _billed(_too_large(), None, max_output), None
             pieces.append(piece)
         if declared is not None and total != declared:
-            return _bad('The provider reply ended early.'), None
-        return self._parse(b''.join(pieces))
+            return _billed(_bad('The provider reply ended early.'), None, max_output), None
+        return self._parse(b''.join(pieces), max_output)
 
-    def _parse(self, body):
+    def _parse(self, body, max_output):
         try:
             document = json.loads(body.decode('utf-8'), parse_int=_parse_int, parse_constant=_reject_constant)
-            choice = document['choices'][0]
-            text = choice['message']['content']
-            finish = choice.get('finish_reason')
-            if not isinstance(text, str):
-                return _bad(), None
-            text.encode('utf-8')
-        except (ValueError, TypeError, KeyError, IndexError, RecursionError):
-            return _bad(), None
-        return None, RawCompletion(text, _usage(document), _STOP_REASONS.get(finish, 'other') if isinstance(finish, str) else 'other')
+        except (ValueError, RecursionError):
+            return _billed(_bad(), None, max_output), None
+        if not isinstance(document, dict):
+            return _billed(_bad(), None, max_output), None
+        usage = _usage(document)
+        if document.get('error') is not None:
+            return _body_error(document['error'], usage), None
+        choices = document.get('choices')
+        if not isinstance(choices, list):
+            return _billed(_bad(), usage, max_output), None
+        if not choices:
+            return _billed(_bad('The provider reply holds no choices.'), usage, max_output), None
+        choice = choices[0]
+        message = choice.get('message') if isinstance(choice, dict) else None
+        if not isinstance(message, dict):
+            return _billed(_bad(), usage, max_output), None
+        finish = choice.get('finish_reason')
+        text = message.get('content')
+        if text is None:
+            # No text. A refusal or a cut by the provider's filter is a reply that says so; so is a call to a tool.
+            if message.get('refusal') or finish == 'content_filter':
+                return None, RawCompletion('', usage, 'content_filter')
+            if message.get('tool_calls') or finish in ('tool_calls', 'function_call'):
+                return None, RawCompletion('', usage, 'other')
+        if not isinstance(text, str) or not ma._encodable(text):
+            return _billed(_bad(), usage, max_output), None
+        return None, RawCompletion(text, usage, _STOP_REASONS.get(finish, 'other') if isinstance(finish, str) else 'other')
