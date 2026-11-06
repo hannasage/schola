@@ -1,0 +1,175 @@
+/* The hub screen: Bench Instrument. Every rule is scoped to .hub so no other screen changes.
+   The fonts are vendored in assets/fonts and served by the local server. Nothing loads from outside. */
+@font-face{font-family:'Schola Hub Plex Sans';font-style:normal;font-weight:400;font-display:swap;src:url(/assets/fonts/ibm-plex-sans-latin-400-normal.woff2) format('woff2')}
+@font-face{font-family:'Schola Hub Plex Sans';font-style:normal;font-weight:500;font-display:swap;src:url(/assets/fonts/ibm-plex-sans-latin-500-normal.woff2) format('woff2')}
+@font-face{font-family:'Schola Hub Plex Sans';font-style:normal;font-weight:600;font-display:swap;src:url(/assets/fonts/ibm-plex-sans-latin-600-normal.woff2) format('woff2')}
+@font-face{font-family:'Schola Hub Plex Mono';font-style:normal;font-weight:400;font-display:swap;src:url(/assets/fonts/ibm-plex-mono-latin-400-normal.woff2) format('woff2')}
+@font-face{font-family:'Schola Hub Plex Mono';font-style:normal;font-weight:500;font-display:swap;src:url(/assets/fonts/ibm-plex-mono-latin-500-normal.woff2) format('woff2')}
+
+.hub{
+  --hub-raised:#1A1F25;--hub-soft:#B3BDC7;--hub-heat-none:#1F252C;--hub-heat-one:#6E5420;--hub-heat-many:#F0B23E;
+  --hub-mono:var(--ui-font-mono);
+  position:relative;box-sizing:border-box;min-width:0;max-width:100%;margin:16px 0 48px;
+  background:var(--ui-bg);color:var(--ui-text);border:1px solid var(--ui-border);border-radius:4px;
+  font-family:var(--ui-font-body);font-size:15px;line-height:1.5;
+}
+.hub *,.hub *::before,.hub *::after{box-sizing:border-box}
+.hub h1,.hub h2,.hub h3,.hub p,.hub ul,.hub ol,.hub dl,.hub dd{margin:0;padding:0}
+.hub h1,.hub h2,.hub h3{font-family:var(--ui-font-body);font-weight:600;color:var(--ui-text);letter-spacing:0;max-width:none;overflow-wrap:anywhere}
+.hub ul,.hub ol{list-style:none}
+.hub p{max-width:62ch}
+.hub [hidden]{display:none!important}
+.hub :focus-visible{outline:2px solid var(--ui-focus);outline-offset:2px;border-radius:2px}
+.hub-mono{font-family:var(--hub-mono)}
+.hub-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+/* top bar */
+.hub-top{display:flex;flex-wrap:wrap;align-items:center;gap:4px 20px;min-height:48px;padding:8px 16px;border-bottom:1px solid var(--ui-border);font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-top h1{font:500 .8125rem var(--hub-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--ui-text)}
+.hub-top .hub-updated{margin-left:auto;overflow-wrap:anywhere}
+
+/* shell: a rail and the main area */
+.hub-shell{display:grid;grid-template-columns:292px minmax(0,1fr);min-width:0}
+.hub-rail{order:0;border-right:1px solid var(--ui-border);padding:14px 16px;position:sticky;top:12px;align-self:start;max-height:calc(100vh - 24px);overflow:auto}
+.hub-main{order:1;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;align-content:start;padding:12px;min-width:0}
+.hub-notices{grid-column:1/-1;display:grid;gap:8px}
+.hub-s12{grid-column:span 12}.hub-s7{grid-column:span 7}.hub-s5{grid-column:span 5}
+.hub-panel{min-width:0}
+.hub-ph{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:46px;padding:6px 14px;border-bottom:1px solid var(--ui-border)}
+.hub-ph h2,.hub-rail-title{font:500 .8125rem var(--hub-mono);text-transform:uppercase;letter-spacing:.09em;color:var(--hub-soft)}
+.hub-rail-title{margin-bottom:8px}
+.hub-pb{padding:14px;min-width:0}
+.hub-note{margin-top:10px;font-size:.875rem;color:var(--ui-muted)}
+.hub-empty{padding:4px 0;color:var(--hub-soft)}
+
+/* continue card */
+.hub-focus-title{font-size:clamp(1.375rem,3vw,2rem);line-height:1.15}
+.hub-meta{display:flex;flex-wrap:wrap;gap:6px 28px;margin-top:12px;font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-meta div{display:flex;gap:8px;min-width:0}
+.hub-meta dd{color:var(--ui-text);overflow-wrap:anywhere}
+.hub-next{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px 28px;align-items:end;margin-top:18px;padding-top:16px;border-top:1px solid var(--ui-border)}
+.hub-next-label{font:400 .8125rem var(--hub-mono);color:var(--ui-muted);overflow-wrap:anywhere}
+.hub-next-text{margin-top:4px;font-size:1.0625rem;white-space:pre-line;overflow-wrap:anywhere;max-width:44rem}
+.hub-seg{display:flex;gap:3px;margin-top:12px;max-width:260px}
+.hub-seg i{flex:1;height:8px;background:var(--hub-raised);border:1px solid var(--ui-border)}
+.hub-seg i[data-state=done]{background:var(--ui-primary);border-color:var(--ui-primary)}
+.hub-seg i[data-state=skipped]{background:repeating-linear-gradient(135deg,var(--ui-muted) 0 2px,transparent 2px 4px);border-color:var(--ui-muted)}
+.hub-tutor{display:flex;flex-wrap:wrap;align-items:center;gap:2px 14px;border-top:1px solid var(--ui-border);padding:6px 8px 6px 14px;background:var(--hub-raised)}
+.hub-tutor-tag{font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-tutor-text{flex:1 1 20rem;font-size:.9375rem;overflow-wrap:anywhere}
+.hub-tutor-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+
+/* readouts */
+.hub-readout{display:flex;flex-wrap:wrap;gap:4px 28px;margin-bottom:14px;font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-readout b{font-weight:500;color:var(--ui-text);font-size:1.0625rem}
+.hub-legend{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:12px;font:400 .75rem var(--hub-mono);color:var(--ui-muted)}
+.hub-legend i{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-2px;border-radius:2px}
+
+/* heat grid (a real table) */
+.hub-heat{width:100%;max-width:620px;border-collapse:separate;border-spacing:3px;table-layout:fixed;font-family:var(--hub-mono)}
+.hub-heat caption{text-align:left}
+.hub-heat th{padding:0;font:400 .6875rem var(--hub-mono);color:var(--ui-muted);text-align:center;vertical-align:bottom}
+.hub-heat th[scope=row]{width:3.9rem;text-align:left;font-size:.75rem;color:var(--hub-soft);white-space:nowrap}
+.hub-heat th.hub-sum,.hub-heat td.hub-sum{width:2.5rem}
+.hub-heat td{height:24px;padding:0;text-align:center;font-size:.75rem;border-radius:2px}
+.hub-heat td.hub-sum{text-align:right;color:var(--ui-text);background:none;font-size:.8125rem}
+.hub-heat td[data-level=none]{background:var(--hub-heat-none);color:var(--ui-muted)}
+.hub-heat td[data-level=one]{background:var(--hub-heat-one);color:var(--ui-text)}
+.hub-heat td[data-level=many]{background:var(--hub-heat-many);color:var(--ui-primary-fg);font-weight:500}
+.hub-heat td[data-level=future]{background:transparent;border:1px dashed var(--ui-border)}
+.hub-swatch-none{background:var(--hub-heat-none)}.hub-swatch-one{background:var(--hub-heat-one)}.hub-swatch-many{background:var(--hub-heat-many)}
+.hub-swatch-future{border:1px dashed var(--ui-border)}
+
+/* checkpoint grid */
+.hub-cpn{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;margin-bottom:12px;font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-cpn b{font-size:1.75rem;font-weight:500;color:var(--ui-text)}
+.hub-cp{display:grid;grid-template-columns:repeat(auto-fill,minmax(20px,1fr));gap:4px}
+.hub-cp li{position:relative;height:26px;background:var(--hub-heat-none);border-radius:2px}
+.hub-cp li[data-state=done]{background:var(--ui-primary)}
+.hub-cp li[data-state=next]{background:transparent;border:1.5px solid var(--ui-primary)}
+.hub-swatch-done{background:var(--ui-primary)}.hub-swatch-next{border:1.5px solid var(--ui-primary)}.hub-swatch-ahead{background:var(--hub-heat-none)}
+
+/* skills */
+.hub-skills{margin-top:12px}
+.hub-skill{display:grid;grid-template-columns:minmax(0,1fr) auto 3.6rem 3rem;gap:4px 14px;align-items:center;padding:9px 0;border-bottom:1px solid var(--ui-border);font:400 .875rem var(--hub-mono)}
+.hub-skill:last-child{border-bottom:0}
+.hub-skill-name{color:var(--ui-text);overflow-wrap:anywhere}
+.hub-cells{display:flex;gap:3px}
+.hub-cells i{width:18px;height:10px;border-radius:1px;background:var(--hub-heat-none)}
+.hub-cells i[data-state=pass]{background:var(--ui-primary)}
+.hub-cells i[data-state=miss]{background:transparent;border:1px solid var(--ui-muted)}
+.hub-skill-frac{color:var(--hub-soft);text-align:right}
+.hub-skill-pct{color:var(--ui-text);text-align:right}
+.hub-how{margin:0;padding:0}
+.hub-how p,.hub-how li{font-size:.9375rem;color:var(--hub-soft)}
+.hub-how ul{display:grid;gap:6px;margin:8px 0}
+.hub-how li{padding-left:14px;position:relative}
+.hub-how li::before{content:'';position:absolute;left:0;top:.65em;width:6px;height:1px;background:var(--ui-muted)}
+
+/* checks table (Projection DataTable) */
+.hub-checks th{white-space:normal!important;line-height:1.3}
+.hub-checks td{vertical-align:top!important}
+.hub-check-title{overflow-wrap:anywhere}
+.hub-check-id,.hub-check-open{display:block;margin-top:2px;font:400 .75rem var(--hub-mono);color:var(--ui-muted);overflow-wrap:anywhere}
+.hub-check-open{color:var(--hub-soft)}
+.hub-num{font-family:var(--hub-mono)}
+.hub-pips{display:flex;gap:3px;margin-bottom:3px}
+.hub-pips i{width:8px;height:12px;border:1px solid var(--ui-muted);border-radius:1px}
+.hub-pips i[data-on]{background:var(--hub-soft);border-color:var(--hub-soft)}
+
+@media(max-width:560px){
+  .hub-checks th,.hub-checks td{padding:8px 6px!important}
+  .hub-checks th:nth-child(2){width:3.6rem!important}
+  .hub-checks th:nth-child(3){width:5.6rem!important}
+}
+
+/* library rail */
+.hub-lib li{display:grid;grid-template-columns:2.2ch minmax(0,1fr);gap:0 10px;min-height:52px;padding:8px 6px;margin:0 -6px;border-left:2px solid transparent;border-radius:3px}
+.hub-lib li[data-status=focus]{background:var(--hub-raised);border-left-color:var(--ui-primary)}
+.hub-lib-no{padding-top:2px;font:400 .8125rem var(--hub-mono);color:var(--ui-muted)}
+.hub-lib-title{font-size:.9375rem;line-height:1.3;overflow-wrap:anywhere}
+.hub-lib-state{display:block;margin-top:2px;font:400 .75rem var(--hub-mono);color:var(--ui-muted)}
+.hub-lib li[data-status=focus] .hub-lib-state{color:var(--ui-primary)}
+
+/* a refresh keeps the old numbers on screen, a little dimmer. The layout does not move. */
+.hub-refreshing .hub-shell{opacity:.6}
+
+/* loading and error */
+.hub-state{padding:16px;display:grid;gap:12px}
+.hub-state .hub-skel{display:grid;gap:10px}
+
+/* buttons and tabs keep a 44 px target */
+.hub .ui-button{min-height:44px}
+.hub button{min-height:44px}
+
+/* the rail folds into a section below the main area */
+@media(max-width:1180px){.hub-s7,.hub-s5{grid-column:span 12}}
+@media(max-width:960px){
+  .hub-shell{grid-template-columns:minmax(0,1fr)}
+  .hub-rail{position:static;max-height:none;overflow:visible;border-right:0;border-top:1px solid var(--ui-border);order:2}
+  .hub-main{order:1}
+}
+@media(max-width:560px){
+  .hub{margin:8px 0 32px}
+  .hub-top{padding:8px 12px}
+  .hub-next{grid-template-columns:minmax(0,1fr)}
+  .hub-next .ui-button{width:100%}
+  .hub-pb{padding:12px}
+  .hub-skill{grid-template-columns:minmax(0,1fr) 3.6rem}
+  .hub-skill .hub-cells{grid-column:1/2}
+  .hub-skill-frac{grid-column:2;grid-row:1}
+  .hub-skill-pct{grid-column:2;grid-row:2}
+  .hub-heat th[scope=row]{width:3.4rem;font-size:.6875rem}
+  .hub-heat th.hub-sum,.hub-heat td.hub-sum{width:2.1rem}
+  .hub-tutor-actions{width:100%}
+  .hub-tutor-actions .ui-button{flex:1 1 auto}
+}
+
+/* motion is for state changes only, and only when the person allows it */
+@media(prefers-reduced-motion:no-preference){
+  .hub-fade{animation:hub-fade 120ms ease-out}
+  @keyframes hub-fade{from{opacity:0}to{opacity:1}}
+}
+@media(prefers-reduced-motion:reduce){
+  .hub *,.hub *::before,.hub *::after{animation:none!important;transition:none!important}
+}

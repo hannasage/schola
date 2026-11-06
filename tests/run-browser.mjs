@@ -13,6 +13,7 @@ import {verifyLearningScreens,verifyRecoveredStartup,verifyStatusWriterConflict,
 import {verifyJournalImport} from './browser/journal-import.mjs';
 import {verifyLessonImport} from './browser/lessons.mjs';
 import {verifyShell,verifyStartupRecovery} from './browser/shell.mjs';
+import {verifyHub} from './browser/hub.mjs';
 
 const server = await createIsolatedServer();
 let browser;
@@ -56,6 +57,7 @@ try {
   await verifyStatusWriterConflict({page,server});
   await verifyEditsDuringStatusSave({page,server});
   await verifyJournalImport({page,server});
+  await verifyHub({browser});
   const blocked = await page.evaluate(async () => {
     try { await fetch('https://touchline-test-egress.invalid/probe'); return false; }
     catch { return true; }

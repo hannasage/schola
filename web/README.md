@@ -38,6 +38,16 @@ The connection screen is a React portal in the same shell.
 Account invalidation clears private records from the home, library, and lesson views before loading local learning.
 Journal, import, and appearance flows retain their existing owners.
 
+## The Hub view
+
+The Hub view is a React portal in `web/hub/`. It is the first item in the navigation, and it is the landing view: the shell starts on it and a reload returns to it.
+`web/services/hub.js` calls `GET /api/hub` and checks the answer. `web/hub/model.js` holds the pure parts. `web/hub/text.js` makes lesson text safe to show.
+The screen is dark only and uses its own Projection UI theme, so the appearance setting does not change it.
+Its fonts are local files in `assets/fonts/`. `docs/hub-screen.md` has the states, the limits, and where each number comes from.
+A crash while it draws is caught by `HubBoundary`, so the rest of the app keeps working.
+`TutorOffer` is built and tested alone. No route sends offers yet, so the screen does not mount it with data.
+Run `npm run test:hub` to run only the Hub browser checks.
+
 ## Journal and file review
 
 The journal keeps one unfinished experiment per curriculum. Hypotheses, results, and evidence links use the portable progress fields. Links in results open in a new tab. Switching to another experiment requires confirmation before replacing an unfinished draft.

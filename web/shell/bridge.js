@@ -1,8 +1,8 @@
-/** @typedef {'home' | 'library' | 'curriculum' | 'experiments' | 'guide' | 'sync'} WorkspaceView */
+/** @typedef {'hub' | 'home' | 'library' | 'curriculum' | 'experiments' | 'guide' | 'sync'} WorkspaceView */
 /** @typedef {{view:WorkspaceView,ready:boolean,navigating:boolean,progress:{done:number,total:number}|null}} ShellSnapshot */
 /** @typedef {{navigate:(view:WorkspaceView)=>Promise<boolean>,exportProgress:()=>void,restoreBackup:()=>void,reportError:(error:Error)=>void}} ShellCommands */
 export function createShellBridge() {
-  /** @type {ShellSnapshot} */ let snapshot = {view:'curriculum', ready:false, navigating:false, progress:null};
+  /** @type {ShellSnapshot} */ let snapshot = {view:'hub', ready:false, navigating:false, progress:null};
   /** @type {ShellCommands | undefined} */ let commands;
   /** @type {Set<()=>void>} */ const listeners = new Set();
   /** @param {Partial<ShellSnapshot>} next */

@@ -13,6 +13,10 @@ import lesson_routes
 from lesson_store import LessonStore
 
 ROOT = Path(__file__).resolve().parent
+# The hub screen fonts: a fixed list, so no other file under assets/fonts is ever served. The page blocks every outside address.
+HUB_FONT_ROUTES = {f"/assets/fonts/{name}.woff2": (f"assets/fonts/{name}.woff2", "font/woff2") for name in (
+    "ibm-plex-sans-latin-400-normal", "ibm-plex-sans-latin-500-normal", "ibm-plex-sans-latin-600-normal",
+    "ibm-plex-mono-latin-400-normal", "ibm-plex-mono-latin-500-normal")}
 import re
 import sys
 import traceback
@@ -298,6 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 return self.respond(200, self.store().get_record(match[1], self.scope()))
             files = {"/": ("index.html", "text/html; charset=utf-8"), "/auth/return": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css"), "/curriculum.json": ("curriculum.json", "application/json"), "/web.bundle.js": ("web.bundle.js", "text/javascript"), "/web.bundle.css": ("web.bundle.css", "text/css"), "/assets/appearance/syne-latin-variable.woff2": ("assets/appearance/syne-latin-variable.woff2", "font/woff2"), "/assets/appearance/ibm-plex-sans-latin-variable.woff2": ("assets/appearance/ibm-plex-sans-latin-variable.woff2", "font/woff2")}
+            files.update(HUB_FONT_ROUTES)
             if path not in files:
                 return self.not_found()
             name, kind = files[path]

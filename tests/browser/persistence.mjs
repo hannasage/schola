@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 
 async function saveNotes(page, notes) {
   const saved = page.waitForResponse(response =>
@@ -11,7 +12,7 @@ async function saveNotes(page, notes) {
 
 export async function verifyPersistence({page, server}) {
   await page.goto(server.url);
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   assert.deepEqual(await page.evaluate(async () => (await fetch('/api/cloud-config')).json()), {});
   const moduleId = await page.locator('.module.selected').getAttribute('data-module');
   const firstNotes = 'First course: a real saved note, with π and <angle>.';
@@ -21,7 +22,7 @@ export async function verifyPersistence({page, server}) {
   assert.equal(disk.state.modules[moduleId].notes,firstNotes);
   await server.restart();
   await page.reload();
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   assert.equal(await page.locator('#notes').inputValue(), firstNotes);
 
   const curriculum = await (await fetch(`${server.url}/curriculum.json`)).json();

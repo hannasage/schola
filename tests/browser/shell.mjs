@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 
 export async function verifyShell({page,server}) {
   await page.goto(server.url);
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   await page.route('**/api/records/*', route => route.request().method()==='PUT'
     ? route.fulfill({status:503,json:{error:'The save is unavailable.',code:'storage_unavailable',retryable:true}})
     : route.continue());
@@ -48,7 +49,7 @@ export async function verifyStartupRecovery({page,server}) {
     assert.deepEqual(writes,[],'Startup failure must not mutate learning records.');
     page.off('request',recordWrite);
     await fallback.getByRole('button',{name:'Reload'}).click();
-    await page.locator('#notes').waitFor();
+    await openCurriculum(page);
     assert.equal(await page.locator('#notes').inputValue(),'A navigation failure must retain this note.');
     assert.equal(await page.getByRole('heading',{name:'Schola could not start'}).count(),0);
   }

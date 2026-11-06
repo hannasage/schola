@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 import {readFile} from 'node:fs/promises';
 const hub=JSON.parse(await readFile(new URL('../fixtures/contracts/valid/hub-description.json',import.meta.url),'utf8'));
 const fixture=JSON.parse(await readFile(new URL('../fixtures/contracts/valid/legacy-backup.json',import.meta.url),'utf8'));
@@ -35,7 +36,7 @@ export async function verifyPublications({page,server}){
   }
   return route.abort('blockedbyclient');
  });
- await page.emulateMedia({colorScheme:'dark'});await page.goto(server.url);await page.locator('#notes').waitFor();
+ await page.emulateMedia({colorScheme:'dark'});await page.goto(server.url);await openCurriculum(page);
  // A clean working copy must still wait for its status write before publication capture.
  await page.locator('#curriculum-select').selectOption(local[0].recordId);await page.waitForFunction(()=>document.querySelector('#plan-title').textContent==='Soccer prediction');
  const id=local[0].recordId;let release,observed;const gate=new Promise(r=>release=r),pending=new Promise(r=>observed=r);

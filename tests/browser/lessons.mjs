@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 import {createHash} from 'node:crypto';
 import {readFile, readdir, stat} from 'node:fs/promises';
 import {join} from 'node:path';
@@ -43,7 +44,7 @@ export async function verifyLessonImport({page, server}) {
   const writesTo = path => writes.filter(entry => entry === path).length;
 
   await page.goto(server.url);
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   const curriculaBefore = await get(server, '/api/library');
   assert.equal(await treeHash(lessonsFolder), null, 'a new data folder holds no lessons');
 
@@ -79,7 +80,7 @@ export async function verifyLessonImport({page, server}) {
   const afterImport = await treeHash(lessonsFolder);
   await server.restart();
   await page.reload();
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   const listing = await get(server, '/api/lessons');
   assert.deepEqual(listing.modules.map(item => [item.id, item.pinnedVersion]), [['hello-module', '1.0.0']]);
   assert.equal(await treeHash(lessonsFolder), afterImport, 'a restart changes no lesson file');

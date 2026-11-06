@@ -4,12 +4,13 @@ import {createPortal} from 'react-dom';
 import {ThemeProvider, Button, Badge, Progress} from '@hannasage/projection-ui/core';
 import {ThemeSwitcher, useAppearance} from './appearance.jsx';
 import {HomeScreen,LibraryScreen} from './web/screens/LearningScreens.jsx';
+import {HubScreen} from './web/hub/HubScreen.jsx';
 import {shell} from './web/shell/bridge.js';
 import {ConnectionScreen} from './web/connection/screen.jsx';
 import '@hannasage/projection-ui/styles';
 
 /** @typedef {import('./web/shell/bridge.js').WorkspaceView} WorkspaceView */
-/** @typedef {{actions:HTMLElement,navigation:HTMLElement,resume:HTMLElement,progress:HTMLElement,connection:HTMLElement,home:HTMLElement,library:HTMLElement}} ShellSlots */
+/** @typedef {{actions:HTMLElement,navigation:HTMLElement,resume:HTMLElement,progress:HTMLElement,connection:HTMLElement,home:HTMLElement,library:HTMLElement,hub:HTMLElement}} ShellSlots */
 /** @param {ParentNode} root @param {string} selector @returns {HTMLElement} */
 function element(root, selector) {
   const result = root.querySelector(selector);
@@ -25,13 +26,13 @@ function HeaderActions({ready, appearance}) {
   </>;
 }
 /** @type {{id:WorkspaceView,label:string}[]} */
-const views = [{id:'home',label:'Overview'},{id:'library',label:'Your curricula'},{id:'curriculum',label:'Learning path'},{id:'experiments',label:'Experiment journal'},{id:'guide',label:'Your approach'},{id:'sync',label:'Devices'}];
+const views = [{id:'hub',label:'Hub'},{id:'home',label:'Overview'},{id:'library',label:'Your curricula'},{id:'curriculum',label:'Learning path'},{id:'experiments',label:'Experiment journal'},{id:'guide',label:'Your approach'},{id:'sync',label:'Devices'}];
 /** @param {{view:WorkspaceView,ready:boolean,navigating:boolean}} props */
 function Navigation({view,ready,navigating}) {
   return <>{views.map(item => <Button key={item.id} variant="ghost" size="sm"
     className={'tab' + (view===item.id?' active':'')} data-view={item.id} aria-pressed={view===item.id}
     style={{fontSize:14,padding:'15px 0',borderRadius:0,border:0,borderBottom:'2px solid '+(view===item.id?'var(--ui-text)':'transparent')}}
-    disabled={navigating || (!ready && !['sync','home','library'].includes(item.id))}
+    disabled={navigating || (!ready && !['sync','home','library','hub'].includes(item.id))}
     onClick={() => void shell.navigate(item.id)}>{item.label}</Button>)}</>;
 }
 async function resume() {
@@ -56,7 +57,7 @@ function WorkspaceShell({onMounted,appearance}) {
     if (!node || !(template instanceof HTMLTemplateElement)) throw Error('The local workspace template is unavailable.');
     const content=template.content.cloneNode(true);
     if (!(content instanceof DocumentFragment)) throw Error('The local workspace template could not load.');
-    const mounts={actions:element(content,'#header-actions-slot'),navigation:element(content,'#navigation-slot'),resume:element(content,'#resume-slot'),progress:element(content,'#progress-slot'),connection:element(content,'#connection-slot'),home:element(content,'#home-view'),library:element(content,'#library-view')};
+    const mounts={actions:element(content,'#header-actions-slot'),navigation:element(content,'#navigation-slot'),resume:element(content,'#resume-slot'),progress:element(content,'#progress-slot'),connection:element(content,'#connection-slot'),home:element(content,'#home-view'),library:element(content,'#library-view'),hub:element(content,'#hub-view')};
     node.append(content);
     setSlots(mounts);
     return ()=>node.replaceChildren();
@@ -66,6 +67,7 @@ function WorkspaceShell({onMounted,appearance}) {
     {createPortal(<ConnectionScreen/>,slots.connection)}
     {createPortal(<HomeScreen/>,slots.home)}
     {createPortal(<LibraryScreen/>,slots.library)}
+    {createPortal(<HubScreen/>,slots.hub)}
     {createPortal(<HeaderActions ready={state.ready} appearance={appearance}/>,slots.actions)}
     {createPortal(<Navigation view={state.view} ready={state.ready} navigating={state.navigating}/>,slots.navigation)}
     {createPortal(<Button variant="primary" size="lg" disabled={!state.ready||state.navigating} onClick={()=>void resume()}>Continue learning <span aria-hidden="true">↗</span></Button>,slots.resume)}
