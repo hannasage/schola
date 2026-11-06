@@ -148,6 +148,13 @@ class ShapeTests(unittest.TestCase):
         result = hub(now=datetime.datetime(2026, 11, 5, 23, 30, 0, tzinfo=zone))  # 04:30 UTC on the 6th
         self.assertEqual(result['generatedAt'], '2026-11-06T04:30:00Z')
 
+    def test_generated_at_is_utc_even_when_the_zone_changes_the_year_and_month(self):
+        zone = datetime.timezone(datetime.timedelta(hours=14))
+        result = hub(now=datetime.datetime(2027, 1, 1, 1, 5, 9, tzinfo=zone))  # 11:05:09 UTC on New Year's Eve
+        self.assertEqual(result['generatedAt'], '2026-12-31T11:05:09Z')
+        result = hub(now=datetime.datetime(2026, 3, 1, 0, 30, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=-9))))
+        self.assertEqual(result['generatedAt'], '2026-03-01T09:30:00Z')
+
     def test_the_offset_must_be_a_whole_number_in_range(self):
         for bad in (841, -841, 1000, 0.0, 1.5, '0', None, True, False):
             with self.assertRaises(ValueError, msg=repr(bad)):
