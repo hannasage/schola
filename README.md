@@ -27,6 +27,25 @@ python3 server.py --port 8766
 
 Then open http://127.0.0.1:8766 in your browser.
 
+## Command line tool
+
+Schola also has a command line tool. It uses the same engine as the hub.
+From this folder, run `./schola --help` to see the commands.
+
+```sh
+./schola hub                                   # start the hub
+./schola modules                               # list your modules
+./schola check show MODULE_ID CHECK_ID         # show what a check runs
+./schola check run MODULE_ID CHECK_ID --workspace PATH
+./schola events list                           # read your event log
+./schola events export --output log.jsonl      # copy your event log
+./schola events delete --confirm               # delete your event log for good
+```
+
+A script check asks for your consent before it runs. There is no flag that skips the question.
+The tool has no agent commands yet. It does not store an API key.
+Read [The command line tool](docs/cli.md) for every command, the exit codes, and the limits.
+
 ## Learning records
 
 The application saves notes, tasks, evidence, study hours, and experiment records automatically.
