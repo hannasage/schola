@@ -457,6 +457,16 @@ class SourceRuleTests(RouteCase):
         self.assertEqual((status, body['code']), (403, 'source_forbidden'))
         self.assertFalse((self.data / '_events').exists())
 
+    def test_an_agent_offer_is_403_even_with_the_source_student(self):
+        before = tree(self.data)
+        status, body = self.post_event(fixture_event('agent-offer-pending', source='student'))
+        self.assertEqual((status, body['code'], body['field']), (403, 'type_forbidden', 'event.type'))
+        self.assertEqual(tree(self.data), before)
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_the_other_student_types_are_still_accepted(self):
+        self.assertEqual(self.post_event(fixture_event())[0], 201)
+
     def test_source_app_is_refused_even_on_an_otherwise_valid_event_of_a_student_type(self):
         status, body = self.post_event(fixture_event(source='app'))
         self.assertEqual((status, body['code']), (403, 'source_forbidden'))

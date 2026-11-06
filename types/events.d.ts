@@ -80,7 +80,7 @@ interface EventReflection extends EventReflectionSaved {
 
 type EventErrorCode =
   | 'invalid_request' | 'invalid_json' | 'payload_too_large' | 'unsupported_media_type' | 'request_timeout'
-  | 'invalid_token' | 'forbidden_origin' | 'source_forbidden' | 'not_found' | 'storage_unavailable'
+  | 'invalid_token' | 'forbidden_origin' | 'source_forbidden' | 'type_forbidden' | 'not_found' | 'storage_unavailable'
   | 'invalid_event' | 'unsupported_version' | 'event_too_large' | 'duplicate_event_id' | 'log_full' | 'log_reserved'
   | 'lock_unavailable' | 'write_failed' | 'fsync_failed' | 'delete_failed'
   | 'log_missing' | 'log_unreadable' | 'log_corrupt' | 'unsafe_path' | 'confirmation_required'

@@ -173,6 +173,7 @@ A request body is at most 256 KB.
 The page adds events with `source: "student"` only.
 Any other source, or no source, gets `403 source_forbidden` and nothing is written.
 An event with the source `app` or `agent` comes only through `EventLog.append` inside the server process.
+An `agent_offer` event gets `403 type_forbidden` from the page, even with the source `student`. Only the agent writes offers.
 This keeps a page from forging a check result.
 The contract does not tell a real student event from a made-up one. A page can still send a student event of any type that the contract allows. A hint request is one example.
 

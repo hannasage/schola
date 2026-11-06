@@ -16,14 +16,15 @@ Limits that no policy and no model output can change
 4. The agent cannot widen its own permissions. The format is closed: a key or an action that is not listed is an error.
 5. Offers are rate limited. `OfferLimits` has two required numbers and no defaults. The values are an open decision for the owner.
    The caller owns the counters (`offers_this_session`, `last_offer_at`) and must update them after each offer.
-   The session cap also counts the `agent_offer` events of this session in the window, so a counter that is too low does not lift it.
+   The session cap also counts the offers of this session in the window (each policy and trigger pair once), so a counter that is too low does not lift it.
 6. The student can mute the agent at any time. A muted state gives no offer, whatever the policy says.
 
 Rules
 -----
 * Rules are checked in policy order. The first rule that matches and is not suppressed wins. One decision per call.
 * A rule skips a trigger event that already has an `agent_offer` from any rule. One trigger event gets one offer.
-* A rule counts events from its epoch only. The epoch starts after the latest of: the last offer by this rule, the last passed
+* A rule counts events from its epoch only. The epoch starts after the latest of: the last new offer by this rule (the first
+  `agent_offer` event of a policy and trigger pair, never a later outcome event of that pair), the last passed
   check (for a `check_result` trigger, in the same scope), and the last `task_finished` of the task (for scope `task`).
 * The evaluator reads the last `MAX_EVENTS_READ` events of the list. It checks the fields it reads and nothing else.
   A malformed event inside that window raises `EvaluationError` (fail closed).
@@ -75,7 +76,7 @@ _APP_ONLY_TYPES = ('attempt_submitted', 'check_result', 'task_finished', 'module
 _TASK_TYPES = ('attempt_submitted', 'check_result', 'hint_requested', 'task_opened', 'task_finished')
 _SOURCES = ('student', 'app', 'agent')
 
-SUPPRESSION_CODES = ('muted', 'session_offer_cap', 'min_gap', 'already_offered', 'no_match')
+SUPPRESSION_CODES = ('muted', 'session_offer_cap', 'min_gap', 'already_offered', 'trigger_failed', 'no_match')
 _RATE_CODES = ('session_offer_cap', 'min_gap')
 
 # Sanity limits of the format.
@@ -88,7 +89,7 @@ MAX_NUMBER = 10 ** 15
 
 POLICY_ERROR_CODES = ('not_an_object', 'unknown_key', 'missing_key', 'wrong_type', 'bad_id', 'bad_value', 'out_of_range', 'too_many_rules',
                       'duplicate_rule_id', 'unknown_action', 'unknown_event', 'bad_condition', 'unsupported_version')
-EVALUATION_ERROR_CODES = ('bad_policy', 'bad_events', 'bad_event', 'bad_state', 'bad_limits', 'bad_decision')
+EVALUATION_ERROR_CODES = ('bad_policy', 'bad_events', 'bad_event', 'bad_state', 'bad_limits', 'bad_exclusion', 'bad_decision')
 
 _FREE_LEVELS = tuple(level for level in HINT_LEVELS if level not in ATTEMPT_REQUIRED_LEVELS)
 if HINT_LEVELS[:len(_FREE_LEVELS)] != _FREE_LEVELS or not _FREE_LEVELS:
@@ -544,13 +545,14 @@ class Decision:
 
 class _Fact:
     """The few fields of one event that the evaluator reads."""
-    __slots__ = ('id', 'type', 'session', 'module', 'task', 'filters', 'key', 'offer')
+    __slots__ = ('id', 'type', 'session', 'module', 'task', 'filters', 'key', 'offer', 'first_offer')
 
     def __init__(self, event_id, type_, session, module, task):
         self.id, self.type, self.session, self.module, self.task = event_id, type_, session, module, task
         self.filters = {}
         self.key = None
         self.offer = None
+        self.first_offer = False  # true for the first `agent_offer` event of a (policy, trigger) pair in the window
 
 
 def _bad_event(position):
@@ -648,7 +650,8 @@ def _trigger_events(rule, facts, state):
         if fact.module != state.module_id:
             continue
         if fact.type == 'agent_offer':
-            if fact.offer[0] == rule.id:
+            # Only the first event of a pair restarts the count. A later event of the same pair is an outcome (the log is append-only).
+            if fact.offer[0] == rule.id and fact.first_offer:
                 total, newest, groups = 0, None, {}
             continue
         if (ends_on_pass and fact.type == 'check_result' and fact.filters['status'] == 'passed' and _in_scope(fact, trigger.scope, state)) or \
@@ -680,12 +683,14 @@ def _has_attempt(facts, state):
 # The decision
 # ----------------------------------------------------------------------
 
-def evaluate(policy, events, *, state, limits):
+def evaluate(policy, events, *, state, limits, exclude_triggers=frozenset()):
     """Decide whether the agent may make an offer. A pure function: the same inputs give the same decision.
 
     `policy` is a `TutorPolicy`. `events` is a list or tuple of already validated event dicts, oldest first. `state` is a `SessionState`.
     `limits` is an `OfferLimits`. Nothing passed in is changed. Raises `EvaluationError` for a wrong input or a malformed event in the window.
     The types of `policy`, `state`, and `limits` must be exactly the classes of this module.
+    `exclude_triggers` is a frozenset of event ids that the caller does not want offered again, for example because an offer for them failed.
+    A rule whose trigger event is in the set is skipped, the next rule is tried, and the reason `trigger_failed` is recorded.
     """
     if type(policy) is not TutorPolicy:
         raise EvaluationError('The policy must be a TutorPolicy.', 'bad_policy')
@@ -693,6 +698,8 @@ def evaluate(policy, events, *, state, limits):
         raise EvaluationError('The state must be a SessionState.', 'bad_state')
     if type(limits) is not OfferLimits:
         raise EvaluationError('The limits must be OfferLimits.', 'bad_limits')
+    if type(exclude_triggers) is not frozenset or not all(_is_shaped(item, _UUID, _UUID_CHARS) for item in exclude_triggers):
+        raise EvaluationError('The excluded triggers must be a frozenset of event ids.', 'bad_exclusion')
     if not isinstance(events, (list, tuple)):
         raise EvaluationError('The events must be a list or a tuple.', 'bad_events')
     truncated = len(events) > MAX_EVENTS_READ
@@ -705,16 +712,21 @@ def evaluate(policy, events, *, state, limits):
     first = len(events) - len(window)
     facts = [_read(event, first + index) for index, event in enumerate(window)]
     ids = set()
+    pairs = set()
     for index, fact in enumerate(facts):
         if fact.id in ids:
             raise _bad_event(first + index)
         ids.add(fact.id)
+        if fact.offer is not None:
+            fact.first_offer = fact.offer not in pairs
+            pairs.add(fact.offer)
     meta = {'events_read': len(facts), 'truncated': truncated}
     # One offer per trigger event, from any rule. The session count is the larger of the caller's counter and the offers in the window.
     offered_triggers = {fact.offer[1] for fact in facts if fact.offer is not None and fact.module == state.module_id}
-    session_offers = sum(1 for fact in facts if fact.offer is not None and fact.module == state.module_id and fact.session == state.session_id)
+    # An outcome (accepted, dismissed, ignored) is a new `agent_offer` event for the same policy and trigger, so count each pair once.
+    session_offers = len({fact.offer for fact in facts if fact.offer is not None and fact.module == state.module_id and fact.session == state.session_id})
 
-    skipped = False
+    skipped = failed = False
     winner = None
     trigger_id = None
     for rule in policy.rules:
@@ -728,10 +740,15 @@ def evaluate(policy, events, *, state, limits):
         if not fresh:
             skipped = True
             continue
-        winner, trigger_id = rule, max(fresh, key=lambda pair: pair[1])[0]
+        usable = [pair for pair in fresh if pair[0] not in exclude_triggers]
+        if not usable:
+            failed = True
+            continue
+        winner, trigger_id = rule, max(usable, key=lambda pair: pair[1])[0]
         break
     if winner is None:
-        return Decision('none', None, None, ('already_offered',) if skipped else ('no_match',), False, **meta)
+        codes = (('already_offered',) if skipped else ()) + (('trigger_failed',) if failed else ())
+        return Decision('none', None, None, codes or ('no_match',), False, **meta)
     if winner.action.type == 'none':
         return Decision('none', winner.id, None, (), False, **meta)
 
