@@ -80,10 +80,6 @@ GROUP_HELP = (
     ('events', 'Read, copy, or delete your event log.'),
 )
 
-# Codes that mean "refused" (exit 3). Every other failure is exit 1.
-REFUSED_CODES = frozenset({'invalid_workspace', 'consent_required', 'hash_mismatch', 'consent_declined', 'output_exists',
-                           'confirmation_required'})
-
 # The data fields that `events list` shows for each event type.
 KEY_FIELDS = (
     ('attempt_submitted', ('attemptId', 'artifactBytes')),
@@ -200,8 +196,8 @@ def show_value(value):
 
 
 def to_json(value):
-    """One JSON document. ASCII only, so a terminal cannot act on it. Keys are sorted, so the shape is stable."""
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2, allow_nan=False).replace('\x7f', '\\u007f')
+    """One JSON document. ASCII only (the encoder also escapes DEL), so a terminal cannot act on it. Keys are sorted, so the shape is stable."""
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2, allow_nan=False)
 
 
 def count_of(number, word):
@@ -252,14 +248,14 @@ def report(stream, failure):
 
 
 def convert(error):
-    """The CliError that stands for any exception. The text is always a fixed sentence."""
+    """The CliError that stands for any exception. The text is a fixed sentence. A refusal (exit 3) is raised as a CliError by the command itself."""
     if isinstance(error, CliError):
         return error
     if isinstance(error, StoreError):
         payload = error.payload()
         code = payload.get('code') if type(payload.get('code')) is str else 'failed'
         message = payload.get('error') if type(payload.get('error')) is str else 'The operation failed.'
-        return CliError(code, message, EXIT_REFUSED if code in REFUSED_CODES else EXIT_FAILED)
+        return CliError(code, message, EXIT_FAILED)
     if isinstance(error, OSError):
         return CliError('storage_unavailable', 'Schola cannot read or write the data folder.')
     return CliError('internal_error', 'Schola hit an unexpected problem and stopped. Check your files before you try again.')
@@ -367,6 +363,8 @@ def cmd_hub(args, ctx):
 
     try:
         server.run_server(args.port, ctx.data_dir, announce)
+    except BrokenPipeError:
+        raise  # the output closed; this is not a port problem
     except OSError:
         raise CliError('hub_unavailable', 'Schola cannot start the hub on that port. Use --port to choose another.') from None
     return EXIT_OK

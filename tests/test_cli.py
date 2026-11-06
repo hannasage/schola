@@ -46,7 +46,7 @@ PYTHON = shutil.which('python3')
 SOURCE = 'print("hello from a script")\n'
 OTHER_SOURCE = 'print("another script")\n'
 TOKEN_HEADER = 'X-Schola-Check-Token'
-ESCAPES = '\x1b[2J\x1b[H\x1b]8;;http://evil.example\x07click\x1b]8;;\x07\rovertype\x00\x7f\x9b31m‮evil​⁦x\U000e0041'
+ESCAPES = '\x1b[2J\x1b[H\x1b]8;;http://evil.example\x07click\x1b]8;;\x07\rovertype\x00\x7f\x9b31m\u202eevil\u200b\u2066x\U000e0041'
 
 Result = collections.namedtuple('Result', 'code out err')
 
@@ -187,7 +187,7 @@ class CliCase(unittest.TestCase):
 
 class SafeTextTests(unittest.TestCase):
     def test_plain_text_and_printable_unicode_are_unchanged(self):
-        for text in ('hello world', 'Zoé café', '日本語', 'goal \U0001f600', '', 'a-b_c.d/e'):
+        for text in ('hello world', 'Zoe\u0301 caf\u00e9', '\u65e5\u672c\u8a9e', 'goal \U0001f600', '', 'a-b_c.d/e'):
             self.assertEqual(schola_cli.safe_text(text), text)
 
     def test_an_escape_sequence_cannot_clear_the_screen_or_move_the_cursor(self):
@@ -216,14 +216,14 @@ class SafeTextTests(unittest.TestCase):
         self.assertEqual(schola_cli.safe_text('a\nb\tc'), 'a<U+000A>b<U+0009>c')
 
     def test_bidi_controls_are_escaped(self):
-        for char in ('‪', '‫', '‬', '‭', '‮', '⁦', '⁧', '⁨', '⁩', '‎', '‏', '؜'):
+        for char in ('\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069', '\u200e', '\u200f', '\u061c'):
             shown = schola_cli.safe_text('a' + char + 'b')
             self.assertNotIn(char, shown)
             self.assertIn('<U+%04X>' % ord(char), shown)
 
     def test_zero_width_and_invisible_characters_are_escaped(self):
-        for char in ('​', '‌', '‍', '⁠', '﻿', '­', '᠎', ' ', ' ', '͏', 'ㅤ', 'ﾠ',
-                     '⁣', '️', '\U000e0100'):
+        for char in ('\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u00ad', '\u180e', '\u2028', '\u2029', '\u034f', '\u3164', '\uffa0',
+                     '\u2063', '\ufe0f', '\U000e0100', '\u180b', '\u180c', '\u180d', '\u180f'):
             shown = schola_cli.safe_text('a' + char + 'b')
             self.assertNotIn(char, shown)
             self.assertIn('<U+%04X>' % ord(char), shown)
@@ -239,7 +239,7 @@ class SafeTextTests(unittest.TestCase):
         self.assertEqual(shown, 'a<U+D800>b<U+DFFF>c')
 
     def test_private_use_characters_are_escaped(self):
-        self.assertEqual(schola_cli.safe_text(''), '<U+E000>')
+        self.assertEqual(schola_cli.safe_text('\ue000'), '<U+E000>')
 
     def test_a_long_line_is_cut_and_says_how_much_is_missing(self):
         shown = schola_cli.safe_text('x' * 1000, 100)
@@ -315,12 +315,16 @@ class ScriptRowsTests(unittest.TestCase):
         self.assertEqual(rows[-1], '   2 | next')
 
     def test_hidden_characters_show_as_text_and_the_carriage_return_stays_visible(self):
-        rows = schola_cli.script_rows('print(1)\r\n\tx = "‮"\x1b[2J\n')
+        rows = schola_cli.script_rows('print(1)\r\n\tx = "\u202e"\x1b[2J\n')
         self.assertEqual(unsafe_characters('\n'.join(rows)), [])
         self.assertIn('<U+000D>', rows[0])
         self.assertIn('<U+0009>', rows[1])
         self.assertIn('<U+202E>', rows[1])
         self.assertIn('<U+001B>', rows[1])
+
+    def test_a_row_narrower_than_one_escape_still_loses_nothing(self):
+        rows = schola_cli.script_rows('\x00a\x01', width=3)
+        self.assertEqual(''.join(row[7:] for row in rows), '<U+0000>a<U+0001>')
 
     def test_an_escape_is_not_split_across_two_rows(self):
         rows = schola_cli.script_rows('\x00' * 30, width=20)
@@ -459,6 +463,20 @@ class ParserTests(CliCase):
         self.assertEqual(result.code, 2)
         self.assertSafe(result.err)
 
+    def test_an_unknown_argument_with_hostile_text_is_not_echoed_raw(self):
+        result = self.go('modules', ESCAPES)
+        self.assertEqual(result.code, 2)
+        self.assertSafe(result.err)
+        self.assertIn('<U+001B>', result.err)
+
+    def test_an_engine_error_with_hostile_text_is_printed_safely(self):
+        from local_store import StoreError
+        with mock.patch.object(LessonStore, 'list_modules', side_effect=StoreError(ESCAPES, 'bad' + ESCAPES, 500)):
+            result = self.go('modules')
+        self.assertEqual(result.code, 1)
+        self.assertSafe(result.err)
+        self.assertIn('<U+001B>', result.err)
+
     def test_a_flag_that_takes_no_value_refuses_one(self):
         self.assertEqual(self.go('events', 'delete', '--confirm=yes').code, 2)
 
@@ -509,6 +527,43 @@ class ShapeTests(unittest.TestCase):
     def test_results_are_frozen_dataclasses(self):
         self.assertTrue(schola_cli.Context.__dataclass_params__.frozen)
         self.assertTrue(schola_cli.Streams.__dataclass_params__.frozen)
+
+
+class OutputFaultTests(CliCase):
+    def test_an_output_that_closes_early_is_exit_one_and_not_a_traceback(self):
+        self.import_module()
+
+        class Closed(FakeOut):
+            def write(self, text):
+                raise BrokenPipeError()
+
+        result = self.go('modules', out=Closed())
+        self.assertEqual(result.code, 1)
+        self.assertNotIn('Traceback', result.err)
+
+    def test_control_c_during_a_command_is_exit_one(self):
+        with mock.patch.object(LessonStore, 'list_modules', side_effect=KeyboardInterrupt()):
+            result = self.go('modules')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Stopped', result.err)
+        self.assertNotIn('Traceback', result.err)
+
+
+class JsonShapeTests(CliCase):
+    def test_every_json_document_has_sorted_keys_at_every_level(self):
+        self.import_module()
+        EventLog(self.data).append(event())
+
+        def ordered(pairs):
+            keys = [key for key, _value in pairs]
+            self.assertEqual(keys, sorted(keys))
+            return dict(pairs)
+
+        for argv in (['modules', '--json'], ['module', 'show', 'hello-module', '--json'], ['check', 'show', 'hello-module', 'script-a', '--json'],
+                     ['check', 'run', 'hello-module', 'has-readme', '--workspace', str(self.work), '--json'], ['events', 'list', '--json'], ['version', '--json']):
+            result = self.go(*argv)
+            self.assertEqual(result.code, 0, (argv, result.err))
+            json.loads(result.out, object_pairs_hook=ordered)
 
 
 class NoReadTests(CliCase):
@@ -578,6 +633,12 @@ class HubTests(CliCase):
                 result = self.go('hub', '--open')
             self.assertEqual(result.code, 0)
             self.assertIn('Open the address yourself', result.out)
+
+    def test_a_closed_output_is_not_reported_as_a_port_problem(self):
+        with mock.patch.object(server, 'run_server', side_effect=BrokenPipeError()):
+            result = self.go('hub')
+        self.assertEqual(result.code, 1)
+        self.assertNotIn('hub_unavailable', result.err)
 
     def test_a_busy_port_is_a_failure_with_a_fixed_message(self):
         with socket.socket() as busy:
@@ -671,6 +732,22 @@ class ModulesTests(CliCase):
         self.assertEqual(document['versions'], ['1.0.0', '1.1.0'])
         self.assertIn('1.1.0 is newer', self.go('modules').out)
 
+    def test_an_unexpected_fault_is_exit_one_with_a_fixed_message_and_no_detail(self):
+        with mock.patch.object(LessonStore, 'list_modules', side_effect=RuntimeError('secret detail /private/path')):
+            result = self.go('modules')
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: internal_error', result.err)
+        self.assertNotIn('secret detail', result.err + result.out)
+        self.assertNotIn('Traceback', result.err)
+
+    def test_a_file_system_fault_is_exit_one_with_a_fixed_message_and_no_detail(self):
+        with mock.patch.object(LessonStore, 'list_modules', side_effect=PermissionError(13, 'Permission denied', '/secret/place')):
+            result = self.go('modules')
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: storage_unavailable', result.err)
+        self.assertNotIn('/secret/place', result.err + result.out)
+        self.assertNotIn('Permission denied', result.err)
+
     def test_a_damaged_store_is_a_failure_with_a_fixed_message(self):
         self.import_module()
         (self.data / '_lessons' / 'modules' / 'hello-module' / '1.0.0' / 'module.json').write_text('{"changed": true}')
@@ -683,10 +760,11 @@ class ModulesTests(CliCase):
         self.import_module()
         result = self.go('module', 'show', 'hello-module')
         self.assertEqual(result.code, 0, result.err)
-        for expected in ('Module: hello-module', 'Version: 1.0.0', 'Title: A minimal lesson module', 'task-1: State the fact in one sentence.',
-                         'has-readme: automated, file-exists, no consent needed', 'script-a: automated, script, needs consent',
-                         'self: self-reported, no runner, no consent needed'):
-            self.assertIn(expected, result.out)
+        lines = result.out.splitlines()
+        for expected in ('Module: hello-module', 'Version: 1.0.0', 'Title: A minimal lesson module', '  task-1: State the fact in one sentence.',
+                         '  has-readme: automated, file-exists, no consent needed', '  script-a: automated, script, needs consent',
+                         '  self: self-reported, no runner, no consent needed', 'Tasks (1):', 'Checks (7):'):
+            self.assertIn(expected, lines)
 
     def test_show_json_has_stable_keys(self):
         self.import_module()
@@ -703,8 +781,8 @@ class ModulesTests(CliCase):
     def test_show_takes_a_version(self):
         self.import_module()
         self.import_module(version='1.1.0')
-        self.assertIn('Version: 1.1.0', self.go('module', 'show', 'hello-module', '--version', '1.1.0').out)
-        self.assertIn('Version: 1.0.0', self.go('module', 'show', 'hello-module').out)
+        self.assertIn('Version: 1.1.0', self.go('module', 'show', 'hello-module', '--version', '1.1.0').out.splitlines())
+        self.assertIn('Version: 1.0.0', self.go('module', 'show', 'hello-module').out.splitlines())
 
     def test_an_unknown_module_or_version_is_not_found(self):
         self.import_module()
@@ -721,7 +799,9 @@ class ModulesTests(CliCase):
                     'tasks': [{'id': 'task-1' + text, 'prompt': text, 'hints': []}],
                     'checks': [{'id': 'check' + text, 'kind': 'automated' + text, 'description': text, 'runner': {'type': 'script' + text, 'path': text},
                                 'runtime': 'python3' + text, 'source': text + '\nprint(1)\n', 'args': [text]},
-                               {'id': 'plain', 'kind': 'automated', 'description': text, 'runner': {'type': 'file-exists', 'path': text}}]}
+                               {'id': 'plain', 'kind': 'automated', 'description': text, 'runner': {'type': 'file-exists', 'path': text, 'k' + text: text}},
+                               {'id': 'hostile-script', 'kind': 'automated', 'description': text, 'runner': {'type': 'script', 'name': text},
+                                'runtime': 'python3', 'source': text + '\nprint(1)\n', 'args': [text, 'two' + text]}]}
         raw = json.dumps(document).encode()
         folder = self.data / '_lessons' / 'modules' / 'evil-module' / '1.0.0'
         folder.mkdir(parents=True)
@@ -733,7 +813,7 @@ class ModulesTests(CliCase):
         document = self.hostile_module()
         hostile_check = document['checks'][0]['id']
         for argv in (['modules'], ['module', 'show', 'evil-module'], ['check', 'show', 'evil-module', hostile_check], ['check', 'show', 'evil-module', 'plain'],
-                     ['check', 'show', 'evil-module', hostile_check, '--workspace', str(self.work)]):
+                     ['check', 'show', 'evil-module', 'hostile-script'], ['check', 'show', 'evil-module', hostile_check, '--workspace', str(self.work)]):
             result = self.go(*argv)
             self.assertEqual(result.code, 0, (argv, result.err))
             self.assertSafe(result.out)
@@ -743,7 +823,8 @@ class ModulesTests(CliCase):
     def test_hostile_text_in_json_output_is_escaped_to_ascii(self):
         document = self.hostile_module()
         hostile_check = document['checks'][0]['id']
-        for argv in (['modules', '--json'], ['module', 'show', 'evil-module', '--json'], ['check', 'show', 'evil-module', hostile_check, '--json']):
+        for argv in (['modules', '--json'], ['module', 'show', 'evil-module', '--json'], ['check', 'show', 'evil-module', hostile_check, '--json'],
+                     ['check', 'show', 'evil-module', 'hostile-script', '--json']):
             result = self.go(*argv)
             self.assertEqual(result.code, 0, (argv, result.err))
             result.out.encode('ascii')
@@ -753,14 +834,23 @@ class ModulesTests(CliCase):
             if argv[0] == 'modules':
                 self.assertEqual(parsed['modules'][0]['title'], ESCAPES)  # the data is intact; only its form is safe
 
+    def test_a_hostile_script_check_is_escaped_in_the_consent_text_and_arguments(self):
+        self.hostile_module()
+        with self.refuse_processes():
+            result = self.go('check', 'run', 'evil-module', 'hostile-script', '--workspace', str(self.work), stdin=FakeIn('0' * 8 + '\n', tty=True))
+        self.assertEqual(result.code, 3)
+        self.assertSafe(result.out)
+        self.assertSafe(result.err)
+        self.assertIn('  1: <U+001B>[2J', result.out)
+
     def test_a_unicode_module_title_is_shown_as_it_is(self):
         document = module_document()
-        document['title'] = 'Fútbol 日本語'
+        document['title'] = 'F\u00fatbol \u65e5\u672c\u8a9e'
         self.lessons.import_files([('m.json', json.dumps(document))])
-        self.assertIn('Fútbol 日本語', self.go('modules').out)
+        self.assertIn('F\u00fatbol \u65e5\u672c\u8a9e', self.go('modules').out)
 
     def test_a_unicode_data_folder_path_works(self):
-        folder = self.base / 'dáta-日本'
+        folder = self.base / 'd\u00e1ta-\u65e5\u672c'
         folder.mkdir()
         LessonStore(folder).import_files([('m.json', json.dumps(module_document()))])
         result = self.go('modules', '--data-dir', str(folder), data=False)
@@ -795,6 +885,14 @@ class CheckShowTests(CliCase):
                 self.assertEqual(result.code, 0, result.err)
         self.assertEqual(tree(self.work), before)
 
+    def test_it_never_calls_the_runner(self):
+        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')) as runner:
+            for check_id in ('script-a', 'has-readme', 'self'):
+                for extra in ((), ('--json',), ('--workspace', str(self.work))):
+                    result = self.go('check', 'show', 'hello-module', check_id, *extra)
+                    self.assertEqual(result.code, 0, (check_id, extra, result.err))
+        runner.assert_not_called()
+
     def test_a_check_that_runs_no_script_needs_no_consent(self):
         result = self.go('check', 'show', 'hello-module', 'has-readme')
         self.assertIn('Needs consent: no', result.out)
@@ -807,6 +905,14 @@ class CheckShowTests(CliCase):
         self.assertIn('Kind: self-reported', result.out)
         self.assertIn('Runner: none', result.out)
         self.assertIn('Needs consent: no', result.out)
+
+    def test_a_workspace_name_with_hidden_characters_is_shown_escaped(self):
+        folder = self.home / 'wo\u202erk\u200b'
+        folder.mkdir()
+        result = self.go('check', 'show', 'hello-module', 'has-readme', '--workspace', str(folder))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertSafe(result.out)
+        self.assertIn('wo<U+202E>rk<U+200B>', result.out)
 
     def test_the_workspace_is_optional_for_show_and_is_not_invented(self):
         result = self.go('check', 'show', 'hello-module', 'script-a')
@@ -925,7 +1031,7 @@ class CheckRunTests(CliCase):
         self.assertIn('Status: passed', result.out)
 
     def test_a_unicode_workspace_path_works(self):
-        folder = self.home / 'proüeto-日本'
+        folder = self.home / 'pro\u00fceto-\u65e5\u672c'
         folder.mkdir()
         (folder / 'README.md').write_text('x')
         result = self.go('check', 'run', 'hello-module', 'has-readme', '--workspace', str(folder))
@@ -1058,7 +1164,7 @@ class CheckRunTests(CliCase):
         self.assertEqual(tree(self.data).keys() & {'consent.json'}, set())
 
     @unittest.skipUnless(PYTHON, 'python3 is not on the PATH')
-    def test_a_consent_is_for_one_workspace_only(self):
+    def test_the_script_runs_in_the_workspace_that_was_named(self):
         other = self.home / 'other'
         other.mkdir()
         digest = self.check_hash()
@@ -1093,6 +1199,30 @@ class CheckRunTests(CliCase):
             result = self.run_check('script-a', env=env)
         self.assertEqual(result.code, 3)
 
+    def test_the_process_environment_cannot_skip_consent_either(self):
+        digest = self.check_hash()
+        names = ('SCHOLA_CONSENT', 'SCHOLA_YES', 'YES', 'CI', 'SCHOLA_ASSUME_YES', 'SCHOLA_CONSENT_HASH', 'SCHOLA_CONSENT_ALL')
+        with mock.patch.dict(os.environ, {name: digest if 'CONSENT' in name else '1' for name in names}):
+            with self.refuse_processes():
+                result = self.run_check('script-a')
+        self.assertEqual(result.code, 3)
+
+    def test_the_consent_is_bound_to_the_real_workspace_path(self):
+        link = self.home / 'link'
+        link.symlink_to(self.work)
+        grants = []
+        original = check_consent.ConsentRegistry.grant
+
+        def spy(registry, *args):
+            grants.append(args)
+            return original(registry, *args)
+
+        with mock.patch.object(check_consent.ConsentRegistry, 'grant', spy), \
+                mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}) as runner:
+            self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), '--consent', self.check_hash())
+        self.assertEqual(grants[0][-1], str(self.work))
+        self.assertEqual(runner.call_args.args[1], str(self.work))
+
     def test_a_consent_value_for_a_check_that_runs_no_script_is_ignored_with_a_note(self):
         result = self.run_check('has-readme', '--consent', 'whatever')
         self.assertEqual(result.code, 0)
@@ -1109,6 +1239,9 @@ class CheckRunTests(CliCase):
         self.assertIn(digest, result.out)  # the full hash is shown, not the short one
         self.assertIn('   1 | print("hello from a script")', result.out)
         self.assertIn('first 8 characters', result.out)
+        self.assertIn('This is consent, not a sandbox.', result.out.split('Status: passed')[0])
+        self.assertIn(f'Workspace: {self.work}', result.out.splitlines())
+        self.assertIn('Check: script-a', result.out.splitlines())
         self.assertLess(result.out.index('1 | print'), result.out.index('Status: passed'))
 
     def test_on_a_terminal_a_wrong_answer_is_refused_and_nothing_starts(self):
@@ -1149,7 +1282,7 @@ class CheckRunTests(CliCase):
         self.assertEqual(result.code, 0)
 
     def test_hostile_script_text_is_escaped_in_the_consent_text(self):
-        source = 'print(1)\r\n# \x1b[2J\x1b]8;;http://evil.example\x07x\x1b]8;;\x07\n‮# hidden\n﻿print(2)\n'
+        source = 'print(1)\r\n# \x1b[2J\x1b]8;;http://evil.example\x07x\x1b]8;;\x07\n\u202e# hidden\n\ufeffprint(2)\n'
         self.import_module(version='1.2.0', source=source)
         digest = self.check_hash(version='1.2.0')
         with self.refuse_processes():
@@ -1395,6 +1528,17 @@ class EventsTests(CliCase):
                 if extra:
                     result.out.encode('ascii')
 
+    def test_a_damage_reason_from_outside_is_not_trusted(self):
+        report = {'ok': False, 'exists': True, 'total': 2, 'offset': 0, 'limit': 100, 'more': False, 'truncatedTail': False,
+                  'lines': [{'line': 1, 'ok': False, 'reason': ESCAPES}, {'line': 2, 'ok': False, 'reason': 'invalid'}], 'events': []}
+        with mock.patch.object(EventLog, 'read', return_value=report):
+            for extra in ((), ('--json',)):
+                result = self.go('events', 'list', *extra)
+                self.assertEqual(result.code, 1)
+                self.assertSafe(result.out)
+            self.assertIn('line 1 is damaged (unknown).', self.go('events', 'list').out)
+            self.assertEqual(json.loads(self.go('events', 'list', '--json').out)['damaged'], [{'line': 1, 'reason': 'unknown'}, {'line': 2, 'reason': 'invalid'}])
+
     def test_an_event_of_an_unknown_type_still_lists_with_its_first_fields(self):
         odd = {'ok': True, 'exists': True, 'total': 1, 'offset': 0, 'limit': 100, 'more': False, 'truncatedTail': False, 'lines': [{'line': 1, 'ok': True}],
                'events': [{'line': 1, 'event': {'eventId': 'e1', 'time': 't', 'type': 'new_type', 'taskId': None, 'source': 'app', 'moduleId': 'm',
@@ -1431,6 +1575,15 @@ class EventsTests(CliCase):
         out.flush()
         self.assertEqual(out.buffer.getvalue(), (self.data / '_events' / 'events.jsonl').read_bytes())
 
+    def test_export_of_a_damaged_log_to_standard_output_keeps_every_byte(self):
+        self.log().append(event())
+        self.damage(b'\xff\xfe not utf-8 \x00\n')
+        out = binary_out()
+        result = self.go('events', 'export', out=out)
+        self.assertEqual(result.code, 1)
+        out.flush()
+        self.assertEqual(out.buffer.getvalue(), (self.data / '_events' / 'events.jsonl').read_bytes())
+
     def test_export_to_a_text_stream_without_a_buffer_still_gives_the_lines(self):
         item = event()
         self.log().append(item)
@@ -1453,6 +1606,7 @@ class EventsTests(CliCase):
         self.assertEqual((result.code, result.err), (0, ''))
         self.assertEqual(target.read_bytes(), (self.data / '_events' / 'events.jsonl').read_bytes())
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(result.out, f'Wrote {len(target.read_bytes())} bytes to {target}.\n')
 
     def test_export_refuses_to_overwrite_an_existing_file(self):
         self.log().append(event())
@@ -1474,6 +1628,16 @@ class EventsTests(CliCase):
             self.assertEqual(result.code, 3, name)
         self.assertEqual(keep.read_text(), 'precious')
         self.assertFalse((self.base / 'nowhere').exists())
+
+    def test_a_write_that_fails_removes_the_file_it_created(self):
+        self.log().append(event())
+        target = self.base / 'export.jsonl'
+        with mock.patch('os.fsync', side_effect=OSError('disk full')):
+            result = self.go('events', 'export', '--output', str(target))
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: output_unwritable', result.err)
+        self.assertNotIn('disk full', result.err)
+        self.assertFalse(target.exists())
 
     def test_export_to_a_folder_that_does_not_exist_is_a_failure(self):
         self.log().append(event())
@@ -1501,9 +1665,17 @@ class EventsTests(CliCase):
     def test_an_empty_output_name_is_a_usage_error(self):
         self.assertEqual(self.go('events', 'export', '--output', '').code, 2)
 
+    def test_a_file_name_with_hidden_characters_is_shown_escaped(self):
+        self.log().append(event())
+        target = self.base / 'ex\u202eport.jsonl'
+        result = self.go('events', 'export', '--output', str(target))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertSafe(result.out)
+        self.assertIn('ex<U+202E>port.jsonl', result.out)
+
     def test_export_to_a_unicode_file_name_works(self):
         self.log().append(event())
-        target = self.base / 'exórt-日本.jsonl'
+        target = self.base / 'ex\u00f3rt-\u65e5\u672c.jsonl'
         self.assertEqual(self.go('events', 'export', '--output', str(target)).code, 0)
         self.assertTrue(target.exists())
 
@@ -1637,7 +1809,7 @@ class SharedFolderTests(CliCase):
         self.assertEqual(call('POST', '/api/events', {'event': again})[0], 201)
         self.assertEqual(json.loads(self.go('events', 'list', '--json').out)['total'], 1)
 
-    def test_the_hub_and_the_tool_write_different_files_and_never_the_same_lock_holder_at_once(self):
+    def test_exports_run_while_events_are_being_appended(self):
         log = EventLog(self.data)
         log.append(event())
         results = []
@@ -1708,7 +1880,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_a_terminal_that_cannot_show_unicode_gets_escapes_and_not_a_crash(self):
         document = module_document()
-        document['title'] = 'Fútbol 日本語'
+        document['title'] = 'F\u00fatbol \u65e5\u672c\u8a9e'
         LessonStore(self.data).import_files([('m.json', json.dumps(document))])
         done = self.launch('modules', '--data-dir', str(self.data), env={'LC_ALL': 'C', 'LANG': 'C', 'PYTHONIOENCODING': 'ascii'})
         self.assertEqual(done.returncode, 0, done.stderr)
