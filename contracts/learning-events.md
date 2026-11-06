@@ -174,8 +174,8 @@ The log holds raw facts. The hub derives measures from them and shows how it com
 
 - Skill estimates use simple counts or a moving average of recent results. They need no server.
 - Retries before the first pass and the hint level reached before a pass are shown without judgment.
-- Total time and active time are shown as a range, with the idle cap stated.
-- The hub does not show streaks or session counts. They push students to take part for its own sake.
+- Total time and active time, when the hub shows them, are shown as a range, with the idle cap stated. The first hub (`docs/hub-data.md`) shows no time figure.
+- The hub does not show streaks, rankings, or a single total-time number. They push students to take part for its own sake. It shows participation as plain counts: sessions and active days by week, with no goal and no comparison (`docs/hub-data.md`).
 - Each chart on the hub leads to one action the student can take.
 
 ## Log file format
