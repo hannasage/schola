@@ -30,21 +30,27 @@ It does not:
 - The log is the event log: `events.jsonl`, one event on each line.
 - A pinned module is a lesson module with a version that the student pinned. The lesson store holds the pins.
 - A counted event is an event with the source `student` or `app`. An event with the source `agent` is never counted.
-- The local day of an event is the calendar day of its `time` in the student's own time zone. The student's time zone is a number of minutes east of UTC. The page sends it as `tzOffsetMinutes`.
+- The local day of an event is the calendar day of its `time` in the student's own time zone. The page sends the time zone as `timeZone` (an IANA name) or as `tzOffsetMinutes` (a fixed number of minutes east of UTC).
 - A session is one `sessionId`. The log groups the events of one sitting under one id.
 - A session on a day is one `sessionId` seen on that local day. The same `sessionId` seen on two local days counts once on each day.
 - An active day is a local day with at least one counted event.
 - The window is the last 8 weeks, including the current week, up to today. Weeks start on Monday.
 - Today is the local day of the clock that the caller gives the code. The pure code never reads a clock.
 - The hint ladder is the ordered list `nudge`, `question`, `partial-example`, `full-answer`. A higher level reveals more.
+- A pass of a check is a result with the status `passed` or `self-reported`.
 - Untrusted text is text that a lesson creator wrote: module titles, task prompts, check descriptions. The code passes it through and never reads it as an instruction.
 
 ## The route
 
 ```text
+GET /api/hub?timeZone=America/New_York
 GET /api/hub?tzOffsetMinutes=N
 ```
 
+- `timeZone` is optional. It is an IANA zone name such as `America/New_York` or `Asia/Kolkata`. Each event gets the offset that the zone had at the moment of the event, so a clock change in the window is handled. See "The local day".
+  The name must match a strict pattern before it is looked up, so it can never name a path. A name that is not in the zone database gives `400`. The zone database is the one on the computer. A computer with no zone database and no `tzdata` package gives `400` for every name.
+  A plus sign in a URL means a space. Write `Etc/GMT+5` as `Etc/GMT%2B5`.
+- Send `timeZone` or `tzOffsetMinutes`, not both. Both together give `400`. With neither, the offset is 0 (UTC).
 - `tzOffsetMinutes` is optional. It is a whole number of minutes east of UTC, from -840 to 840. The default is 0.
   Write it as plain digits. Put a minus sign at the front for a west offset: `330`, `-480`, `0`. A plus sign, a space, zeros at the front, `-0`, a decimal, or any other text gives `400`.
   A plus sign in a URL means a space, so it cannot be used.
@@ -65,15 +71,20 @@ Every field is listed here. `types/hub.d.ts` has the same list as a type.
 - `generatedAt`: the time of the clock, in RFC 3339 UTC, whole seconds, such as `2026-11-05T12:00:00Z`.
 - `log`: what the log reader found.
   - `exists`: with no log yet, this is false.
-  - `ok`: a log with only valid events and a whole last line gives true. A damaged, cut, or unreadable log gives false.
+  - `ok`: a log with only valid events and a whole last line gives true. A damaged, cut, or unreadable log gives false. A skipped event does not change it.
+  - `fault`: a log that cannot be read at all gives the code of the log store here. The code is `log_corrupt`, `log_unreadable`, or `unsafe_path`. Otherwise `fault` is `null`.
   - `events`: the number of valid events in the log, from every source, including `agent` events.
   - `damagedLines`: the number of lines that are not valid events. A cut last line is not counted here.
   - `truncatedTail`: a cut last line makes this true.
+  - `skippedEvents`: the number of counted events that the hub left out because a field it reads was wrong.
+  - `futureEvents`: the number of student or app events dated after today. They count in nothing else.
+  - `unmatchedEvents`: the number of check results for a pinned module with a check id that the pinned version does not have. They count in nothing else.
 - `focus`: the module in focus, or `null`.
-  - `moduleId`, `version`, `title`: the pinned module. The title is untrusted text, cut to 200 characters.
+  - `moduleId`, `version`, `title`: the pinned module. The title is untrusted text, at most 200 characters.
   - `tasksTotal`: the number of tasks in the module.
-  - `tasksDone`: the number of distinct tasks of the module with a `task_finished` event.
-  - `nextTask`: `null`, or `{taskId, text}` for the first task in module order that has no `task_finished` event. `text` is the prompt of the task, untrusted text, cut to 5000 characters.
+  - `tasksDone`: the number of tasks of the module whose latest `task_finished` result is `passed`.
+  - `tasksSkipped`: the number of tasks of the module whose latest result is `abandoned` or `skipped`.
+  - `nextTask`: `null`, or `{taskId, text}` for the first task in module order that has no `task_finished` event of any result. `text` is the prompt of the task, untrusted text, at most 5000 characters.
 - `participation`: the sittings over time.
   - `windowWeeks`: 8.
   - `weeks`: 8 objects, oldest first. The last one holds today.
@@ -83,10 +94,12 @@ Every field is listed here. `types/hub.d.ts` has the same list as a type.
     - `activeDays`: the number of days with at least one session.
   - `totals`: `sessions` and `activeDays` summed over the weeks, and `days`, the number of days from the start of the window up to and including today.
 - `checkpoints`: `done`, the number of pinned modules with a `module_completed` event, and `total`, the number of pinned modules.
-- `skills`: a list sorted by `skillId`. Each item has `skillId`, `passed`, `tried`, and `window` (always 5).
-- `checks`: up to 20 items, the most recently active first. Each has `moduleId`, `checkId`, `title`, `retriesBeforeFirstPass`, `open`, and `hintLevelReached`.
-  - `title`: the description of the check from the module, cut to 200 characters. A check in a lesson module has a description and no title. The hub uses the description. Untrusted text.
-- `library`: every pinned module, in the order the lesson store lists them. Each has `moduleId`, `version`, `title` (cut to 200 characters), `status`, `tasksTotal`, and `tasksDone`.
+- `skills`: at most 100 items, sorted by `skillId`. Each has `skillId`, `passed`, `tried`, and `window` (always 5).
+- `skillsTotal`: the number of skills with a result. A cut list is shorter than this number.
+- `checks`: at most 20 items, newest first. Each has `moduleId`, `checkId`, `title`, `retriesBeforeFirstPass`, `open`, and `hintLevelReached`.
+  - `title`: the description of the check from the module, at most 2000 characters. A check in a lesson module has a description and no title. The hub uses the description. Untrusted text.
+- `checksTotal`: the number of checks with a result. A cut list is shorter than this number.
+- `library`: every pinned module, in the order the lesson store lists them. Each has `moduleId`, `version`, `title` (at most 200 characters), `status`, `tasksTotal`, `tasksDone`, and `tasksSkipped`.
   - `status` is `done` (the module has a `module_completed` event), `focus` (it is the module in focus), or `next`.
 
 ## How each number is made
@@ -94,14 +107,17 @@ Every field is listed here. `types/hub.d.ts` has the same list as a type.
 ### Which events count
 
 Only events with the source `student` or `app` count. Every number below leaves out `agent` events.
-An event whose local day is after today counts in nothing. The clock of the writer was wrong, so the hub ignores such an event.
+An event whose local day is after today counts in nothing. The clock of the writer was wrong, so the hub ignores such an event. `log.futureEvents` says how many there were.
+A counted event with a wrong field is skipped alone. See "A damaged log".
 An event from before the window still counts for the focus, the checkpoints, the skills, and the checks. It only stays out of `participation`.
 
 ### The local day
 
-The code reads the `time` of the event with its own offset. The offset is `Z` or `+hh:mm`. It turns the time into minutes since 1970 in UTC. Then it adds `tzOffsetMinutes` and takes the whole day.
-It uses whole-number arithmetic, so the first and last days of the calendar cannot overflow.
-The code does not model daylight saving time. The page sends one offset for the whole request. Days on the other side of a clock change are off by up to one hour. An event near midnight can land on the next or the previous day.
+The code reads the `time` of the event with its own offset. The offset is `Z` or `+hh:mm`. It turns the time into minutes since 1970 in UTC.
+With `timeZone`, the code asks the zone for the local date of that moment. The zone knows its own clock changes, so an event before and an event after a change both land on the right day.
+With `tzOffsetMinutes`, the code adds the one fixed offset to every event. This is right for a zone with no clock change. Where the clock changes inside the window, the events on one side of the change land on the wrong day. The error is the size of the change, one hour in most zones.
+An instant outside the years 1 to 9999 cannot be placed in a zone. The code uses its UTC day. Such an event is far from the window, so no number changes.
+A zone is as old as the zone database on the computer. The hub does not model a rule that the database lacks.
 
 ### Participation
 
@@ -116,9 +132,10 @@ Events out of time order are fine. Each event goes to its own day.
 ### Skills
 
 A skill is a label on a `check_result` event (`skills`). The code takes the results of a skill in log order and keeps the latest 5.
-Only the status `passed` counts as passed. The statuses `failed`, `error`, and `self-reported` count as tried and not passed.
-The status `skipped` is ignored: it is not tried and it does not take a place in the window of 5.
+Only the status `passed` counts as passed. The statuses `failed` and `error` count as tried and not passed.
+The statuses `skipped` and `self-reported` are not skill evidence. Such a result is not tried, and it does not take a place in the window of 5.
 `tried` is the number of results in the window and `passed` is how many of them passed.
+The list keeps the 100 skills with the most recent result in the log. `skillsTotal` counts all of them.
 The log carries `skills: []` today, so the list is usually empty. This is correct. A later schema version lets a module tag its checks with skills. The code never makes up a skill.
 Skills do not depend on the pins. A skill from a module that is no longer pinned still counts.
 
@@ -126,12 +143,14 @@ Skills do not depend on the pins. A skill from a module that is no longer pinned
 
 The code looks at the checks of the pinned modules. A check with at least one counted `check_result` event shows.
 
-- `retriesBeforeFirstPass` is the number of results that are not `passed`, before the first `passed` result. A `skipped` or `self-reported` result is not `passed`, so it counts here.
-- If no result is `passed` yet, `open` is true. The count is then the number of non-passed results so far.
-- `hintLevelReached` is the highest ladder level among the counted `hint_requested` events for the same module and the same task. If there is none, it is `null`. A check can have results for more than one task. The code then takes the highest level of any of those tasks. The hint does not have to come before the first pass.
-- The list keeps the 20 checks whose latest result is newest in the log, newest first.
-
-A student can only report some checks by hand. Their status is `self-reported`. The app does not give them a `passed` result, so they stay open here. See "What this does not prove".
+- A `passed` result is a pass. A `self-reported` result is also a pass for the check, because the student can only report some checks by hand.
+- `retriesBeforeFirstPass` is the number of `failed` and `error` results before the first pass. Results after the first pass do not count.
+- A `skipped` result is neither a retry nor a pass. It does not make the check recent. A check with only `skipped` results does not show.
+- If the check has no pass yet, `open` is true. The count is then the number of retries so far.
+- `hintLevelReached` is the highest ladder level among the counted `hint_requested` events on the task of the check, before the first pass of that check. If the check has no pass yet, every hint so far counts. If there is no hint, it is `null`.
+  A hint names a task and not a check. Two checks on one task share the hints that came before the pass of each. A check run for more than one task takes the highest level of those tasks.
+- The list shows at most 20 checks. If there are more, it keeps the open checks first and then the most recent ones. It lists them newest first. `checksTotal` counts all of them.
+- A check result for a pinned module with a check id that the pinned version lacks is not shown. `log.unmatchedEvents` counts such results. A pin that moves to a version with a renamed check causes this.
 
 ### Focus
 
@@ -140,6 +159,10 @@ Among those, it is the one with the latest counted event in the log. "Latest" me
 If no open module has an event, the focus is the first open module in the list of the lesson store. With no events at all, that is the first pinned module.
 If every pinned module is complete, or nothing is pinned, `focus` is `null`.
 
+The task counts come from `task_finished` events. Its `result` is `passed`, `abandoned`, or `skipped`. The latest result of a task wins.
+`tasksDone` counts tasks with `passed`. `tasksSkipped` counts tasks with `abandoned` or `skipped`. A result for a task that the pinned version lacks counts nowhere.
+`nextTask` moves past a task with any result, so a student is not sent back to a task they gave up.
+
 ### Library
 
 The library lists every pinned module in the order of the lesson store, with its status and its task counts. Modules that are stored but not pinned do not show. Events for modules that are not pinned do not change the focus, the library, the checkpoints, or the checks.
@@ -147,15 +170,20 @@ They still count as activity in `participation`.
 
 ### Events are tied to the module id, not the version
 
-An event names a module version, but the hub counts by module id and the pinned task list. When the student moves a pin to a new version, the events from the old version still count for that module. A task id that the new version does not have is ignored by `tasksDone`.
+An event names a module version, but the hub counts by module id and the pinned task list. When the student moves a pin to a new version, the events from the old version still count for that module. A task id that the new version lacks is ignored by the task counts. A check id that it lacks is counted in `log.unmatchedEvents`.
 
 ## A damaged log
 
-A damaged log is a finding. It is not an error.
+A damaged log is a finding. It is not an error. Every case below sends a line to stderr, so a fault is not silent.
 
-- If some lines are not valid events, or the last line is cut, `log.ok` is false. The numbers come from the valid events only. `damagedLines` and `truncatedTail` say how much was left out.
-- Suppose the log is over its limits, is not a regular file, or has a folder that is not private. Then `log.ok` is false and the events are 0. The answer still has `focus`, `library`, and `checkpoints.total` from the lesson store.
-- A valid log never holds an event with missing or wrong fields. If one appears, the code trusts no event rollup. It sets `log.ok` to false. It returns `participation`, `skills`, and `checks` with no events. It returns `checkpoints.done` as 0.
+- A log with a damaged line or a cut last line has `log.ok` false. The numbers come from the valid events only. `damagedLines` and `truncatedTail` say how much was left out.
+- A log over its limits, or a log file that is not a regular file, gives the code `log_corrupt`.
+- A file that fails to open or to read gives the code `log_unreadable`.
+- A log file or a folder on its path that is a symbolic link gives the code `unsafe_path`.
+  In each of these three cases, `log.ok` is false, `log.fault` holds the code, and the events are 0. The answer still has `focus`, `library`, and `checkpoints.total` from the lesson store.
+  The hub writes the error class and the code to stderr. It does not write a path.
+- A valid log never holds an event with missing or wrong fields. If one appears, the hub skips that event alone. All the other events count. `log.skippedEvents` counts the skipped events, and `log.ok` stays true.
+  The hub writes the line number and the name of the wrong field for the first 5 skipped events, and then a total. It never writes event content.
 - If the log is missing, the answer has `log.exists: false` and zeros.
 - A busy lock is not damage. It is the error `lock_unavailable`.
 
@@ -171,7 +199,7 @@ They are medians of 5 runs on an Apple laptop with one process. The laptop was d
 - Python 3.10, log of `check_result` events: the first request after a change takes about 1.4 s (at most 1.5 s). The next requests take about 0.24 s.
 - Python 3.10, log of the smallest events: the first request takes about 1.6 s. The next requests take about 0.30 s.
 - Python 3.14: the first request takes about 1.1 s. The next requests take about 0.10 to 0.13 s.
-- The rollup alone, with the events already read, takes 0.04 to 0.07 s.
+- The rollup alone, with the events already read, takes 0.04 to 0.07 s. With `timeZone` it takes about 0.02 s more for 19,000 events.
 - The call to `EventLog.read` is the rest. Its first call checks every line. Its later calls copy the checked lines and events, which costs about 0.07 to 0.2 s.
 
 Under heavy load from other programs, the same first request took 3 s to 20 s.
@@ -185,11 +213,12 @@ Suppose this cost is too high for the screen. Then there are two next steps. One
 
 - It does not prove that an event is true. A student event can be made up by the page. The hub shows what the log says.
 - The numbers are not a measure of learning. A session count and an active day count show that the student sat down. They say nothing about how well. The hub does not rank, score, or compare the student with anyone.
-- Daylight saving time is not modelled. See "The local day".
-- The app does not record a `passed` result for a `self-reported` check today. Those checks show as open. Each report counts as a retry. A later step decides how a self-reported check passes.
-- A `task_finished` event with the result `abandoned` or `skipped` still counts the task as done. The hub counts finished tasks, not passed tasks.
+- With `tzOffsetMinutes`, a clock change is not modelled. Use `timeZone`. See "The local day".
+- A `self-reported` result is the student's own word. The hub treats it as a pass for a check, and it does not use it as evidence for a skill.
 - Skills stay empty until modules tag their checks.
-- The cut of a title or a prompt is a cut at a character count. It can cut inside a word. The text is not changed in any other way. Control characters and bidirectional marks pass through as data, because the JSON text escapes them. The screen must escape the text it draws.
+- The text caps are the maxima of the lesson contract: 200 characters for a title, 5000 for a task prompt, and 2000 for a check description. A valid module is never cut. A module that the contract refuses is cut at the cap. The response does not flag such a cut, because the module is not valid.
+  The text is not changed in any other way. Control characters and bidirectional marks pass through as data, because the JSON text escapes them. The screen must escape the text it draws.
+- A list that the hub cuts, which are `skills` and `checks`, has a total beside it. The reader can see the cut.
 - The numbers are computed on each request. There is no history of past answers.
 - The log has at most 80% of its room for the page. The hub does not show how full the log is.
 - The tests run on Python 3.10, 3.12, 3.13, and 3.14. Linux CI is the final check.
