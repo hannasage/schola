@@ -114,8 +114,28 @@ def check_token(session, headers):
 # ---------------------------------------------------------------------------
 
 def _inside(path, folder):
-    """True when the real path `path` is `folder` or below it."""
-    return path == folder or path.startswith(folder if folder.endswith(os.sep) else folder + os.sep)
+    """True when the real path `path` is `folder` or below it.
+
+    The names are compared first. On a file system that ignores case, `DATA` and `data` are one folder with two
+    names, so each part of `path` is also compared with `folder` as a file (same device and same inode).
+    """
+    if path == folder or path.startswith(folder if folder.endswith(os.sep) else folder + os.sep):
+        return True
+    try:
+        wanted = os.stat(folder)
+    except (OSError, ValueError):
+        return False
+    current = path
+    while True:
+        try:
+            if os.path.samestat(os.stat(current), wanted):
+                return True
+        except (OSError, ValueError):
+            pass
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
 
 
 def validate_workspace(path, data_dir, home):
@@ -194,7 +214,8 @@ def _reference(payload, extra=()):
     return payload['moduleId'], payload['version'], payload['checkId']
 
 
-def _find_check(lessons, module_id, version, check_id):
+def find_check(lessons, module_id, version, check_id):
+    """The check of a stored module version, or a `not_found` CheckError. The command line tool uses this name too."""
     document = lessons.get_module(module_id, version)
     for check in document['checks']:
         if check['id'] == check_id:
@@ -206,7 +227,8 @@ def _find_check(lessons, module_id, version, check_id):
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _shown(check, workspace, digest, limits=None):
+def describe_check(check, workspace, digest, limits=None):
+    """What a check would run, as the inspect route shows it. The command line tool uses this name too."""
     source = check.get('source')
     timeout = check.get('timeoutSeconds', check_consent.DEFAULT_TIMEOUT_SECONDS)
     if isinstance(timeout, float) and timeout.is_integer():
@@ -229,6 +251,11 @@ def _shown(check, workspace, digest, limits=None):
     }
 
 
+# The private names stay, so nothing that used them breaks.
+_find_check = find_check
+_shown = describe_check
+
+
 def handle_get(server, lessons, path, headers):
     session = session_for(server)
     check_fetch_site(headers)
@@ -248,9 +275,9 @@ def handle_post(server, lessons, path, payload, headers):
         return 200, set_workspace(lessons, session, payload)
     if path == '/api/checks/inspect':
         module_id, version, check_id = _reference(payload)
-        check = _find_check(lessons, module_id, version, check_id)
+        check = find_check(lessons, module_id, version, check_id)
         workspace = _usable_workspace(lessons, session)
-        return 200, _shown(check, workspace, check_consent.check_hash(check), session.limits)
+        return 200, describe_check(check, workspace, check_consent.check_hash(check), session.limits)
     if path == '/api/checks/consent':
         return 200, _grant(session, lessons, payload, headers)
     if path == '/api/checks/run':
@@ -268,7 +295,7 @@ def _grant(session, lessons, payload, headers):
         raise CheckError('Agree to a script from the Schola page.', 'forbidden_origin', 403)
     if payload['confirm'] is not True:
         raise CheckError('Confirm that you have read the script and agree to run it.', 'confirmation_required', 400, 'confirm')
-    check = _find_check(lessons, module_id, version, check_id)
+    check = find_check(lessons, module_id, version, check_id)
     if not check_consent.needs_consent(check):
         raise CheckError('This check runs no script. It needs no consent.', 'consent_not_needed', 400)
     workspace = _usable_workspace(lessons, session)
@@ -284,7 +311,7 @@ def _run(session, lessons, payload):
     consent_id = payload.get('consentId')
     if 'consentId' in payload and not isinstance(consent_id, str):
         raise _bad('The consent id must be text.', 'consentId')
-    check = _find_check(lessons, module_id, version, check_id)
+    check = find_check(lessons, module_id, version, check_id)
     workspace = _usable_workspace(lessons, session)
     digest = check_consent.check_hash(check)
     tier, consent = 1, None

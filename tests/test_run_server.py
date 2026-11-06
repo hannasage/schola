@@ -1,10 +1,9 @@
 """The server start-up function that the command line tool shares with `python3 server.py`.
 
 `server.run_server` holds what the `__main__` block of `server.py` used to do. The old command must behave as before.
-The tests that start a program use a free port.
+The tests that start a program use port 0 and read the address that the server announces.
 """
 import json
-import os
 from pathlib import Path
 import signal
 import socket
@@ -20,14 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import check_routes
 import server
-
-
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
 
 
 class ServerCompatTests(unittest.TestCase):
@@ -55,10 +47,10 @@ class ServerCompatTests(unittest.TestCase):
         return process.returncode, out, err
 
     def test_the_old_command_still_starts_the_server_the_same_way(self):
-        port = free_port()
         data = Path(self.temp.name) / 'data'
-        process, line = self.start(sys.executable, str(ROOT / 'server.py'), '--port', str(port), '--data-dir', str(data))
-        self.assertEqual(line, f'Schola is ready at http://127.0.0.1:{port}\n')
+        process, line = self.start(sys.executable, str(ROOT / 'server.py'), '--port', '0', '--data-dir', str(data))
+        self.assertRegex(line, r'^Schola is ready at http://127\.0\.0\.1:[1-9][0-9]*\n$')
+        port = int(line.rsplit(':', 1)[1])
         connection = HTTPConnection('127.0.0.1', port, timeout=10)
         connection.request('GET', '/api/curricula')
         response = connection.getresponse()
@@ -91,8 +83,7 @@ class ServerCompatTests(unittest.TestCase):
         done = subprocess.run([sys.executable, str(ROOT / 'server.py'), '--port', 'abc'], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 2)
 
-    def test_run_server_announces_the_address_serves_and_returns_on_control_c(self):
-        port = free_port()
+    def test_run_server_announces_the_real_port_serves_and_returns_on_control_c(self):
         seen = []
         data = Path(self.temp.name) / 'data'
 
@@ -100,14 +91,19 @@ class ServerCompatTests(unittest.TestCase):
             seen.append(address)
             threading.Timer(0.5, __import__('_thread').interrupt_main).start()
 
-        self.assertIsNone(server.run_server(port, data, announce))
-        self.assertEqual(seen, [f'http://127.0.0.1:{port}'])
+        self.assertIsNone(server.run_server(0, data, announce))
+        self.assertRegex(seen[0], r'^http://127\.0\.0\.1:[1-9][0-9]*$')
         with self.assertRaises(OSError):
-            socket.create_connection(('127.0.0.1', port), timeout=2)
+            socket.create_connection(('127.0.0.1', int(seen[0].rsplit(':', 1)[1])), timeout=2)
+
+    def test_the_default_announcement_prints_the_old_line(self):
+        with mock.patch('builtins.print') as printed:
+            server.announce_ready('http://127.0.0.1:8765')
+        printed.assert_called_once_with('Schola is ready at http://127.0.0.1:8765', flush=True)
 
     def test_run_server_makes_the_check_token_before_it_announces(self):
         created = []
-        original = check_routes.session_for
+        original = server.check_routes.session_for
 
         def spy(srv):
             created.append('session')
@@ -125,11 +121,54 @@ class ServerCompatTests(unittest.TestCase):
                 made.append(self)
 
         with mock.patch.object(server.check_routes, 'session_for', spy), mock.patch.object(server, 'HTTPServer', Recording):
-            with self.assertRaises(KeyboardInterrupt):
-                server.run_server(0, Path(self.temp.name), announce)
-        for item in made:
-            item.server_close()
+            server.run_server(0, Path(self.temp.name), announce)
         self.assertEqual(created, ['session', 'announce'])
+        self.assertEqual(len(made), 1)
+
+    def test_a_fault_in_announce_closes_the_socket_and_passes_the_fault_on(self):
+        made = []
+
+        class Recording(server.HTTPServer):
+            def __init__(self, *args):
+                super().__init__(*args)
+                made.append(self)
+
+        def announce(address):
+            raise RuntimeError('announce failed')
+
+        with mock.patch.object(server, 'HTTPServer', Recording):
+            with self.assertRaises(RuntimeError):
+                server.run_server(0, Path(self.temp.name), announce)
+        self.assertEqual(made[0].socket.fileno(), -1)
+
+    def test_a_fault_in_the_session_setup_closes_the_socket(self):
+        made = []
+
+        class Recording(server.HTTPServer):
+            def __init__(self, *args):
+                super().__init__(*args)
+                made.append(self)
+
+        with mock.patch.object(server, 'HTTPServer', Recording), mock.patch.object(server.check_routes, 'session_for', side_effect=RuntimeError('no session')):
+            with self.assertRaises(RuntimeError):
+                server.run_server(0, Path(self.temp.name), lambda address: None)
+        self.assertEqual(made[0].socket.fileno(), -1)
+
+    def test_a_busy_port_raises_an_os_error_marked_as_a_bind_fault(self):
+        with socket.socket() as busy:
+            busy.bind(('127.0.0.1', 0))
+            busy.listen(1)
+            with self.assertRaises(OSError) as raised:
+                server.run_server(busy.getsockname()[1], Path(self.temp.name), lambda address: None)
+        self.assertEqual(raised.exception.hub_phase, 'bind')
+
+    def test_an_os_error_from_announce_is_not_marked_as_a_bind_fault(self):
+        def announce(address):
+            raise BrokenPipeError()
+
+        with self.assertRaises(OSError) as raised:
+            server.run_server(0, Path(self.temp.name), announce)
+        self.assertFalse(hasattr(raised.exception, 'hub_phase'))
 
     def test_run_server_listens_on_the_local_address_only(self):
         seen = {}
@@ -154,6 +193,7 @@ class ServerCompatTests(unittest.TestCase):
                 server.run_server(1234, Path(self.temp.name), lambda address: None)
         self.assertEqual(seen['address'], ('127.0.0.1', 1234))
         self.assertIs(seen['handler'], server.Handler)
+        self.assertIs(seen['closed'], True)
 
 
 if __name__ == '__main__':

@@ -383,14 +383,22 @@ def run_server(port, data_dir, announce=announce_ready):
     """Start the hub on 127.0.0.1 and serve until Control-C. `announce` gets the address once the server listens.
 
     `python3 server.py` and the `schola hub` command both call this function.
+    The address holds the port the system gave, so `port=0` announces the real port (the old command printed 0).
+    The socket is closed whatever ends the function. An OSError from the bind has `hub_phase = "bind"`.
     """
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    server.data_dir = data_dir
-    check_routes.session_for(server)  # the check token is made when the server starts
-    announce(f"http://127.0.0.1:{server.server_port}")
     try:
+        server = HTTPServer(("127.0.0.1", port), Handler)
+    except OSError as error:
+        error.hub_phase = "bind"
+        raise
+    try:
+        server.data_dir = data_dir
+        check_routes.session_for(server)  # the check token is made when the server starts
+        announce(f"http://127.0.0.1:{server.server_port}")
         server.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
         server.server_close()
 
 

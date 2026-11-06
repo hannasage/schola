@@ -635,6 +635,84 @@ class BusyTests(RouteCase):
         self.assertEqual(self.call('POST', '/api/checks/run', self.ref('has-readme'))[0], 200)
 
 
+class PublicNamesTests(RouteCase):
+    """The command line tool uses these public names. They give what the hub route gives."""
+
+    def test_the_private_names_are_aliases_of_the_public_ones(self):
+        self.assertIs(check_routes._find_check, check_routes.find_check)
+        self.assertIs(check_routes._shown, check_routes.describe_check)
+
+    def test_find_check_returns_the_check_the_hub_uses_and_refuses_an_unknown_one(self):
+        from lesson_store import LessonStore
+        store = LessonStore(self.data)
+        check = check_routes.find_check(store, 'hello-module', '1.0.0', 'script-a')
+        self.assertEqual(check['id'], 'script-a')
+        with self.assertRaises(check_routes.CheckError) as raised:
+            check_routes.find_check(store, 'hello-module', '1.0.0', 'nope')
+        self.assertEqual(raised.exception.code, 'not_found')
+
+    def test_describe_check_gives_the_same_facts_and_hash_as_the_inspect_route(self):
+        from lesson_store import LessonStore
+        self.set_workspace()
+        check = check_routes.find_check(LessonStore(self.data), 'hello-module', '1.0.0', 'script-a')
+        digest = check_consent.check_hash(check)
+        status, shown = self.call('POST', '/api/checks/inspect', self.ref('script-a'))
+        self.assertEqual(status, 200)
+        self.assertEqual(check_routes.describe_check(check, shown['workspace'], digest), shown)
+        self.assertEqual(shown['checkHash'], digest)
+
+
+class CaseInsensitiveWorkspaceTests(unittest.TestCase):
+    """On a file system that ignores case, `DATA` is the data folder `data`. The workspace rules must see that."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(os.path.realpath(self.temp.name)) / 'home'
+        self.data = self.home / 'data'
+        (self.data / 'inner').mkdir(parents=True)
+        (self.home / 'other').mkdir()
+        self.insensitive = (self.home / 'DATA').exists()
+
+    def need_insensitive(self):
+        if not self.insensitive:
+            self.skipTest('this file system is case sensitive, so DATA is not the data folder here')
+
+    def test_the_data_folder_in_other_case_is_refused(self):
+        self.need_insensitive()
+        with self.assertRaises(check_routes.CheckError):
+            check_routes.validate_workspace(str(self.home / 'DATA'), str(self.data), self.home)
+
+    def test_a_folder_inside_the_data_folder_in_other_case_is_refused(self):
+        self.need_insensitive()
+        with self.assertRaises(check_routes.CheckError):
+            check_routes.validate_workspace(str(self.home / 'DATA' / 'inner'), str(self.data), self.home)
+
+    def test_a_folder_that_holds_the_data_folder_in_other_case_is_refused(self):
+        self.need_insensitive()
+        holder = self.home / 'Holder'
+        (holder / 'store').mkdir(parents=True)
+        with self.assertRaises(check_routes.CheckError):
+            check_routes.validate_workspace(str(self.home / 'holder'), str(holder / 'store'), self.home)
+
+    def test_an_unrelated_folder_is_still_allowed(self):
+        real = check_routes.validate_workspace(str(self.home / 'other'), str(self.data), self.home)
+        self.assertEqual(real, str(self.home / 'other'))
+
+    def test_a_folder_with_a_similar_name_is_still_allowed(self):
+        (self.home / 'data-two').mkdir()
+        real = check_routes.validate_workspace(str(self.home / 'data-two'), str(self.data), self.home)
+        self.assertEqual(real, str(self.home / 'data-two'))
+
+    def test_a_data_folder_that_does_not_exist_yet_does_not_block_an_unrelated_folder(self):
+        real = check_routes.validate_workspace(str(self.home / 'other'), str(self.home / 'no-data-yet'), self.home)
+        self.assertEqual(real, str(self.home / 'other'))
+
+    def test_a_data_folder_that_does_not_exist_yet_is_compared_by_name(self):
+        with self.assertRaises(check_routes.CheckError):
+            check_routes.validate_workspace(str(self.home / 'other'), str(self.home / 'other' / 'missing'), self.home)
+
+
 class HashTests(unittest.TestCase):
     CHECK = {'id': 'c', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'script', 'a': 1, 'b': ['x']},
              'runtime': 'python3', 'source': 'print(1)\n', 'args': ['--x'], 'timeoutSeconds': 30}
