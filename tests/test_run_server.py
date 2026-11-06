@@ -117,9 +117,18 @@ class ServerCompatTests(unittest.TestCase):
             created.append('announce')
             raise KeyboardInterrupt()
 
-        with mock.patch.object(server.check_routes, 'session_for', spy):
+        made = []
+
+        class Recording(server.HTTPServer):
+            def __init__(self, *args):
+                super().__init__(*args)
+                made.append(self)
+
+        with mock.patch.object(server.check_routes, 'session_for', spy), mock.patch.object(server, 'HTTPServer', Recording):
             with self.assertRaises(KeyboardInterrupt):
                 server.run_server(0, Path(self.temp.name), announce)
+        for item in made:
+            item.server_close()
         self.assertEqual(created, ['session', 'announce'])
 
     def test_run_server_listens_on_the_local_address_only(self):
