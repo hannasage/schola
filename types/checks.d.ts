@@ -9,6 +9,14 @@ interface CheckRef {
   checkId: string;
 }
 
+/**
+ * What a run needs. `taskId` names the task the check belongs to. The server needs it to write the check events
+ * when the module has more than one task. A module with one task does not need it.
+ */
+interface CheckRunRef extends CheckRef {
+  taskId?: string;
+}
+
 /** What would run, as the server describes it. Every field is untrusted text or numbers. */
 interface CheckInspection {
   needsConsent: boolean;
@@ -48,6 +56,17 @@ interface CheckResult {
   log: string[];
 }
 
+/**
+ * Whether the server wrote the events of a run. `true`: both are in the log. `false`: the store says nothing was written.
+ * `'partial'`: the attempt is in the log and the result is not, or a write may have reached the log (`log_uncertain`).
+ */
+type CheckEventsWritten = boolean | 'partial';
+
+/** The stable codes of `eventsError`. */
+type CheckEventsError =
+  | 'not_run' | 'task_required' | 'task_unknown' | 'log_full' | 'log_reserved' | 'log_uncertain' | 'log_damaged' | 'log_unavailable'
+  | 'duplicate_event_id' | 'clock_unavailable' | 'artifact_too_large' | 'artifact_unavailable' | 'event_invalid' | 'events_failed';
+
 interface CheckRunResponse {
   moduleId: string;
   version: string;
@@ -55,6 +74,10 @@ interface CheckRunResponse {
   checkHash: string;
   tier: 1 | 2;
   result: CheckResult;
+  /** A fault in the event log never changes `result`. This field says what happened to the events. */
+  eventsWritten: CheckEventsWritten;
+  /** A stable code. Missing when `eventsWritten` is `true`. For `log_uncertain`, read the event log before a retry. */
+  eventsError?: CheckEventsError;
 }
 
 interface CheckService {
@@ -62,7 +85,7 @@ interface CheckService {
   setWorkspace(path: string): Promise<CheckWorkspace>;
   inspect(ref: CheckRef): Promise<CheckInspection>;
   grantConsent(ref: CheckRef, options: { confirm: boolean; shownHash: string }): Promise<CheckConsentGrant>;
-  run(ref: CheckRef, consentId?: string): Promise<CheckRunResponse>;
+  run(ref: CheckRunRef, consentId?: string): Promise<CheckRunResponse>;
 }
 
 interface CheckConsentOutcome {

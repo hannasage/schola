@@ -9,7 +9,7 @@ rules first. Every route except the first also needs the session token in the
     POST /api/checks/workspace  {path}: set the folder
     POST /api/checks/inspect    {moduleId, version, checkId}: what would run, and its hash
     POST /api/checks/consent    {moduleId, version, checkId, confirm: true, shownHash}: agree to a script
-    POST /api/checks/run        {moduleId, version, checkId, consentId?}: run one check
+    POST /api/checks/run        {moduleId, version, checkId, consentId?, taskId?}: run one check, then write its events
 
 A request body for these routes may be up to 64 KB.
 
@@ -26,15 +26,27 @@ computer. That program can call `GET /api/checks/session` and then the consent
 route with any headers it likes. It already has the student's permissions. So
 the guarantee is against hostile lesson content, not against a hostile local
 program.
+
+Check events
+------------
+A run that started also writes two events to the event log (`check_events.py`): `attempt_submitted` and
+`check_result`, both with the source `app`. The response keeps its old fields and gains `eventsWritten`
+(`true`, `false`, or `"partial"`) and, when it is not `true`, `eventsError` (a stable code).
+Events of a hub run obey the 80 percent reserve of the log (`from_page`), so a loop of runs cannot fill it. A fault in the
+log never changes the result and never turns the answer into an error. A request that is refused before the
+run writes no event. `taskId` is optional: a module with one task uses that task, and a module with several
+tasks needs `taskId` or its events are not written (`eventsError: "task_required"`).
 """
 import hmac
 import json
 import os
 import secrets
+import sys
 import threading
 from pathlib import Path
 
 import check_consent
+import check_events
 import check_runner
 import check_script
 from lesson_store import LessonStoreError
@@ -68,6 +80,8 @@ class CheckSession:
 
     def __init__(self, registry=None, limits=None, home=None):
         self.token = secrets.token_urlsafe(32)
+        # One session id for every event the hub writes in this run of the server.
+        self.event_session_id = check_events.new_session_id()
         self.consents = check_consent.ConsentRegistry()
         self.run_lock = threading.Lock()
         self.registry = registry
@@ -214,13 +228,18 @@ def _reference(payload, extra=()):
     return payload['moduleId'], payload['version'], payload['checkId']
 
 
-def find_check(lessons, module_id, version, check_id):
-    """The check of a stored module version, or a `not_found` CheckError. The command line tool uses this name too."""
+def find_module_check(lessons, module_id, version, check_id):
+    """`(module document, check)` of a stored module version, or a `not_found` CheckError."""
     document = lessons.get_module(module_id, version)
     for check in document['checks']:
         if check['id'] == check_id:
-            return check
+            return document, check
     raise CheckError('That check is not in that module version.', 'not_found', 404, 'checkId')
+
+
+def find_check(lessons, module_id, version, check_id):
+    """The check of a stored module version, or a `not_found` CheckError. The command line tool uses this name too."""
+    return find_module_check(lessons, module_id, version, check_id)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +300,7 @@ def handle_post(server, lessons, path, payload, headers):
     if path == '/api/checks/consent':
         return 200, _grant(session, lessons, payload, headers)
     if path == '/api/checks/run':
-        return 200, _run(session, lessons, payload)
+        return 200, _run(session, lessons, payload, _event_log(server))
     return None
 
 
@@ -306,12 +325,23 @@ def _grant(session, lessons, payload, headers):
     return session.consents.grant(module_id, version, check_id, digest, workspace)
 
 
-def _run(session, lessons, payload):
-    module_id, version, check_id = _reference(payload, ('consentId',))
+def _event_log(server):
+    # Imported here because event_routes imports this module.
+    import event_routes
+    return event_routes.log_for(server)
+
+
+def _run(session, lessons, payload, log):
+    module_id, version, check_id = _reference(payload, ('consentId', 'taskId'))
     consent_id = payload.get('consentId')
     if 'consentId' in payload and not isinstance(consent_id, str):
         raise _bad('The consent id must be text.', 'consentId')
-    check = find_check(lessons, module_id, version, check_id)
+    task_id = payload.get('taskId')
+    if 'taskId' in payload and not isinstance(task_id, str):
+        raise _bad('The task id must be text.', 'taskId')
+    document, check = find_module_check(lessons, module_id, version, check_id)
+    if 'taskId' in payload and check_events.resolve_task(document, task_id)[1] is not None:
+        raise _bad('That task is not in that module version.', 'taskId')
     workspace = _usable_workspace(lessons, session)
     digest = check_consent.check_hash(check)
     tier, consent = 1, None
@@ -323,7 +353,13 @@ def _run(session, lessons, payload):
     if not session.run_lock.acquire(blocking=False):
         raise CheckError('Another check is running. Wait for it to finish.', 'busy', 429, retryable=True)
     try:
-        outcome = check_runner.run(check, workspace, session.limits, session.adapters(), consent=consent)
+        # The events are written inside the run lock, so two runs never read the folder for their digests at once.
+        outcome, report = check_events.run_and_record(check, workspace, log=log, session_id=session.event_session_id, module=document,
+                                                      task_id=task_id, consent=consent, limits=session.limits, registry=session.adapters(),
+                                                      from_page=True)
     finally:
         session.run_lock.release()
-    return {'moduleId': module_id, 'version': version, 'checkId': check_id, 'checkHash': digest, 'tier': tier, 'result': outcome}
+    if report.error not in (None, check_events.NOT_RUN):
+        # The page gets the answer. The server log gets the code too, so a person who reads it sees the fault. No path, no text.
+        print(f'schola: the check events were not saved (code: {report.error}).', file=sys.stderr)
+    return {'moduleId': module_id, 'version': version, 'checkId': check_id, 'checkHash': digest, 'tier': tier, 'result': outcome, **report.fields()}

@@ -143,5 +143,15 @@ node --test tests/check-consent.test.mjs
 
 The route tests start a server that handles requests at the same time, so they can check the busy answer. They cover a missing and a wrong token, a foreign Host and Origin, unsafe workspace folders, consent bound to a hash and a folder, and a run request that tries to grant consent. The Node test runs the check service and the consent screen against a fake server and a fake document. It checks that Cancel makes no call and that server text is shown as text only.
 
+The check events, which the hub run route and `schola check run` write through `check_events.py`:
+
+```sh
+python3 -m unittest -v tests.test_check_events
+python3 -m unittest -v tests.test_check_routes.EventsRouteTests tests.test_cli.CheckRunEventsTests
+node --test tests/check-events-parity.test.mjs
+```
+
+The tests use the real event log, the real check runner, and the real lesson store on temporary folders. They validate every written event with `learning_event.validate_event`. The Node test validates a real log with the Node validator and compares it with the Python result. The tests cover the digest of the work, the reason codes, a task id that the module does not give, and a run that did not start. They also cover a full log, a damaged log, an unreadable log, a read-only folder, and a log that takes only the first event.
+
 The golden data in `tests/fixtures/storage/pre-s03/` is the data folder as it was before lessons.
 A test loads it and checks that no byte changes.

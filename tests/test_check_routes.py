@@ -7,6 +7,7 @@ against a hostile local program, which already has the student's permissions.
 """
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,9 @@ import check_consent
 import check_routes
 import check_runner
 import check_script
+import event_log
+import learning_event
+from event_log import EventLog
 from server import Handler
 
 FIXTURE = ROOT / 'tests' / 'fixtures' / 'contracts' / 'valid' / 'lesson-module-minimal.json'
@@ -628,7 +632,7 @@ class BusyTests(RouteCase):
     def test_the_lock_is_released_after_a_fault(self):
         self.set_workspace()
         self.consent()
-        with mock.patch.object(check_routes.check_runner, 'run', side_effect=RuntimeError('/secret/path')), mock.patch('server.traceback.print_exc'):
+        with mock.patch.object(check_routes.check_runner, 'run_traced', side_effect=RuntimeError('/secret/path')), mock.patch('server.traceback.print_exc'):
             status, payload = self.call('POST', '/api/checks/run', self.ref('has-readme'))
         self.assertEqual((status, payload['code']), (500, 'internal_error'))
         self.assertNotIn('secret', json.dumps(payload))
@@ -751,6 +755,326 @@ class HashTests(unittest.TestCase):
                                sort_keys=True, separators=(',', ':')).encode()
         expected = hashlib.sha256(canonical + b'\n' + b'print(1)\n').hexdigest()
         self.assertEqual(check_consent.check_hash(self.CHECK), expected)
+
+
+# ---------------------------------------------------------------------------
+# Check events: the run route writes attempt_submitted and check_result
+# ---------------------------------------------------------------------------
+
+class EventsRouteTests(RouteCase):
+    """A finished run writes two events. A run that did not happen writes none. A log fault never hides the result."""
+
+    def log_events(self):
+        report = EventLog(self.data).read()
+        self.assertTrue(report['ok'], report)
+        events = [item['event'] for item in report['events']]
+        for event in events:
+            self.assertEqual(learning_event.validate_event(event), {'ok': True}, event)
+        return events
+
+    def log_exists(self):
+        return (self.data / '_events').exists()
+
+    def run_check(self, check_id='has-readme', **extra):
+        return self.call('POST', '/api/checks/run', self.ref(check_id, **extra))
+
+    def test_a_finished_run_writes_an_attempt_then_a_result_and_says_so(self):
+        self.set_workspace()
+        status, payload = self.run_check()
+        self.assertEqual(status, 200, payload)
+        self.assertIs(payload['eventsWritten'], True)
+        self.assertNotIn('eventsError', payload)
+        self.assertEqual(set(payload), {'moduleId', 'version', 'checkId', 'checkHash', 'tier', 'result', 'eventsWritten'})
+        attempt, result = self.log_events()
+        self.assertEqual((attempt['type'], result['type']), ('attempt_submitted', 'check_result'))
+        for event in (attempt, result):
+            self.assertEqual((event['source'], event['moduleId'], event['moduleVersion'], event['taskId'], event['skills']),
+                             ('app', 'hello-module', '1.0.0', 'task-1', []))
+        self.assertEqual(attempt['data']['attemptId'], result['data']['attemptId'])
+        self.assertEqual((result['data']['checkId'], result['data']['status'], result['data']['runnerType']), ('has-readme', 'passed', 'file-exists'))
+        self.assertEqual(attempt['data']['artifactDigest'], hashlib.sha256(
+            b'README.md\0' + hashlib.sha256(b'hi').hexdigest().encode() + b'\0' + b'2\n').hexdigest())
+        self.assertEqual(attempt['data']['artifactBytes'], 2)
+
+    def test_the_events_can_be_read_back_through_the_event_route(self):
+        self.set_workspace()
+        self.run_check()
+        status, report = self.call('GET', '/api/events')
+        self.assertEqual(status, 200)
+        self.assertEqual([item['event']['type'] for item in report['events']], ['attempt_submitted', 'check_result'])
+
+    def test_every_event_of_one_hub_run_carries_the_session_id_of_the_hub(self):
+        self.set_workspace()
+        self.run_check()
+        self.run_check()
+        self.run_check('has-readme', taskId='task-1')
+        events = self.log_events()
+        self.assertEqual(len(events), 6)
+        self.assertEqual({event['sessionId'] for event in events}, {self.server.check_session.event_session_id})
+        self.assertRegex(self.server.check_session.event_session_id, r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+    def test_another_hub_start_has_another_session_id(self):
+        first = self.server.check_session.event_session_id
+        self.token = None
+        self.start_server(session=check_routes.CheckSession())
+        self.assertNotEqual(first, self.server.check_session.event_session_id)
+        self.assertNotEqual(check_routes.CheckSession().event_session_id, check_routes.CheckSession().event_session_id)
+
+    def test_a_repeated_click_is_a_new_attempt(self):
+        self.set_workspace()
+        self.run_check()
+        self.run_check()
+        events = self.log_events()
+        self.assertEqual(len(events), 4)
+        self.assertEqual(len({event['eventId'] for event in events}), 4)
+        self.assertEqual(len({event['data']['attemptId'] for event in events}), 2)
+
+    def test_a_failed_check_is_a_result_too(self):
+        self.set_workspace()
+        (self.work / 'README.md').unlink()
+        status, payload = self.run_check()
+        self.assertEqual((status, payload['result']['status'], payload['eventsWritten']), (200, 'failed', True))
+        attempt, result = self.log_events()
+        self.assertEqual((result['data']['status'], result['data']['evidence']), ('failed', 'not_found'))
+        self.assertEqual(attempt['data']['artifactBytes'], 0)
+
+    def test_a_script_check_writes_events_after_consent(self):
+        self.set_workspace()
+        granted = self.consent()
+        status, payload = self.run_check('script-a', consentId=granted['consentId'])
+        self.assertEqual((status, payload['eventsWritten']), (200, True))
+        attempt, result = self.log_events()
+        self.assertEqual(result['data']['runnerType'], 'script')
+        self.assertEqual(attempt['data']['artifactBytes'], 2)
+
+    def test_a_run_that_was_refused_writes_no_event(self):
+        self.set_workspace()
+        refusals = [
+            ('consent missing', self.ref('script-a'), 403),
+            ('consent for nothing', self.ref('script-a', consentId='forged'), 403),
+            ('unknown check', self.ref('nope'), 404),
+            ('unknown module', {'moduleId': 'nope', 'version': '1.0.0', 'checkId': 'has-readme'}, 404),
+            ('unpinned version', {'moduleId': 'hello-module', 'version': '9.9.9', 'checkId': 'has-readme'}, 404),
+            ('bad shape', {'moduleId': 'hello-module'}, 400),
+            ('unknown task', self.ref('has-readme', taskId='no-such-task'), 400),
+            ('task not text', self.ref('has-readme', taskId=5), 400),
+        ]
+        for label, body, expected in refusals:
+            with self.subTest(label=label):
+                status, payload = self.call('POST', '/api/checks/run', body)
+                self.assertEqual(status, expected, payload)
+                self.assertNotIn('eventsWritten', payload)
+        self.assertEqual(self.adapter.calls, [])
+        self.assertFalse(self.log_exists())
+
+    def test_a_task_id_that_is_not_text_gets_its_own_message(self):
+        self.set_workspace()
+        for value in (5, ['task-1'], None, True, {'a': 1}):
+            with self.subTest(value=value):
+                status, payload = self.run_check('has-readme', taskId=value)
+                self.assertEqual((status, payload['code'], payload['field']), (400, 'invalid_request', 'taskId'))
+                self.assertIn('must be text', payload['error'])
+        status, payload = self.run_check('has-readme', taskId='no-such-task')
+        self.assertEqual((status, payload['field']), (400, 'taskId'))
+        self.assertIn('not in that module version', payload['error'])
+
+    def test_a_run_with_no_workspace_writes_no_event(self):
+        status, payload = self.run_check()
+        self.assertEqual((status, payload['code']), (409, 'workspace_required'))
+        self.assertFalse(self.log_exists())
+
+    def test_a_run_with_a_bad_token_writes_no_event(self):
+        self.set_workspace()
+        self.assertEqual(self.call('POST', '/api/checks/run', self.ref('has-readme'), token='x' * 43)[0], 403)
+        self.assertFalse(self.log_exists())
+
+    def test_a_self_reported_check_writes_no_event_and_says_why(self):
+        self.set_workspace()
+        status, payload = self.run_check('self')
+        self.assertEqual((status, payload['result']['status']), (200, 'skipped'))
+        self.assertEqual((payload['eventsWritten'], payload['eventsError']), (False, 'not_run'))
+        self.assertFalse(self.log_exists())
+
+    def test_a_busy_hub_writes_no_event_for_the_refused_run(self):
+        self.set_workspace()
+        granted = self.consent()
+        self.adapter.release.clear()
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.run_check('script-a', consentId=granted['consentId'])))
+        thread.start()
+        self.assertTrue(self.adapter.started.wait(10))
+        status, payload = self.run_check()
+        self.assertEqual((status, payload['code']), (429, 'busy'))
+        self.adapter.release.set()
+        thread.join()
+        self.assertEqual(results[0][0], 200)
+        self.assertEqual(len(self.log_events()), 2)
+
+    def test_a_module_with_several_tasks_needs_a_named_task(self):
+        document = module_document(version='2.0.0')
+        template = document['tasks'][0]
+        document['tasks'] = [dict(template, id='task-a'), dict(template, id='task-b')]
+        self.import_module(document)
+        self.set_workspace()
+        body = {'moduleId': 'hello-module', 'version': '2.0.0', 'checkId': 'has-readme'}
+        status, payload = self.call('POST', '/api/checks/run', body)
+        self.assertEqual((status, payload['result']['status'], payload['eventsWritten'], payload['eventsError']), (200, 'passed', False, 'task_required'))
+        self.assertFalse(self.log_exists())
+        status, payload = self.call('POST', '/api/checks/run', dict(body, taskId='task-b'))
+        self.assertEqual((status, payload['eventsWritten']), (200, True))
+        self.assertEqual({event['taskId'] for event in self.log_events()}, {'task-b'})
+        status, payload = self.call('POST', '/api/checks/run', dict(body, taskId='task-1'))
+        self.assertEqual((status, payload['code']), (400, 'invalid_request'))
+
+    # --- a log that cannot be written never hides the result ---
+
+    def assertResultKept(self, expected_error, expected_written=False, check_id='has-readme'):
+        status, payload = self.run_check(check_id)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['result']['status'], 'passed')
+        self.assertEqual(payload['eventsWritten'], expected_written)
+        self.assertIs(type(payload['eventsWritten']), type(expected_written))
+        self.assertEqual(payload['eventsError'], expected_error)
+        self.assertEqual(payload['tier'], 1)
+        return payload
+
+    def test_a_full_log_is_refused_by_the_reserve_first(self):
+        self.set_workspace()
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (learning_event.MAX_BYTES - 10) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        self.assertResultKept('log_reserved')
+
+    def test_a_log_over_the_page_reserve_refuses_the_events_of_a_hub_run(self):
+        """A hub run is page traffic. Its events stop at 80 percent, so the rest stays free for other app events."""
+        self.set_workspace()
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES + 100) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        before = (folder / 'events.jsonl').read_bytes()
+        self.assertResultKept('log_reserved')
+        self.assertEqual((folder / 'events.jsonl').read_bytes(), before)
+        # The app, with no reserve, can still use the rest.
+        EventLog(self.data).append(self.sample_app_event())
+
+    def test_a_loop_of_runs_stops_at_the_reserve(self):
+        self.set_workspace()
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES - 1500) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        answers = [self.run_check()[1]['eventsWritten'] for _ in range(8)]
+        self.assertIn(True, answers)
+        self.assertEqual(answers[-1], False)
+        self.assertLessEqual(len((folder / 'events.jsonl').read_bytes()), event_log.RESERVE_BYTES + 1000)
+
+    def sample_app_event(self):
+        return {'schemaVersion': '1.0', 'eventId': '11111111-1111-4111-8111-111111111111', 'time': '2026-01-01T00:00:00Z',
+                'sessionId': '22222222-2222-4222-8222-222222222222', 'moduleId': 'hello-module', 'moduleVersion': '1.0.0', 'taskId': 'task-1',
+                'source': 'app', 'skills': [], 'type': 'task_finished', 'data': {'result': 'passed'}}
+
+    def test_a_damaged_log(self):
+        self.set_workspace()
+        (self.data / '_events').mkdir(mode=0o700)
+        (self.data / '_events' / 'events.jsonl').mkdir()
+        self.assertResultKept('log_damaged')
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can read any file')
+    def test_an_unreadable_log(self):
+        self.set_workspace()
+        self.run_check()
+        path = self.data / '_events' / 'events.jsonl'
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        self.assertResultKept('log_unavailable')
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can write anywhere')
+    def test_a_read_only_folder(self):
+        self.set_workspace()
+        os.chmod(self.data, 0o500)
+        self.addCleanup(os.chmod, self.data, 0o700)
+        self.assertResultKept('log_unavailable')
+
+    def test_a_log_with_room_for_one_event_is_partial(self):
+        self.set_workspace()
+        real_append = event_log.EventLog.append
+        calls = []
+
+        def second_fails(log, event, from_page=False):
+            calls.append(event['type'])
+            if len(calls) == 2:
+                raise event_log.EventLogError('x', 'log_full', 409)
+            return real_append(log, event, from_page)
+
+        with mock.patch.object(event_log.EventLog, 'append', second_fails):
+            self.assertResultKept('log_full', expected_written='partial')
+        self.assertEqual(calls, ['attempt_submitted', 'check_result'])
+        self.assertEqual([event['type'] for event in self.log_events()], ['attempt_submitted'])
+
+    def test_an_unexpected_fault_in_the_log_is_named(self):
+        self.set_workspace()
+        with mock.patch.object(event_log.EventLog, 'append', side_effect=RuntimeError('/Users/someone/secret')):
+            payload = self.assertResultKept('log_uncertain', expected_written='partial')
+        self.assertNotIn('Users', json.dumps(payload))
+
+    def test_the_log_comes_back_when_the_fault_is_gone(self):
+        self.set_workspace()
+        (self.data / '_events').mkdir(mode=0o700)
+        (self.data / '_events' / 'events.jsonl').mkdir()
+        self.assertResultKept('log_damaged')
+        (self.data / '_events' / 'events.jsonl').rmdir()
+        status, payload = self.run_check()
+        self.assertEqual((status, payload['eventsWritten']), (200, True))
+
+    def test_a_fault_while_writing_the_events_is_not_a_server_fault(self):
+        self.set_workspace()
+        with mock.patch.object(check_routes.check_events, 'artifact_for', side_effect=RuntimeError('boom')):
+            self.assertResultKept('events_failed')
+
+    def test_an_uncertain_write_is_named_and_the_second_event_is_not_tried(self):
+        self.set_workspace()
+        calls = []
+
+        def uncertain(log, event, from_page=False):
+            calls.append(event['type'])
+            raise event_log.EventLogError('may be in the log', 'fsync_failed', details={'partialLine': False, 'maybeWritten': True})
+
+        with mock.patch.object(event_log.EventLog, 'append', uncertain):
+            self.assertResultKept('log_uncertain', expected_written='partial')
+        self.assertEqual(calls, ['attempt_submitted'])
+
+    def test_every_failure_except_not_run_leaves_one_line_on_standard_error_with_a_code_only(self):
+        self.set_workspace()
+        (self.data / '_events').write_text('x')
+        seen = io.StringIO()
+        with mock.patch.object(sys, 'stderr', seen):
+            self.assertResultKept('log_damaged')
+        self.assertEqual(seen.getvalue(), 'schola: the check events were not saved (code: log_damaged).\n')
+        self.assertNotIn(str(self.data), seen.getvalue())
+
+    def test_a_partial_write_leaves_a_line_too(self):
+        self.set_workspace()
+        with mock.patch.object(event_log.EventLog, 'append', side_effect=event_log.EventLogError('may be in the log', 'fsync_failed', details={'maybeWritten': True})):
+            seen = io.StringIO()
+            with mock.patch.object(sys, 'stderr', seen):
+                self.assertResultKept('log_uncertain', expected_written='partial')
+        self.assertIn('(code: log_uncertain)', seen.getvalue())
+
+    def test_a_run_that_wrote_its_events_or_did_not_start_leaves_no_line(self):
+        self.set_workspace()
+        seen = io.StringIO()
+        with mock.patch.object(sys, 'stderr', seen):
+            self.assertEqual(self.run_check()[1]['eventsWritten'], True)
+            self.assertEqual(self.run_check('self')[1]['eventsError'], 'not_run')
+        self.assertEqual(seen.getvalue(), '')
+
+    def test_no_text_of_the_log_fault_reaches_the_response(self):
+        self.set_workspace()
+        (self.data / '_events').write_text('x')
+        payload = self.assertResultKept('log_damaged')
+        self.assertNotIn(str(self.data), json.dumps(payload))
 
 
 if __name__ == '__main__':

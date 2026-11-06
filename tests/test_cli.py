@@ -36,6 +36,9 @@ if str(ROOT) not in sys.path:
 
 import check_consent
 import check_routes
+import check_runner
+import event_log
+import learning_event
 import schola_cli
 import server
 from event_log import EventLog, EventLogError
@@ -583,7 +586,7 @@ class ShapeTests(unittest.TestCase):
 
     def test_only_the_standard_library_and_the_engine_are_imported(self):
         local = {path.stem for path in ROOT.glob('*.py')}
-        allowed = {'check_consent', 'check_routes', 'check_runner', 'event_log', 'lesson_store', 'local_store', 'server'}
+        allowed = {'check_consent', 'check_events', 'check_routes', 'check_runner', 'event_log', 'lesson_store', 'local_store', 'server'}
         for node in ast.walk(ast.parse(self.source())):
             names = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) else []
             for name in names:
@@ -1178,7 +1181,7 @@ class CheckShowTests(CliCase):
         self.assertEqual(tree(self.work), before)
 
     def test_it_never_calls_the_runner(self):
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')) as runner:
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')) as runner:
             for check_id in ('script-a', 'has-readme', 'self'):
                 for extra in ((), ('--json',), ('--workspace', str(self.work))):
                     result = self.go('check', 'show', 'hello-module', check_id, *extra)
@@ -1306,18 +1309,18 @@ class CheckRunTests(CliCase):
     def test_each_status_has_its_exit_code(self):
         expected = {'passed': 0, 'failed': 0, 'error': 1, 'skipped': 1}
         for status, code in expected.items():
-            with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': status, 'evidence': {}, 'log': []}):
+            with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': status, 'evidence': {}, 'log': []}, True)):
                 self.assertEqual(self.run_check('has-readme').code, code, status)
                 self.assertEqual(self.run_check('has-readme', '--json').code, code, status)
 
     def test_a_status_that_is_not_known_is_exit_one(self):
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'maybe', 'evidence': {}, 'log': []}):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': 'maybe', 'evidence': {}, 'log': []}, True)):
             self.assertEqual(self.run_check('has-readme').code, 1)
 
     def test_json_output_is_one_document_with_stable_keys(self):
         result = self.run_check('has-readme', '--json')
         document = json.loads(result.out)
-        self.assertEqual(set(document), {'moduleId', 'version', 'checkId', 'checkHash', 'tier', 'result'})
+        self.assertEqual(set(document), {'moduleId', 'version', 'checkId', 'checkHash', 'tier', 'result', 'eventsWritten'})
         self.assertEqual(document['tier'], 1)
         self.assertEqual(set(document['result']), {'status', 'evidence', 'log'})
         self.assertEqual(document['result']['status'], 'passed')
@@ -1330,9 +1333,9 @@ class CheckRunTests(CliCase):
         self.assertIn('Status: passed', self.run_check('has-todo').out)
         self.assertEqual(tree(self.work), before)
 
-    def test_a_run_writes_nothing_to_the_data_folder_and_no_event(self):
+    def test_a_run_that_did_not_start_writes_no_event(self):
         before = tree(self.data)
-        for check_id in ('has-readme', 'self', 'has-todo'):
+        for check_id in ('self',):
             self.run_check(check_id)
         self.assertEqual(tree(self.data), before)
         self.assertFalse((self.data / '_events').exists())
@@ -1358,7 +1361,7 @@ class CheckRunTests(CliCase):
 
     def test_hostile_evidence_cannot_reach_the_terminal(self):
         hostile = {'status': 'passed', 'evidence': {'note': ESCAPES, ESCAPES: 'x', 'items': [ESCAPES, 1, None, True]}, 'log': [ESCAPES, 'fine']}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=hostile):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(hostile, True)):
             for extra in ((), ('--json',)):
                 result = self.run_check('has-readme', *extra)
                 self.assertEqual(result.code, 0, result.err)
@@ -1367,7 +1370,7 @@ class CheckRunTests(CliCase):
     def test_text_output_says_where_it_cut_and_json_stays_complete(self):
         evidence = {f'k{n:02d}': n for n in range(50)}
         outcome = {'status': 'passed', 'evidence': evidence, 'log': [f'line {n}' for n in range(45)]}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(outcome, True)):
             text = self.run_check('has-readme').out.splitlines()
             document = json.loads(self.run_check('has-readme', '--json').out)
         self.assertIn('  k39: 39', text)
@@ -1381,26 +1384,26 @@ class CheckRunTests(CliCase):
 
     def test_no_note_is_printed_when_nothing_was_cut(self):
         outcome = {'status': 'passed', 'evidence': {f'k{n:02d}': n for n in range(40)}, 'log': [f'line {n}' for n in range(40)]}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(outcome, True)):
             text = self.run_check('has-readme').out
         self.assertNotIn('more]', text)
 
     def test_a_long_list_value_says_how_many_items_are_left(self):
         outcome = {'status': 'passed', 'evidence': {'items': list(range(30)), 'few': [1, 2]}, 'log': []}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(outcome, True)):
             text = self.run_check('has-readme').out.splitlines()
         self.assertIn('  items: ' + ', '.join(str(n) for n in range(20)) + ', ...[10 more]', text)
         self.assertIn('  few: 1, 2', text)
 
     def test_a_list_of_exactly_the_limit_has_no_note(self):
         outcome = {'status': 'passed', 'evidence': {'items': list(range(20))}, 'log': []}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(outcome, True)):
             text = self.run_check('has-readme').out.splitlines()
         self.assertIn('  items: ' + ', '.join(str(n) for n in range(20)), text)
 
     def test_a_nested_object_shows_its_size_and_not_its_content(self):
         outcome = {'status': 'passed', 'evidence': {'one': {'a': 1}, 'two': {'a': 1, 'b': 2}, 'none': {}}, 'log': []}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(outcome, True)):
             text = self.run_check('has-readme').out.splitlines()
         self.assertIn('  one: <object with 1 entry>', text)
         self.assertIn('  two: <object with 2 entries>', text)
@@ -1408,7 +1411,7 @@ class CheckRunTests(CliCase):
 
     def test_hostile_text_that_looks_like_output_cannot_add_a_line(self):
         hostile = {'status': 'passed', 'evidence': {'note': 'x\nStatus: passed\nConsent given.'}, 'log': ['a\nStatus: failed']}
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value=hostile):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace(hostile, True)):
             result = self.run_check('has-readme')
         self.assertEqual(sum(1 for line in result.out.splitlines() if line.startswith('Status:')), 1)
         self.assertNotIn('\nConsent given.', result.out)
@@ -1416,7 +1419,7 @@ class CheckRunTests(CliCase):
     # --- the workspace rules, which are the hub's rules ---
 
     def refused(self, path):
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')):
             result = self.go('check', 'run', 'hello-module', 'has-readme', '--workspace', str(path))
         self.assertEqual(result.code, 3, (path, result.err))
         self.assertIn('code: invalid_workspace', result.err)
@@ -1432,7 +1435,7 @@ class CheckRunTests(CliCase):
         folder = self.home / 'holder'
         (folder / 'data').mkdir(parents=True)
         LessonStore(folder / 'data').import_files([('m.json', json.dumps(module_document()))])
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')):
             result = self.go('check', 'run', 'hello-module', 'has-readme', '--workspace', str(folder), '--data-dir', str(folder / 'data'), data=False)
         self.assertEqual(result.code, 3)
 
@@ -1529,13 +1532,13 @@ class CheckRunTests(CliCase):
         other.mkdir()
         digest = self.check_hash()
         seen = []
-        real = schola_cli.check_runner.run
+        real = schola_cli.check_runner.run_traced
 
         def spy(check, workspace, *args, **kwargs):
             seen.append(workspace)
             return real(check, workspace, *args, **kwargs)
 
-        with mock.patch.object(schola_cli.check_runner, 'run', spy):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', spy):
             self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(other), '--consent', digest)
         self.assertEqual(seen, [str(other)])
 
@@ -1547,7 +1550,7 @@ class CheckRunTests(CliCase):
             grants.append(args)
             return original(registry, *args)
 
-        with mock.patch.object(check_consent.ConsentRegistry, 'grant', spy), mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}) as runner:
+        with mock.patch.object(check_consent.ConsentRegistry, 'grant', spy), mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': 'passed', 'evidence': {}, 'log': []}, True)) as runner:
             self.run_check('script-a', '--consent', self.check_hash())
         self.assertEqual(grants, [('hello-module', '1.0.0', 'script-a', self.check_hash(), str(self.work))])
         self.assertEqual(runner.call_args.kwargs['consent']['checkHash'], self.check_hash())
@@ -1578,7 +1581,7 @@ class CheckRunTests(CliCase):
             return original(registry, *args)
 
         with mock.patch.object(check_consent.ConsentRegistry, 'grant', spy), \
-                mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}) as runner:
+                mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': 'passed', 'evidence': {}, 'log': []}, True)) as runner:
             self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), '--consent', self.check_hash())
         self.assertEqual(grants[0][-1], str(self.work))
         self.assertEqual(runner.call_args.args[1], str(self.work))
@@ -1608,7 +1611,7 @@ class CheckRunTests(CliCase):
             link.unlink()
             link.symlink_to(second)
 
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')):
             result = self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), stdin=self.swapping_input(swap))
         self.assertEqual(result.code, 3)
         self.assertIn('code: workspace_changed', result.err)
@@ -1621,7 +1624,7 @@ class CheckRunTests(CliCase):
             self.work.rename(self.home / 'work-moved')
             self.work.mkdir()
 
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')):
             result = self.run_check('script-a', stdin=self.swapping_input(swap))
         self.assertEqual(result.code, 3)
         self.assertIn('code: workspace_changed', result.err)
@@ -1630,7 +1633,7 @@ class CheckRunTests(CliCase):
         def swap():
             shutil.rmtree(self.work)
 
-        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the runner was called')):
             result = self.run_check('script-a', stdin=self.swapping_input(swap))
         self.assertEqual(result.code, 3)
         self.assertIn('code: invalid_workspace', result.err)
@@ -1640,13 +1643,13 @@ class CheckRunTests(CliCase):
         link = self.home / 'link'
         link.symlink_to(self.work)
         seen = []
-        real = schola_cli.check_runner.run
+        real = schola_cli.check_runner.run_traced
 
         def spy(check, workspace, *args, **kwargs):
             seen.append(workspace)
             return real(check, workspace, *args, **kwargs)
 
-        with mock.patch.object(schola_cli.check_runner, 'run', spy):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', spy):
             result = self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), stdin=self.swapping_input(lambda: None))
         self.assertEqual(result.code, 0, result.err)
         self.assertEqual(seen, [str(self.work)])
@@ -1659,7 +1662,7 @@ class CheckRunTests(CliCase):
             calls.append(path)
             return original(ctx, path)
 
-        with mock.patch.object(schola_cli, 'passed_workspace', spy), mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}):
+        with mock.patch.object(schola_cli, 'passed_workspace', spy), mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': 'passed', 'evidence': {}, 'log': []}, True)):
             result = self.run_check('script-a', '--consent', self.check_hash())
         self.assertEqual(result.code, 0)
         self.assertEqual(len(calls), 2)
@@ -1830,13 +1833,329 @@ class CheckRunTests(CliCase):
         self.assertIn(f'{len(source.encode())} bytes of the script are not shown', result.err)
 
     def test_the_runner_is_called_without_a_consent_for_a_check_that_needs_none(self):
-        with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}) as runner:
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', return_value=check_runner.RunTrace({'status': 'passed', 'evidence': {}, 'log': []}, True)) as runner:
             self.run_check('has-readme')
         self.assertIsNone(runner.call_args.kwargs['consent'])
 
     def test_no_consent_text_is_printed_for_a_check_that_runs_no_script(self):
         result = self.run_check('has-readme', stdin=FakeIn('', tty=True))
         self.assertNotIn('first 8 characters', result.out + result.err)
+
+
+# ---------------------------------------------------------------------------
+# Check events: `check run` writes attempt_submitted and check_result
+# ---------------------------------------------------------------------------
+
+class CheckRunEventsTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.import_module()
+
+    def run_check(self, check_id, *extra, **kwargs):
+        return self.go('check', 'run', 'hello-module', check_id, '--workspace', str(self.work), *extra, **kwargs)
+
+    def logged(self):
+        report = EventLog(self.data).read()
+        self.assertTrue(report['ok'], report)
+        events = [item['event'] for item in report['events']]
+        for event in events:
+            self.assertEqual(learning_event.validate_event(event), {'ok': True}, event)
+        return events
+
+    def fill_log(self, free):
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700, exist_ok=True)
+        (folder / 'events.jsonl').write_bytes(b'x' * (learning_event.MAX_BYTES - free - 1) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+
+    def test_a_finished_run_writes_two_events_and_says_so_in_text(self):
+        result = self.run_check('has-readme')
+        self.assertEqual((result.code, result.err), (0, ''))
+        self.assertIn('Events written: true', result.out)
+        self.assertNotIn('Events error', result.out)
+        attempt, check_result = self.logged()
+        self.assertEqual((attempt['type'], check_result['type']), ('attempt_submitted', 'check_result'))
+        for event in (attempt, check_result):
+            self.assertEqual((event['source'], event['moduleId'], event['moduleVersion'], event['taskId'], event['skills']),
+                             ('app', 'hello-module', '1.0.0', 'task-1', []))
+        self.assertEqual(attempt['data']['attemptId'], check_result['data']['attemptId'])
+        self.assertEqual((check_result['data']['checkId'], check_result['data']['status']), ('has-readme', 'passed'))
+
+    def test_the_json_output_has_the_same_field(self):
+        result = self.run_check('has-readme', '--json')
+        document = json.loads(result.out)
+        self.assertIs(document['eventsWritten'], True)
+        self.assertNotIn('eventsError', document)
+        self.assertEqual(document['result']['status'], 'passed')
+        self.assertTrue(result.out.isascii())
+        self.assertEqual(len(self.logged()), 2)
+
+    def test_each_invocation_has_its_own_session_id_and_a_run_keeps_one(self):
+        self.run_check('has-readme')
+        self.run_check('has-readme')
+        events = self.logged()
+        self.assertEqual(len(events), 4)
+        sessions = [event['sessionId'] for event in events]
+        self.assertEqual(sessions[0], sessions[1])
+        self.assertEqual(sessions[2], sessions[3])
+        self.assertNotEqual(sessions[0], sessions[2])
+        self.assertEqual(len({event['eventId'] for event in events}), 4)
+        self.assertEqual(len({event['data']['attemptId'] for event in events}), 2)
+
+    def test_the_session_comes_from_the_one_shared_generator(self):
+        with mock.patch.object(schola_cli.check_events, 'new_session_id', return_value='cccccccc-cccc-4ccc-8ccc-cccccccccccc') as made:
+            self.run_check('has-readme')
+        self.assertEqual(made.call_count, 1)
+        self.assertEqual({event['sessionId'] for event in self.logged()}, {'cccccccc-cccc-4ccc-8ccc-cccccccccccc'})
+
+    def test_a_failed_check_writes_events_and_keeps_exit_zero(self):
+        (self.work / 'README.md').write_text('no match\n')
+        result = self.run_check('has-todo')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events written: true', result.out)
+        self.assertEqual(self.logged()[-1]['data']['status'], 'failed')
+
+    def test_an_error_check_writes_events_and_keeps_exit_one(self):
+        result = self.run_check('bad-pattern')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Events written: true', result.out)
+        self.assertEqual((self.logged()[-1]['data']['status'], self.logged()[-1]['data']['evidence']), ('error', 'invalid_pattern'))
+
+    def test_a_self_reported_check_writes_nothing_and_says_why(self):
+        result = self.run_check('self')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Events written: false', result.out)
+        self.assertIn('Events error: not_run', result.out)
+        self.assertFalse((self.data / '_events').exists())
+        document = json.loads(self.run_check('self', '--json').out)
+        self.assertEqual((document['eventsWritten'], document['eventsError']), (False, 'not_run'))
+
+    @unittest.skipUnless(PYTHON, 'python3 is not on the PATH')
+    def test_a_script_check_writes_events(self):
+        result = self.run_check('script-a', '--consent', self.check_hash())
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn('Events written: true', result.out)
+        self.assertEqual(self.logged()[-1]['data']['runnerType'], 'script')
+
+    def test_a_check_that_was_refused_writes_nothing(self):
+        for argv in (('script-a',), ('script-a', '--consent', '0' * 64), ('no-such-check',)):
+            with self.subTest(argv=argv), self.refuse_processes():
+                result = self.run_check(*argv)
+                self.assertNotEqual(result.code, 0)
+                self.assertNotIn('Events written', result.out)
+        self.assertEqual(self.go('check', 'run', 'hello-module', 'has-readme', '--workspace', str(self.home)).code, 3)
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_a_full_log_is_named_and_the_exit_code_is_the_one_of_the_check(self):
+        self.fill_log(10)
+        passed = self.run_check('has-readme')
+        self.assertEqual(passed.code, 0)
+        self.assertIn('Status: passed', passed.out)
+        self.assertIn('Events written: false', passed.out)
+        self.assertIn('Events error: log_full', passed.out)
+        self.assertIn('log_full', passed.err)
+        failed = self.run_check('bad-pattern')
+        self.assertEqual(failed.code, 1)
+        self.assertIn('Events error: log_full', failed.out)
+
+    def test_a_log_fault_in_json(self):
+        self.fill_log(10)
+        result = self.run_check('has-readme', '--json')
+        document = json.loads(result.out)
+        self.assertEqual((result.code, document['eventsWritten'], document['eventsError'], document['result']['status']), (0, False, 'log_full', 'passed'))
+
+    def test_a_damaged_log(self):
+        (self.data / '_events').mkdir(mode=0o700)
+        (self.data / '_events' / 'events.jsonl').mkdir()
+        result = self.run_check('has-readme')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events error: log_damaged', result.out)
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can read any file')
+    def test_an_unreadable_log(self):
+        self.run_check('has-readme')
+        path = self.data / '_events' / 'events.jsonl'
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        result = self.run_check('has-readme')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events error: log_unavailable', result.out)
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can write anywhere')
+    def test_a_read_only_data_folder(self):
+        os.chmod(self.data, 0o500)
+        self.addCleanup(os.chmod, self.data, 0o700)
+        result = self.run_check('has-readme')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events error: log_unavailable', result.out)
+        self.assertIn('Status: passed', result.out)
+
+    def test_a_log_with_room_for_one_event_says_partial(self):
+        real = EventLog.append
+        calls = []
+
+        def second_fails(log, event, from_page=False):
+            calls.append(event['type'])
+            if len(calls) == 2:
+                raise EventLogError('x', 'log_full', 409)
+            return real(log, event, from_page)
+
+        with mock.patch.object(EventLog, 'append', second_fails):
+            result = self.run_check('has-readme')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events written: partial', result.out)
+        self.assertIn('Events error: log_full', result.out)
+        self.assertEqual([event['type'] for event in self.logged()], ['attempt_submitted'])
+
+    def test_the_text_of_a_log_fault_never_reaches_the_output(self):
+        with mock.patch.object(EventLog, 'append', side_effect=RuntimeError('/Users/someone/secret')):
+            result = self.run_check('has-readme')
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events written: partial', result.out)
+        self.assertIn('Events error: log_uncertain', result.out)
+        self.assertNotIn('Users', result.out + result.err)
+
+    def uncertain_failure(self):
+        return EventLogError('may be in the log', 'fsync_failed', details={'partialLine': False, 'maybeWritten': True})
+
+    def test_an_uncertain_write_says_may_or_may_not_be_saved_and_never_says_not_saved(self):
+        calls = []
+
+        def uncertain(log, event, from_page=False):
+            calls.append(event['type'])
+            raise self.uncertain_failure()
+
+        with mock.patch.object(EventLog, 'append', uncertain):
+            result = self.run_check('has-readme')
+        self.assertEqual(calls, ['attempt_submitted'])
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events written: partial', result.out)
+        self.assertIn('Events error: log_uncertain', result.out)
+        self.assertIn('may or may not be saved. Read your event log before you retry.', result.err)
+        self.assertNotIn('not saved', result.err.replace('may or may not be saved', ''))
+        self.assertIn('log_uncertain', result.err)
+
+    def test_a_definite_failure_says_not_saved(self):
+        self.fill_log(10)
+        self.assertIn('were not saved', self.run_check('has-readme').err)
+
+    def test_a_half_write_says_which_half(self):
+        real = EventLog.append
+        calls = []
+
+        def second_fails(log, event, from_page=False):
+            calls.append(event['type'])
+            if len(calls) == 2:
+                raise EventLogError('x', 'log_unavailable_test', 409)
+            return real(log, event, from_page)
+
+        with mock.patch.object(EventLog, 'append', second_fails):
+            result = self.run_check('has-readme')
+        self.assertIn('Only the first event was saved', result.err)
+
+    def test_a_run_that_did_not_start_leaves_the_error_output_empty(self):
+        result = self.run_check('self')
+        self.assertEqual(result.err, '')
+
+    def test_the_command_line_does_not_use_the_page_reserve(self):
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES + 1000) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        result = self.run_check('has-readme')
+        self.assertIn('Events written: true', result.out)
+
+    def test_events_are_appended_with_from_page_false(self):
+        seen = []
+        real = EventLog.append
+
+        def spy(log, event, from_page=False):
+            seen.append(from_page)
+            return real(log, event, from_page)
+
+        with mock.patch.object(EventLog, 'append', spy):
+            self.run_check('has-readme')
+        self.assertEqual(seen, [False, False])
+
+    # --- --strict-events ---
+
+    def test_without_the_flag_a_write_failure_keeps_the_old_exit_codes(self):
+        self.fill_log(10)
+        self.assertEqual(self.run_check('has-readme').code, 0)
+        self.assertEqual(self.run_check('bad-pattern').code, 1)
+
+    def test_with_the_flag_a_write_failure_exits_with_four(self):
+        self.fill_log(10)
+        for check_id in ('has-readme', 'bad-pattern'):
+            with self.subTest(check=check_id):
+                result = self.run_check(check_id, '--strict-events')
+                self.assertEqual(result.code, 4)
+                self.assertIn('Events error: log_full', result.out)
+        document = json.loads(self.run_check('has-readme', '--strict-events', '--json').out)
+        self.assertEqual((document['eventsWritten'], document['result']['status']), (False, 'passed'))
+        self.assertEqual(self.run_check('has-readme', '--strict-events', '--json').code, 4)
+
+    def test_with_the_flag_a_partial_or_uncertain_write_exits_with_four(self):
+        with mock.patch.object(EventLog, 'append', side_effect=self.uncertain_failure()):
+            self.assertEqual(self.run_check('has-readme', '--strict-events').code, 4)
+
+    def test_with_the_flag_a_task_that_is_missing_exits_with_four(self):
+        document = module_document(version='2.0.0')
+        template = document['tasks'][0]
+        document['tasks'] = [dict(template, id='task-a'), dict(template, id='task-b')]
+        self.lessons.import_files([('m2.json', json.dumps(document))])
+        self.assertEqual(self.run_check('has-readme', '--version', '2.0.0', '--strict-events').code, 4)
+        self.assertEqual(self.run_check('has-readme', '--version', '2.0.0').code, 0)
+
+    def test_with_the_flag_a_good_write_and_a_run_that_did_not_start_keep_their_codes(self):
+        self.assertEqual(self.run_check('has-readme', '--strict-events').code, 0)
+        self.assertEqual(self.run_check('bad-pattern', '--strict-events').code, 1)
+        result = self.run_check('self', '--strict-events')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Events error: not_run', result.out)
+
+    def test_the_flag_is_in_the_help_and_takes_no_value(self):
+        self.assertIn('--strict-events', self.go('check', 'run', '--help').out)
+        self.assertEqual(self.run_check('has-readme', '--strict-events=1').code, 2)
+        self.assertEqual(schola_cli.EXIT_EVENTS, 4)
+
+    def test_the_task_option_names_the_task(self):
+        document = module_document(version='2.0.0')
+        template = document['tasks'][0]
+        document['tasks'] = [dict(template, id='task-a'), dict(template, id='task-b')]
+        self.lessons.import_files([('m2.json', json.dumps(document))])
+        without = self.run_check('has-readme', '--version', '2.0.0')
+        self.assertEqual(without.code, 0)
+        self.assertIn('Events written: false', without.out)
+        self.assertIn('Events error: task_required', without.out)
+        self.assertFalse((self.data / '_events').exists())
+        named = self.run_check('has-readme', '--version', '2.0.0', '--task', 'task-b')
+        self.assertIn('Events written: true', named.out)
+        self.assertEqual({event['taskId'] for event in self.logged()}, {'task-b'})
+
+    def test_an_unknown_task_is_refused_before_the_check_runs(self):
+        with mock.patch.object(schola_cli.check_runner, 'run_traced', side_effect=AssertionError('the check ran')):
+            result = self.run_check('has-readme', '--task', 'no-such-task')
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: not_found', result.err)
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_the_help_names_the_task_option(self):
+        out = self.go('check', 'run', '--help').out
+        self.assertIn('--task', out)
+
+    def test_the_result_text_is_unchanged_apart_from_the_new_lines(self):
+        plain = self.run_check('has-readme').out
+        lines = plain.splitlines()
+        self.assertEqual(lines[0:3], ['Check: has-readme', 'Module: hello-module 1.0.0', 'Status: passed'])
+        self.assertEqual(lines[-1], 'Events written: true')
+
+    def test_a_run_changes_only_the_event_folder_of_the_data_folder(self):
+        before = tree(self.data)
+        self.run_check('has-readme')
+        after = tree(self.data)
+        changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+        self.assertTrue(all(key.startswith('_events') for key in changed), changed)
 
 
 @unittest.skipUnless(PYTHON and hasattr(os, 'openpty'), 'needs python3 and a pseudo terminal')
