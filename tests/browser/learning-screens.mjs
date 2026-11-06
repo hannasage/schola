@@ -147,8 +147,13 @@ export async function verifyEditsDuringStatusSave({page,server}) {
  await page.locator('[data-module="m02"]').click();
  await page.locator('[data-view=experiments]').click();
  await page.locator('#experiment-form [name=title]').fill('A draft preserved during status changes.');
+ // The draft saves on a 500 ms debounce. Run the page clock past it and wait for
+ // the save, so the record read below holds the draft on a slow machine too.
+ await page.clock.runFor(600);
+ await page.waitForFunction(()=>document.querySelector('#save-state').textContent==='Saved on this computer');
  await page.locator('[data-view=library]').click();
  const before=await (await fetch(`${server.url}/api/records/${id}`)).json();
+ assert.equal(before.draft.experiment?.title,'A draft preserved during status changes.','The draft must be saved before the status change starts.');
  const status=before.status==='active'?'paused':'active';
  let release,observed;
  const pending=new Promise(resolve=>{observed=resolve;});
