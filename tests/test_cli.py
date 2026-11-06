@@ -5,12 +5,15 @@ The tests that start a program use a free port. None of them touches the reposit
 """
 import ast
 import collections
+import errno
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import random
+import re
+import select
 import shutil
 import signal
 import socket
@@ -33,10 +36,9 @@ if str(ROOT) not in sys.path:
 
 import check_consent
 import check_routes
-import check_runner
 import schola_cli
 import server
-from event_log import EventLog
+from event_log import EventLog, EventLogError
 from lesson_store import LessonStore
 
 LAUNCHER = ROOT / 'schola'
@@ -126,12 +128,6 @@ def event(name='task-opened', **changes):
     return document
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
-
-
 FORBIDDEN_CATEGORIES = ('Cc', 'Cf', 'Cs', 'Co', 'Zl', 'Zp')
 
 
@@ -162,9 +158,14 @@ class CliCase(unittest.TestCase):
         self.lessons.import_files([('m.json', json.dumps(document))])
         return document
 
-    def go(self, *argv, stdin=None, env=None, out=None, data=True):
-        """Run the tool in this process. Returns the exit code and what it wrote."""
-        stdout, stderr = out if out is not None else FakeOut(), FakeOut()
+    def go(self, *argv, stdin=None, env=None, out=None, data=True, err_tty=None, err=None):
+        """Run the tool in this process. Returns the exit code and what it wrote.
+
+        The error output is a terminal when the standard input is one, as it is at a real keyboard. `err_tty` overrides that.
+        """
+        if err_tty is None:
+            err_tty = isinstance(stdin, FakeIn) and stdin.isatty()
+        stdout, stderr = out if out is not None else FakeOut(), err if err is not None else FakeOut(tty=err_tty)
         arguments = (['--data-dir', str(self.data)] if data else []) + list(argv)
         code = schola_cli.main(arguments, stdin=stdin if stdin is not None else NoRead(), stdout=stdout, stderr=stderr,
                                environ=dict(self.env if env is None else env))
@@ -237,6 +238,42 @@ class SafeTextTests(unittest.TestCase):
         shown = schola_cli.safe_text('a\ud800b\udfffc')
         shown.encode('utf-8')
         self.assertEqual(shown, 'a<U+D800>b<U+DFFF>c')
+
+    def test_look_alike_blanks_are_escaped(self):
+        for char in ('\u00a0', '\u2800', '\u17b4', '\u17b5'):
+            shown = schola_cli.safe_text('a' + char + 'b')
+            self.assertNotIn(char, shown)
+            self.assertIn('<U+%04X>' % ord(char), shown)
+
+    def test_one_or_two_combining_marks_stay(self):
+        self.assertEqual(schola_cli.safe_text('e\u0301'), 'e\u0301')
+        self.assertEqual(schola_cli.safe_text('e\u0301\u0302'), 'e\u0301\u0302')
+        self.assertEqual(schola_cli.safe_text('e\u0301\u0302x\u0301\u0302y'), 'e\u0301\u0302x\u0301\u0302y')
+
+    def test_a_long_run_of_combining_marks_is_cut_with_a_visible_note(self):
+        shown = schola_cli.safe_text('e' + '\u0301' * 10 + 'x')
+        self.assertEqual(shown, 'e\u0301\u0301<8 marks cut>x')
+        self.assertEqual(schola_cli.safe_text('e' + '\u0301' * 3), 'e\u0301\u0301<1 marks cut>')
+
+    def test_spacing_and_enclosing_marks_count_too(self):
+        self.assertEqual(schola_cli.safe_text('a' + '\u0903' * 4), 'a\u0903\u0903<2 marks cut>')
+        self.assertEqual(schola_cli.safe_text('a' + '\u0488' * 4), 'a\u0488\u0488<2 marks cut>')
+        self.assertEqual(schola_cli.safe_text('a\u0301\u0903\u0488\u0302'), 'a\u0301\u0903<2 marks cut>')
+
+    def test_each_run_of_marks_is_counted_on_its_own(self):
+        shown = schola_cli.safe_text('a' + '\u0301' * 4 + 'b' + '\u0302' * 5)
+        self.assertEqual(shown, 'a\u0301\u0301<2 marks cut>b\u0302\u0302<3 marks cut>')
+
+    def test_a_run_of_marks_of_100k_characters_takes_linear_time(self):
+        started = time.perf_counter()
+        shown = schola_cli.safe_text('e' + '\u0301' * 100_000 + 'x', 10 ** 9)
+        self.assertLess(time.perf_counter() - started, 3.0)
+        self.assertEqual(shown, 'e\u0301\u0301<99998 marks cut>x')
+
+    def test_marks_that_were_cut_count_toward_the_line_limit(self):
+        shown = schola_cli.safe_text('e' + '\u0301' * 50 + 'x' * 500, 20)
+        self.assertLessEqual(len(shown), 20 + 40)
+        self.assertIn('more characters', shown)
 
     def test_private_use_characters_are_escaped(self):
         self.assertEqual(schola_cli.safe_text('\ue000'), '<U+E000>')
@@ -326,6 +363,10 @@ class ScriptRowsTests(unittest.TestCase):
         rows = schola_cli.script_rows('\x00a\x01', width=3)
         self.assertEqual(''.join(row[7:] for row in rows), '<U+0000>a<U+0001>')
 
+    def test_a_script_shows_every_combining_mark_beyond_two_as_text(self):
+        rows = schola_cli.script_rows('e' + '\u0301' * 5)
+        self.assertEqual(rows, ['   1 | e\u0301\u0301<U+0301><U+0301><U+0301>'])
+
     def test_an_escape_is_not_split_across_two_rows(self):
         rows = schola_cli.script_rows('\x00' * 30, width=20)
         for row in rows:
@@ -341,6 +382,21 @@ class ScriptRowsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # The data folder, the parser, and the shape of the program
 # ---------------------------------------------------------------------------
+
+class FolderIdentityTests(CliCase):
+    def test_the_identity_is_the_device_and_the_inode(self):
+        info = os.stat(self.work)
+        self.assertEqual(schola_cli.folder_identity(str(self.work)), (info.st_dev, info.st_ino))
+
+    def test_a_folder_that_is_gone_has_no_identity(self):
+        self.assertIsNone(schola_cli.folder_identity(str(self.home / 'gone')))
+
+    def test_a_folder_replaced_at_the_same_path_has_another_identity(self):
+        before = schola_cli.folder_identity(str(self.work))
+        self.work.rename(self.home / 'work-moved')
+        self.work.mkdir()
+        self.assertNotEqual(schola_cli.folder_identity(str(self.work)), before)
+
 
 class DataFolderTests(CliCase):
     def test_the_flag_wins_over_the_environment(self):
@@ -477,6 +533,24 @@ class ParserTests(CliCase):
         self.assertSafe(result.err)
         self.assertIn('<U+001B>', result.err)
 
+    def test_an_unrecognized_argument_prints_the_usage_of_the_subcommand(self):
+        for argv, usage in ((['modules', '--nope'], 'usage: schola modules'), (['check', 'show', 'a', 'b', 'c'], 'usage: schola check show'),
+                            (['events', 'list', '--nope'], 'usage: schola events list'), (['version', 'x'], 'usage: schola version')):
+            result = self.go(*argv)
+            self.assertEqual(result.code, 2, argv)
+            self.assertTrue(result.err.startswith(usage), (argv, result.err))
+            self.assertIn('unrecognized arguments', result.err)
+
+    def test_a_missing_value_prints_the_usage_of_the_subcommand(self):
+        result = self.go('check', 'run', 'hello-module', 'script-a')
+        self.assertEqual(result.code, 2)
+        self.assertTrue(result.err.startswith('usage: schola check run'), result.err)
+
+    def test_version_flag_prints_the_version_and_exits_zero(self):
+        for argv in (['--version'], ['--version', 'modules']):
+            result = self.go(*argv, data=False)
+            self.assertEqual((result.code, result.out, result.err), (0, 'schola 0.1.0\n', ''), argv)
+
     def test_a_flag_that_takes_no_value_refuses_one(self):
         self.assertEqual(self.go('events', 'delete', '--confirm=yes').code, 2)
 
@@ -519,6 +593,11 @@ class ShapeTests(unittest.TestCase):
                 else:
                     self.assertIn(root, sys.stdlib_module_names if hasattr(sys, 'stdlib_module_names') else {root}, name)
 
+    def test_only_public_names_of_the_engine_are_used(self):
+        for name in ('schola_cli.py', '../tests/test_cli.py'):
+            text = (ROOT / name.replace('../', '')).read_text(encoding='utf-8')
+            self.assertEqual(re.findall(r'(?:check_routes|check_runner|check_consent|check_script|server|event_log)\._[a-z]\w*', text), [], name)
+
     def test_the_module_keeps_no_mutable_global_state(self):
         for node in ast.parse(self.source()).body:
             if isinstance(node, ast.Assign):
@@ -530,16 +609,109 @@ class ShapeTests(unittest.TestCase):
 
 
 class OutputFaultTests(CliCase):
-    def test_an_output_that_closes_early_is_exit_one_and_not_a_traceback(self):
+    def broken(self, error, where='write'):
+        class Out(FakeOut):
+            pass
+
+        def fail(self, *args):
+            raise error
+
+        setattr(Out, where, fail)
+        return Out()
+
+    def test_an_output_that_closes_early_is_exit_one_and_silent(self):
         self.import_module()
+        result = self.go('modules', out=self.broken(BrokenPipeError()))
+        self.assertEqual((result.code, result.err), (1, ''))
 
-        class Closed(FakeOut):
-            def write(self, text):
-                raise BrokenPipeError()
+    def test_a_write_that_fails_is_an_output_fault_and_never_a_data_folder_fault(self):
+        self.import_module()
+        for error in (OSError(errno.ENOSPC, 'No space left on device'), OSError(errno.EBADF, 'Bad file descriptor'), ValueError('I/O operation on closed file.'),
+                      OSError(errno.EIO, 'input output error')):
+            result = self.go('modules', out=self.broken(error))
+            self.assertEqual(result.code, 1, error)
+            self.assertIn('code: output_unwritable', result.err)
+            self.assertNotIn('storage_unavailable', result.err)
+            self.assertNotIn('Traceback', result.err)
+            self.assertNotIn('No space', result.err)
 
-        result = self.go('modules', out=Closed())
+    def test_a_flush_that_fails_at_the_end_is_an_output_fault(self):
+        result = self.go('version', out=self.broken(OSError(errno.ENOSPC, 'No space left on device'), where='flush'))
         self.assertEqual(result.code, 1)
-        self.assertNotIn('Traceback', result.err)
+        self.assertIn('code: output_unwritable', result.err)
+
+    def test_a_broken_pipe_at_the_flush_is_exit_one_and_silent(self):
+        result = self.go('version', out=self.broken(BrokenPipeError(), where='flush'))
+        self.assertEqual((result.code, result.err), (1, ''))
+
+    def test_every_command_that_cannot_write_fails_the_same_way(self):
+        self.import_module()
+        EventLog(self.data).append(event())
+        for argv in (['version'], ['modules'], ['module', 'show', 'hello-module'], ['check', 'show', 'hello-module', 'script-a'],
+                     ['check', 'run', 'hello-module', 'has-readme', '--workspace', str(self.work)], ['events', 'list'], ['events', 'export'],
+                     ['events', 'delete']):
+            result = self.go(*argv, out=self.broken(OSError(errno.ENOSPC, 'No space left on device')))
+            self.assertEqual(result.code, 1 if argv[:2] != ['events', 'delete'] else 3, argv)
+
+    def test_a_refusal_whose_output_then_fails_to_flush_is_exit_one(self):
+        result = self.go('events', 'delete', out=self.broken(OSError(errno.ENOSPC, 'No space left on device'), where='flush'))
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: output_unwritable', result.err)
+
+    def test_help_and_version_with_a_dead_output_are_exit_one(self):
+        for argv in (['--help'], ['--version'], ['modules', '--help']):
+            for error in (OSError(errno.EBADF, 'Bad file descriptor'), BrokenPipeError()):
+                result = self.go(*argv, out=self.broken(error), data=False)
+                self.assertEqual(result.code, 1, (argv, error))
+
+    def test_a_byte_output_that_fails_is_an_output_fault(self):
+        EventLog(self.data).append(event())
+
+        class BadBuffer:
+            def write(self, data):
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+            def flush(self):
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+        class Out(FakeOut):
+            buffer = BadBuffer()
+
+        result = self.go('events', 'export', out=Out())
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: output_unwritable', result.err)
+        self.assertNotIn('storage_unavailable', result.err)
+
+    def test_a_missing_standard_output_is_exit_one(self):
+        errors = FakeOut()
+        with mock.patch.object(sys, 'stdout', None):
+            code = schola_cli.main(['version'], stdin=NoRead(), stderr=errors, environ={'HOME': str(self.home)})
+        self.assertEqual(code, 1)
+        self.assertIn('code: output_unwritable', errors.getvalue())
+
+    def test_missing_standard_output_and_error_output_are_exit_one_with_no_fault(self):
+        with mock.patch.object(sys, 'stdout', None), mock.patch.object(sys, 'stderr', None):
+            self.assertEqual(schola_cli.main(['version'], stdin=NoRead(), environ={'HOME': str(self.home)}), 1)
+            self.assertEqual(schola_cli.main(['nonsense'], stdin=NoRead(), environ={'HOME': str(self.home)}), 2)
+
+    def test_a_missing_standard_input_is_not_a_terminal(self):
+        self.import_module()
+        errors = FakeOut()
+        with self.refuse_processes(), mock.patch.object(sys, 'stdin', None):
+            code = schola_cli.main(['check', 'run', 'hello-module', 'script-a', '--workspace', str(self.work), '--data-dir', str(self.data)],
+                                   stdout=FakeOut(), stderr=errors, environ={'HOME': str(self.home)})
+        self.assertEqual(code, 3)
+        self.assertIn('code: consent_required', errors.getvalue())
+
+    def test_a_usage_error_with_a_dead_error_output_is_still_exit_two(self):
+        result = self.go('nonsense', err=self.broken(OSError(errno.EBADF, 'Bad file descriptor')), data=False)
+        self.assertEqual(result.code, 2)
+
+    def test_a_failure_report_with_a_dead_error_output_keeps_its_exit_code(self):
+        result = self.go('module', 'show', 'nope', err=self.broken(OSError(errno.EBADF, 'Bad file descriptor')))
+        self.assertEqual(result.code, 1)
+        refused = self.go('events', 'delete', err=self.broken(OSError(errno.EBADF, 'Bad file descriptor')))
+        self.assertEqual(refused.code, 3)
 
     def test_control_c_during_a_command_is_exit_one(self):
         with mock.patch.object(LessonStore, 'list_modules', side_effect=KeyboardInterrupt()):
@@ -634,6 +806,38 @@ class HubTests(CliCase):
             self.assertEqual(result.code, 0)
             self.assertIn('Open the address yourself', result.out)
 
+    def test_an_os_error_from_the_bind_is_a_hub_fault(self):
+        def fake(port, data_dir, announce):
+            error = OSError(errno.EADDRINUSE, 'Address already in use')
+            error.hub_phase = 'bind'
+            raise error
+
+        with mock.patch.object(server, 'run_server', fake):
+            result = self.go('hub')
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: hub_unavailable', result.err)
+
+    def test_an_os_error_after_the_bind_is_not_reported_as_a_port_fault(self):
+        with mock.patch.object(server, 'run_server', side_effect=OSError(errno.EIO, 'input output error')):
+            result = self.go('hub')
+        self.assertEqual(result.code, 1)
+        self.assertNotIn('hub_unavailable', result.err)
+        self.assertNotIn('port', result.err)
+
+    def test_a_failed_write_of_the_address_is_an_output_fault_and_not_a_port_fault(self):
+        def fake(port, data_dir, announce):
+            announce(f'http://127.0.0.1:{port}')
+
+        class Broken(FakeOut):
+            def write(self, text):
+                raise OSError(errno.EBADF, 'Bad file descriptor')
+
+        with mock.patch.object(server, 'run_server', fake):
+            result = self.go('hub', out=Broken())
+        self.assertEqual(result.code, 1)
+        self.assertIn('code: output_unwritable', result.err)
+        self.assertNotIn('hub_unavailable', result.err)
+
     def test_a_closed_output_is_not_reported_as_a_port_problem(self):
         with mock.patch.object(server, 'run_server', side_effect=BrokenPipeError()):
             result = self.go('hub')
@@ -687,12 +891,69 @@ class ModulesTests(CliCase):
         self.assertEqual((result.code, result.err), (0, ''))
         self.assertIn('No modules are imported yet', result.out)
 
-    def test_a_data_folder_that_does_not_exist_is_empty_and_is_not_created(self):
+    def missing_cases(self):
+        self.import_module()
+        return (['modules'], ['module', 'show', 'hello-module'], ['check', 'show', 'hello-module', 'script-a'],
+                ['check', 'run', 'hello-module', 'has-readme', '--workspace', str(self.work)],
+                ['events', 'list'], ['events', 'export'], ['events', 'delete', '--confirm'])
+
+    def test_a_data_folder_from_the_flag_that_does_not_exist_is_an_error_for_every_reading_command(self):
         missing = self.base / 'nothing-here'
-        result = self.go('modules', '--data-dir', str(missing), data=False)
-        self.assertEqual(result.code, 0)
-        self.assertIn('No modules are imported yet', result.out)
+        for argv in self.missing_cases():
+            result = self.go(*argv, '--data-dir', str(missing), data=False)
+            self.assertEqual(result.code, 1, argv)
+            self.assertIn('code: data_dir_missing', result.err)
+            self.assertIn('from --data-dir', result.err)
+            self.assertEqual(result.out, '')
+            self.assertNotIn(str(missing), result.err)
         self.assertFalse(missing.exists())
+
+    def test_a_data_folder_from_the_environment_that_does_not_exist_is_an_error_that_names_the_variable(self):
+        missing = self.base / 'nothing-here'
+        env = {'HOME': str(self.home), 'SCHOLA_DATA_DIR': str(missing)}
+        for argv in self.missing_cases():
+            result = self.go(*argv, env=env, data=False)
+            self.assertEqual(result.code, 1, argv)
+            self.assertIn('code: data_dir_missing', result.err)
+            self.assertIn('from SCHOLA_DATA_DIR', result.err)
+        self.assertFalse(missing.exists())
+
+    def test_the_default_data_folder_may_be_missing_on_a_fresh_install(self):
+        fresh = self.base / 'fresh-install'
+        fresh.mkdir()
+        with mock.patch.object(schola_cli, 'ROOT', fresh):
+            listed = self.go('modules', data=False)
+            events = self.go('events', 'list', data=False)
+        self.assertEqual((listed.code, events.code), (0, 0))
+        self.assertIn('No modules are imported yet', listed.out)
+        self.assertIn('There is no event log yet', events.out)
+        self.assertEqual(list(fresh.iterdir()), [])
+
+    def test_an_empty_environment_value_counts_as_the_default_folder(self):
+        fresh = self.base / 'fresh-install'
+        fresh.mkdir()
+        with mock.patch.object(schola_cli, 'ROOT', fresh):
+            result = self.go('modules', env={'HOME': str(self.home), 'SCHOLA_DATA_DIR': ''}, data=False)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(schola_cli.data_dir_source(None, {'SCHOLA_DATA_DIR': ''}), 'default')
+        self.assertEqual(schola_cli.data_dir_source(None, {'SCHOLA_DATA_DIR': 'x'}), 'env')
+        self.assertEqual(schola_cli.data_dir_source('x', {'SCHOLA_DATA_DIR': 'y'}), 'flag')
+        self.assertEqual(schola_cli.data_dir_source(None, {}), 'default')
+
+    def test_a_data_folder_that_is_a_file_is_an_error_for_every_reading_command(self):
+        not_a_folder = self.base / 'a-file'
+        not_a_folder.write_text('x')
+        for argv in self.missing_cases():
+            result = self.go(*argv, '--data-dir', str(not_a_folder), data=False)
+            self.assertEqual(result.code, 1, argv)
+            self.assertIn('code: data_dir_not_a_folder', result.err)
+        self.assertEqual(not_a_folder.read_text(), 'x')
+
+    def test_an_empty_data_folder_from_the_flag_is_fine(self):
+        empty = self.base / 'empty'
+        empty.mkdir()
+        self.assertEqual(self.go('modules', '--data-dir', str(empty), data=False).code, 0)
+        self.assertEqual(self.go('events', 'list', '--data-dir', str(empty), data=False).code, 0)
 
     def test_the_list_command_writes_nothing(self):
         self.import_module()
@@ -715,7 +976,8 @@ class ModulesTests(CliCase):
         result = self.go('modules', '--json')
         document = json.loads(result.out)
         self.assertEqual(set(document), {'modules'})
-        self.assertEqual(set(document['modules'][0]), {'id', 'version', 'title', 'tasks', 'checks', 'versions', 'newerVersionAvailable'})
+        self.assertEqual(set(document['modules'][0]), {'id', 'version', 'title', 'tasks', 'checks', 'versions', 'newerVersionAvailable', 'pinned'})
+        self.assertIs(document['modules'][0]['pinned'], True)
         self.assertEqual(document['modules'][0]['tasks'], 1)
         self.assertEqual(document['modules'][0]['checks'], 7)
         self.assertEqual(result.out.count('\n'), result.out.rstrip('\n').count('\n') + 1)
@@ -731,6 +993,35 @@ class ModulesTests(CliCase):
         self.assertEqual(document['newerVersionAvailable'], '1.1.0')
         self.assertEqual(document['versions'], ['1.0.0', '1.1.0'])
         self.assertIn('1.1.0 is newer', self.go('modules').out)
+
+    def unpin(self):
+        (self.data / '_lessons' / 'pins.json').unlink()
+
+    def test_with_no_pin_the_tool_refuses_like_the_hub_and_does_not_pick_the_newest_version(self):
+        self.import_module()
+        self.import_module(version='1.1.0')
+        self.unpin()
+        for argv in (['module', 'show', 'hello-module'], ['check', 'show', 'hello-module', 'script-a'],
+                     ['check', 'run', 'hello-module', 'has-readme', '--workspace', str(self.work)]):
+            result = self.go(*argv)
+            self.assertEqual(result.code, 1, argv)
+            self.assertIn('code: not_found', result.err)
+            self.assertIn('not pinned', result.err)
+
+    def test_with_no_pin_a_named_version_still_works(self):
+        self.import_module()
+        self.unpin()
+        self.assertEqual(self.go('module', 'show', 'hello-module', '--version', '1.0.0').code, 0)
+        self.assertEqual(self.go('check', 'show', 'hello-module', 'script-a', '--version', '1.0.0').code, 0)
+
+    def test_the_list_marks_a_module_that_has_no_pin(self):
+        self.import_module()
+        self.unpin()
+        document = json.loads(self.go('modules', '--json').out)['modules'][0]
+        self.assertIs(document['pinned'], False)
+        self.assertEqual(document['version'], '1.0.0')
+        self.assertIn('(not pinned)', self.go('modules').out)
+        self.assertNotIn('(not pinned)', self.go('modules', '--json').out)
 
     def test_an_unexpected_fault_is_exit_one_with_a_fixed_message_and_no_detail(self):
         with mock.patch.object(LessonStore, 'list_modules', side_effect=RuntimeError('secret detail /private/path')):
@@ -807,6 +1098,7 @@ class ModulesTests(CliCase):
         folder.mkdir(parents=True)
         (folder / 'module.json').write_bytes(raw)
         (folder / 'source.json').write_text(json.dumps({'sha256': hashlib.sha256(raw).hexdigest()}))
+        (self.data / '_lessons' / 'pins.json').write_text(json.dumps({'version': 1, 'revision': 1, 'pins': {'evil-module': '1.0.0'}}))
         return document
 
     def test_hostile_text_in_every_field_cannot_reach_the_terminal(self):
@@ -841,7 +1133,7 @@ class ModulesTests(CliCase):
         self.assertEqual(result.code, 3)
         self.assertSafe(result.out)
         self.assertSafe(result.err)
-        self.assertIn('  1: <U+001B>[2J', result.out)
+        self.assertIn('  1: <U+001B>[2J', result.err)
 
     def test_a_unicode_module_title_is_shown_as_it_is(self):
         document = module_document()
@@ -906,6 +1198,20 @@ class CheckShowTests(CliCase):
         self.assertIn('Runner: none', result.out)
         self.assertIn('Needs consent: no', result.out)
 
+    def test_the_real_path_is_shown_and_the_typed_path_too_when_it_differs(self):
+        link = self.home / 'link'
+        link.symlink_to(self.work)
+        text = self.go('check', 'show', 'hello-module', 'script-a', '--workspace', str(link)).out.splitlines()
+        self.assertIn(f'Workspace: {self.work}', text)
+        self.assertIn(f'Typed as: {link}', text)
+        document = json.loads(self.go('check', 'show', 'hello-module', 'script-a', '--workspace', str(link), '--json').out)
+        self.assertEqual((document['workspace'], document['workspaceTyped']), (str(self.work), str(link)))
+
+    def test_the_typed_path_is_not_repeated_when_it_is_the_real_path(self):
+        text = self.go('check', 'show', 'hello-module', 'script-a', '--workspace', str(self.work)).out
+        self.assertIn(f'Workspace: {self.work}', text.splitlines())
+        self.assertNotIn('Typed as', text)
+
     def test_a_workspace_name_with_hidden_characters_is_shown_escaped(self):
         folder = self.home / 'wo\u202erk\u200b'
         folder.mkdir()
@@ -922,7 +1228,7 @@ class CheckShowTests(CliCase):
     def test_json_has_stable_keys(self):
         document = json.loads(self.go('check', 'show', 'hello-module', 'script-a', '--json', '--workspace', str(self.work)).out)
         self.assertEqual(set(document), {'moduleId', 'version', 'checkId', 'kind', 'runnerType', 'description', 'needsConsent', 'checkHash', 'runtime',
-                                         'source', 'args', 'timeoutSeconds', 'workspace', 'limits', 'limitsNotApplied', 'runner'})
+                                         'source', 'args', 'timeoutSeconds', 'workspace', 'workspaceTyped', 'limits', 'limitsNotApplied', 'runner'})
         self.assertEqual(document['checkHash'], self.check_hash())
         self.assertEqual(document['source'], SOURCE)
         self.assertIs(document['needsConsent'], True)
@@ -930,12 +1236,13 @@ class CheckShowTests(CliCase):
         self.assertEqual(document['timeoutSeconds'], 30)
         plain = json.loads(self.go('check', 'show', 'hello-module', 'has-readme', '--json').out)
         self.assertIsNone(plain['workspace'])
+        self.assertIsNone(plain['workspaceTyped'])
         self.assertIsNone(plain['source'])
         self.assertIs(plain['needsConsent'], False)
 
     def test_the_hash_is_the_hash_the_hub_shows(self):
         check = next(c for c in self.lessons.get_module('hello-module', '1.0.0')['checks'] if c['id'] == 'script-a')
-        shown = check_routes._shown(check, None, check_consent.check_hash(check))
+        shown = check_routes.describe_check(check, None, check_consent.check_hash(check))
         document = json.loads(self.go('check', 'show', 'hello-module', 'script-a', '--json').out)
         for key in ('checkHash', 'needsConsent', 'runnerType', 'runtime', 'source', 'args', 'timeoutSeconds', 'limits', 'limitsNotApplied'):
             self.assertEqual(document[key], shown[key], key)
@@ -991,10 +1298,21 @@ class CheckRunTests(CliCase):
         self.assertEqual(result.code, 1)
         self.assertIn('Status: error', result.out)
 
-    def test_a_self_reported_check_is_skipped_and_exit_zero(self):
+    def test_a_self_reported_check_is_skipped_and_exit_one(self):
         result = self.run_check('self')
-        self.assertEqual(result.code, 0)
+        self.assertEqual(result.code, 1)
         self.assertIn('Status: skipped', result.out)
+
+    def test_each_status_has_its_exit_code(self):
+        expected = {'passed': 0, 'failed': 0, 'error': 1, 'skipped': 1}
+        for status, code in expected.items():
+            with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': status, 'evidence': {}, 'log': []}):
+                self.assertEqual(self.run_check('has-readme').code, code, status)
+                self.assertEqual(self.run_check('has-readme', '--json').code, code, status)
+
+    def test_a_status_that_is_not_known_is_exit_one(self):
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'maybe', 'evidence': {}, 'log': []}):
+            self.assertEqual(self.run_check('has-readme').code, 1)
 
     def test_json_output_is_one_document_with_stable_keys(self):
         result = self.run_check('has-readme', '--json')
@@ -1045,6 +1363,48 @@ class CheckRunTests(CliCase):
                 result = self.run_check('has-readme', *extra)
                 self.assertEqual(result.code, 0, result.err)
                 self.assertSafe(result.out)
+
+    def test_text_output_says_where_it_cut_and_json_stays_complete(self):
+        evidence = {f'k{n:02d}': n for n in range(50)}
+        outcome = {'status': 'passed', 'evidence': evidence, 'log': [f'line {n}' for n in range(45)]}
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+            text = self.run_check('has-readme').out.splitlines()
+            document = json.loads(self.run_check('has-readme', '--json').out)
+        self.assertIn('  k39: 39', text)
+        self.assertNotIn('  k40: 40', text)
+        self.assertIn('  ...[10 more]', text)
+        self.assertIn('  line 39', text)
+        self.assertNotIn('  line 40', text)
+        self.assertIn('  ...[5 more]', text)
+        self.assertEqual(len(document['result']['evidence']), 50)
+        self.assertEqual(len(document['result']['log']), 45)
+
+    def test_no_note_is_printed_when_nothing_was_cut(self):
+        outcome = {'status': 'passed', 'evidence': {f'k{n:02d}': n for n in range(40)}, 'log': [f'line {n}' for n in range(40)]}
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+            text = self.run_check('has-readme').out
+        self.assertNotIn('more]', text)
+
+    def test_a_long_list_value_says_how_many_items_are_left(self):
+        outcome = {'status': 'passed', 'evidence': {'items': list(range(30)), 'few': [1, 2]}, 'log': []}
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+            text = self.run_check('has-readme').out.splitlines()
+        self.assertIn('  items: ' + ', '.join(str(n) for n in range(20)) + ', ...[10 more]', text)
+        self.assertIn('  few: 1, 2', text)
+
+    def test_a_list_of_exactly_the_limit_has_no_note(self):
+        outcome = {'status': 'passed', 'evidence': {'items': list(range(20))}, 'log': []}
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+            text = self.run_check('has-readme').out.splitlines()
+        self.assertIn('  items: ' + ', '.join(str(n) for n in range(20)), text)
+
+    def test_a_nested_object_shows_its_size_and_not_its_content(self):
+        outcome = {'status': 'passed', 'evidence': {'one': {'a': 1}, 'two': {'a': 1, 'b': 2}, 'none': {}}, 'log': []}
+        with mock.patch.object(schola_cli.check_runner, 'run', return_value=outcome):
+            text = self.run_check('has-readme').out.splitlines()
+        self.assertIn('  one: <object with 1 entry>', text)
+        self.assertIn('  two: <object with 2 entries>', text)
+        self.assertIn('  none: <object with 0 entries>', text)
 
     def test_hostile_text_that_looks_like_output_cannot_add_a_line(self):
         hostile = {'status': 'passed', 'evidence': {'note': 'x\nStatus: passed\nConsent given.'}, 'log': ['a\nStatus: failed']}
@@ -1228,6 +1588,94 @@ class CheckRunTests(CliCase):
         self.assertEqual(result.code, 0)
         self.assertIn('needs no consent', result.err)
 
+    # --- the workspace after the question ---
+
+    def swapping_input(self, action, text=None):
+        class Swapping(FakeIn):
+            def readline(self, size=-1):
+                action()
+                return super().readline(size)
+
+        return Swapping(self.check_hash()[:8] + '\n' if text is None else text, tty=True)
+
+    def test_a_link_that_is_repointed_during_the_question_stops_the_run(self):
+        second = self.home / 'second'
+        second.mkdir()
+        link = self.home / 'link'
+        link.symlink_to(self.work)
+
+        def swap():
+            link.unlink()
+            link.symlink_to(second)
+
+        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+            result = self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), stdin=self.swapping_input(swap))
+        self.assertEqual(result.code, 3)
+        self.assertIn('code: workspace_changed', result.err)
+        self.assertEqual(result.out, '')
+        self.assertIn(f'Workspace: {self.work}', result.err.splitlines())
+        self.assertIn(f'Typed as: {link}', result.err.splitlines())
+
+    def test_a_folder_that_is_replaced_in_place_during_the_question_stops_the_run(self):
+        def swap():
+            self.work.rename(self.home / 'work-moved')
+            self.work.mkdir()
+
+        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+            result = self.run_check('script-a', stdin=self.swapping_input(swap))
+        self.assertEqual(result.code, 3)
+        self.assertIn('code: workspace_changed', result.err)
+
+    def test_a_folder_that_disappears_during_the_question_stops_the_run(self):
+        def swap():
+            shutil.rmtree(self.work)
+
+        with mock.patch.object(schola_cli.check_runner, 'run', side_effect=AssertionError('the runner was called')):
+            result = self.run_check('script-a', stdin=self.swapping_input(swap))
+        self.assertEqual(result.code, 3)
+        self.assertIn('code: invalid_workspace', result.err)
+
+    @unittest.skipUnless(PYTHON, 'python3 is not on the PATH')
+    def test_a_workspace_that_stays_the_same_runs_in_its_real_path(self):
+        link = self.home / 'link'
+        link.symlink_to(self.work)
+        seen = []
+        real = schola_cli.check_runner.run
+
+        def spy(check, workspace, *args, **kwargs):
+            seen.append(workspace)
+            return real(check, workspace, *args, **kwargs)
+
+        with mock.patch.object(schola_cli.check_runner, 'run', spy):
+            result = self.go('check', 'run', 'hello-module', 'script-a', '--workspace', str(link), stdin=self.swapping_input(lambda: None))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(seen, [str(self.work)])
+
+    def test_the_workspace_is_checked_again_when_the_hash_came_on_the_command_line(self):
+        calls = []
+        original = schola_cli.passed_workspace
+
+        def spy(ctx, path):
+            calls.append(path)
+            return original(ctx, path)
+
+        with mock.patch.object(schola_cli, 'passed_workspace', spy), mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}):
+            result = self.run_check('script-a', '--consent', self.check_hash())
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_check_that_runs_no_script_also_checks_the_workspace_again(self):
+        calls = []
+        original = schola_cli.passed_workspace
+
+        def spy(ctx, path):
+            calls.append(path)
+            return original(ctx, path)
+
+        with mock.patch.object(schola_cli, 'passed_workspace', spy):
+            self.run_check('has-readme')
+        self.assertEqual(len(calls), 2)
+
     # --- the terminal prompt ---
 
     @unittest.skipUnless(PYTHON, 'python3 is not on the PATH')
@@ -1236,13 +1684,48 @@ class CheckRunTests(CliCase):
         result = self.run_check('script-a', stdin=FakeIn(digest[:8] + '\n', tty=True))
         self.assertEqual(result.code, 0, result.err)
         self.assertIn('Status: passed', result.out)
-        self.assertIn(digest, result.out)  # the full hash is shown, not the short one
-        self.assertIn('   1 | print("hello from a script")', result.out)
-        self.assertIn('first 8 characters', result.out)
-        self.assertIn('This is consent, not a sandbox.', result.out.split('Status: passed')[0])
-        self.assertIn(f'Workspace: {self.work}', result.out.splitlines())
-        self.assertIn('Check: script-a', result.out.splitlines())
-        self.assertLess(result.out.index('1 | print'), result.out.index('Status: passed'))
+        self.assertIn(digest, result.err)  # the full hash is shown, not the short one
+        self.assertIn('   1 | print("hello from a script")', result.err)
+        self.assertIn('first 8 characters', result.err)
+        self.assertIn('This is consent, not a sandbox.', result.err)
+        self.assertIn(f'Workspace: {self.work}', result.err.splitlines())
+        self.assertIn('Check: script-a', result.err.splitlines())
+
+    def test_the_question_goes_to_the_error_output_and_never_to_standard_output(self):
+        digest = self.check_hash()
+        with self.refuse_processes():
+            result = self.run_check('script-a', stdin=FakeIn('0' * 8 + '\n', tty=True))
+        self.assertEqual(result.out, '')
+        for text in ('first 8 characters', digest, 'print("hello', 'This is consent'):
+            self.assertIn(text, result.err)
+
+    @unittest.skipUnless(PYTHON, 'python3 is not on the PATH')
+    def test_json_output_carries_no_prompt_text(self):
+        digest = self.check_hash()
+        result = self.run_check('script-a', '--json', stdin=FakeIn(digest[:8] + '\n', tty=True))
+        self.assertEqual(result.code, 0, result.err)
+        document = json.loads(result.out)
+        self.assertEqual(document['result']['status'], 'passed')
+        for text in ('first 8 characters', 'Read the script before you agree.', 'To agree, type'):
+            self.assertNotIn(text, result.out)
+        self.assertIn('first 8 characters', result.err)
+
+    def test_a_keyboard_on_input_alone_is_not_enough_to_ask(self):
+        digest = self.check_hash()
+        with self.refuse_processes():
+            result = self.run_check('script-a', stdin=FakeIn(digest[:8] + '\n', tty=True), err_tty=False)
+        self.assertEqual(result.code, 3)
+        self.assertIn('code: consent_required', result.err)
+        self.assertIn('--consent', result.err)
+        self.assertNotIn('first 8 characters', result.err)
+        self.assertEqual(result.out, '')
+
+    def test_a_terminal_on_the_error_output_alone_is_not_enough_to_ask(self):
+        with self.refuse_processes():
+            result = self.run_check('script-a', stdin=FakeIn(self.check_hash()[:8] + '\n', tty=False), err_tty=True)
+        self.assertEqual(result.code, 3)
+        self.assertIn('code: consent_required', result.err)
+        self.assertNotIn('first 8 characters', result.err)
 
     def test_on_a_terminal_a_wrong_answer_is_refused_and_nothing_starts(self):
         digest = self.check_hash()
@@ -1290,9 +1773,9 @@ class CheckRunTests(CliCase):
         self.assertEqual(result.code, 3)
         self.assertSafe(result.out)
         self.assertSafe(result.err)
-        self.assertIn('<U+001B>', result.out)
-        self.assertIn('<U+202E>', result.out)
-        self.assertIn(digest, result.out)
+        self.assertIn('<U+001B>', result.err)
+        self.assertIn('<U+202E>', result.err)
+        self.assertIn(digest, result.err)
 
     def test_a_script_too_long_for_the_screen_cannot_be_agreed_to_by_typing(self):
         source = ''.join(f'value_{n} = {n}\n' for n in range(400))
@@ -1302,11 +1785,11 @@ class CheckRunTests(CliCase):
             result = self.go('check', 'run', 'hello-module', 'script-a', '--version', '1.3.0', '--workspace', str(self.work), stdin=FakeIn(digest[:8] + '\n', tty=True))
         self.assertEqual(result.code, 3)
         self.assertIn('code: consent_required', result.err)
-        self.assertIn('value_0 = 0', result.out)
-        self.assertNotIn('value_399', result.out)
+        self.assertIn('value_0 = 0', result.err)
+        self.assertNotIn('value_399', result.err)
         shown = ''.join(f'value_{n} = {n}\n' for n in range(400))
-        hidden = len(source.encode()) - sum(len(line.encode()) + 1 for line in shown.split('\n')[:self.shown_lines(result.out)])
-        self.assertIn(f'{hidden} bytes of the script are not shown', result.out + result.err)
+        hidden = len(source.encode()) - sum(len(line.encode()) + 1 for line in shown.split('\n')[:self.shown_lines(result.err)])
+        self.assertIn(f'{hidden} bytes of the script are not shown', result.err)
         self.assertIn('check show', result.err)
 
     def shown_lines(self, text):
@@ -1327,7 +1810,7 @@ class CheckRunTests(CliCase):
         with self.refuse_processes():
             result = self.go('check', 'run', 'hello-module', 'script-a', '--version', '1.4.0', '--workspace', str(self.work), stdin=FakeIn('0' * 8 + '\n', tty=True))
         self.assertIn('code: consent_declined', result.err)
-        self.assertNotIn('not shown', result.out + result.err)
+        self.assertNotIn('not shown', result.err)
 
     def test_one_line_over_the_screen_cap_hides_it_and_counts_it(self):
         lines = schola_cli.PROMPT_ROWS + 1
@@ -1336,7 +1819,7 @@ class CheckRunTests(CliCase):
         with self.refuse_processes():
             result = self.go('check', 'run', 'hello-module', 'script-a', '--version', '1.4.0', '--workspace', str(self.work), stdin=FakeIn('0' * 8 + '\n', tty=True))
         self.assertIn('code: consent_required', result.err)
-        self.assertIn(f'{len(f"v{lines - 1} = {lines - 1}") + 1} bytes of the script are not shown', result.out + result.err)
+        self.assertIn(f'{len(f"v{lines - 1} = {lines - 1}") + 1} bytes of the script are not shown', result.err)
 
     def test_a_single_line_longer_than_the_screen_is_hidden_and_counted(self):
         source = 'x = "' + 'a' * 20000 + '"\n'
@@ -1344,7 +1827,7 @@ class CheckRunTests(CliCase):
         with self.refuse_processes():
             result = self.go('check', 'run', 'hello-module', 'script-a', '--version', '1.5.0', '--workspace', str(self.work), stdin=FakeIn('0' * 8 + '\n', tty=True))
         self.assertIn('code: consent_required', result.err)
-        self.assertIn(f'{len(source.encode())} bytes of the script are not shown', result.out + result.err)
+        self.assertIn(f'{len(source.encode())} bytes of the script are not shown', result.err)
 
     def test_the_runner_is_called_without_a_consent_for_a_check_that_needs_none(self):
         with mock.patch.object(schola_cli.check_runner, 'run', return_value={'status': 'passed', 'evidence': {}, 'log': []}) as runner:
@@ -1353,48 +1836,148 @@ class CheckRunTests(CliCase):
 
     def test_no_consent_text_is_printed_for_a_check_that_runs_no_script(self):
         result = self.run_check('has-readme', stdin=FakeIn('', tty=True))
-        self.assertNotIn('first 8 characters', result.out)
+        self.assertNotIn('first 8 characters', result.out + result.err)
 
 
 @unittest.skipUnless(PYTHON and hasattr(os, 'openpty'), 'needs python3 and a pseudo terminal')
 class RealTerminalTests(CliCase):
-    """The consent question on a real pseudo terminal, started through the launcher."""
+    """The consent question on a real pseudo terminal, started through the launcher.
+
+    The question goes to the error output, so the terminal holds standard input and the error output, and a pipe holds standard output.
+    """
 
     def setUp(self):
         super().setUp()
         self.import_module()
 
-    def ask(self, answer):
+    def read_until(self, master, marker, seconds=30):
+        seen = b''
+        deadline = time.monotonic() + seconds
+        while marker not in seen and time.monotonic() < deadline:
+            ready, _w, _x = select.select([master], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+        return seen
+
+    def drain(self, master):
+        seen = b''
+        while True:
+            ready, _w, _x = select.select([master], [], [], 0.5)
+            if not ready:
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+        return seen
+
+    def collect(self, master, process):
+        """Read the terminal while the program runs, and a little after, so that no text is lost when it exits."""
+        seen = b''
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            ready, _w, _x = select.select([master], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            elif process.poll() is not None:
+                break
+        return seen + self.drain(master)
+
+    def ask(self, answer, between=None, extra=(), workspace=None):
+        """Run `check run` for the script check with the keyboard on a pseudo terminal. Returns (code, stdout, stdout_error_text, terminal_text)."""
         master, slave = os.openpty()
         self.addCleanup(os.close, master)
         env = {'PATH': os.environ.get('PATH', ''), 'HOME': str(self.home), 'LC_ALL': 'en_US.UTF-8', 'LANG': 'en_US.UTF-8'}
-        process = subprocess.Popen([str(LAUNCHER), 'check', 'run', 'hello-module', 'script-a', '--workspace', str(self.work), '--data-dir', str(self.data)],
-                                   stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(self.base))
+        process = subprocess.Popen([str(LAUNCHER), 'check', 'run', 'hello-module', 'script-a', '--workspace', str(workspace or self.work),
+                                    '--data-dir', str(self.data), *extra],
+                                   stdin=slave, stdout=subprocess.PIPE, stderr=slave, text=True, env=env, cwd=str(self.base))
         os.close(slave)
-        os.write(master, answer.encode())
         timer = threading.Timer(60, process.kill)
         timer.start()
         try:
-            out, err = process.communicate(timeout=90)
+            shown = self.read_until(master, b'press Enter: ') if answer is not None else b''
+            if between is not None:
+                between()
+            if answer is not None:
+                os.write(master, answer.encode())
+            shown += self.collect(master, process)
+            out, _none = process.communicate(timeout=90)
         finally:
             timer.cancel()
-        return process.returncode, out, err
+        return process.returncode, out, shown.decode('utf-8', errors='replace')
 
     def test_the_right_eight_characters_on_a_real_terminal_run_the_script(self):
-        code, out, err = self.ask(self.check_hash()[:8] + '\n')
-        self.assertEqual((code, err), (0, ''))
+        code, out, terminal = self.ask(self.check_hash()[:8] + '\n')
+        self.assertEqual(code, 0, terminal)
         self.assertIn('hello from a script', out)
+        self.assertIn('Status: passed', out)
+
+    def test_the_question_appears_on_the_terminal_and_standard_output_stays_clean(self):
+        digest = self.check_hash()
+        code, out, terminal = self.ask(digest[:8] + '\n')
+        for text in ('first 8 characters', digest, 'print("hello from a script")', 'Workspace:', 'Check hash:'):
+            self.assertIn(text, terminal)
+            self.assertNotIn(text, out)
+
+    def test_json_on_a_real_terminal_stays_one_document(self):
+        code, out, terminal = self.ask(self.check_hash()[:8] + '\n', extra=('--json',))
+        self.assertEqual(code, 0, terminal)
+        self.assertEqual(json.loads(out)['result']['status'], 'passed')
+        self.assertIn('first 8 characters', terminal)
 
     def test_a_wrong_answer_on_a_real_terminal_runs_nothing(self):
-        code, out, err = self.ask('00000000\n')
+        code, out, terminal = self.ask('00000000\n')
         self.assertEqual(code, 3)
-        self.assertIn('code: consent_declined', err)
-        self.assertNotIn('Status:', out)
+        self.assertIn('code: consent_declined', terminal)
+        self.assertEqual(out, '')
 
     def test_end_of_input_on_a_real_terminal_runs_nothing(self):
-        code, out, err = self.ask('\x04')
+        code, out, terminal = self.ask('\x04')
         self.assertEqual(code, 3)
         self.assertNotIn('Status:', out)
+
+    def test_a_workspace_that_is_swapped_between_the_question_and_the_answer_does_not_run(self):
+        second = self.home / 'second'
+        second.mkdir()
+        (second / 'README.md').write_text('other')
+        link = self.home / 'link'
+        link.symlink_to(self.work)
+
+        def swap():
+            link.unlink()
+            link.symlink_to(second)
+
+        code, out, terminal = self.ask(self.check_hash()[:8] + '\n', between=swap, workspace=link)
+        self.assertEqual(code, 3, terminal)
+        self.assertIn('code: workspace_changed', terminal)
+        self.assertEqual(out, '')
+        self.assertIn(f'Workspace: {self.work}', terminal.replace('\r', '').splitlines())
+        self.assertIn(f'Typed as: {link}', terminal.replace('\r', '').splitlines())
+
+    def test_a_workspace_folder_that_is_replaced_in_place_does_not_run(self):
+        def swap():
+            self.work.rename(self.home / 'work-moved')
+            self.work.mkdir()
+
+        code, out, terminal = self.ask(self.check_hash()[:8] + '\n', between=swap)
+        self.assertEqual(code, 3, terminal)
+        self.assertIn('code: workspace_changed', terminal)
+        self.assertEqual(out, '')
 
 
 # ---------------------------------------------------------------------------
@@ -1414,12 +1997,6 @@ class EventsTests(CliCase):
         self.assertEqual((result.code, result.err), (0, ''))
         self.assertIn('There is no event log yet', result.out)
         self.assertEqual(list(self.data.iterdir()), [])
-
-    def test_list_on_a_missing_data_folder_creates_nothing(self):
-        missing = self.base / 'nothing-here'
-        result = self.go('events', 'list', '--data-dir', str(missing), data=False)
-        self.assertEqual(result.code, 0)
-        self.assertFalse(missing.exists())
 
     def test_list_json_on_an_empty_folder(self):
         document = json.loads(self.go('events', 'list', '--json').out)
@@ -1639,6 +2216,41 @@ class EventsTests(CliCase):
         self.assertNotIn('disk full', result.err)
         self.assertFalse(target.exists())
 
+    def test_a_stop_while_writing_removes_the_partial_file(self):
+        self.log().append(event())
+        target = self.base / 'export.jsonl'
+        with mock.patch('os.fsync', side_effect=KeyboardInterrupt()):
+            result = self.go('events', 'export', '--output', str(target))
+        self.assertEqual(result.code, 1)
+        self.assertIn('Stopped', result.err)
+        self.assertFalse(target.exists())
+
+    def test_any_other_interruption_while_writing_also_removes_the_file(self):
+        self.log().append(event())
+        target = self.base / 'export.jsonl'
+        with mock.patch('os.fsync', side_effect=SystemExit(9)):
+            with self.assertRaises(SystemExit):
+                self.go('events', 'export', '--output', str(target))
+        self.assertFalse(target.exists())
+
+    def test_a_dash_means_standard_output_and_never_a_file_named_dash(self):
+        item = event()
+        self.log().append(item)
+        previous = os.getcwd()
+        os.chdir(self.base)
+        self.addCleanup(os.chdir, previous)
+        result = self.go('events', 'export', '--output', '-')
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(json.loads(result.out.strip())['eventId'], item['eventId'])
+        self.assertFalse((self.base / '-').exists())
+
+    def test_a_dash_to_a_terminal_is_escaped_too(self):
+        self.log().append(event())
+        self.damage(b'\x1b[2J bad\n')
+        result = self.go('events', 'export', '--output', '-', out=FakeOut(tty=True))
+        self.assertSafe(result.out)
+        self.assertIn('escaped', result.err)
+
     def test_export_to_a_folder_that_does_not_exist_is_a_failure(self):
         self.log().append(event())
         result = self.go('events', 'export', '--output', str(self.base / 'no-folder' / 'x.jsonl'))
@@ -1724,6 +2336,51 @@ class EventsTests(CliCase):
         result = self.go('events', 'delete', '--confirm')
         self.assertEqual(result.code, 0)
         self.assertIn('There is no event log. Nothing was removed.', result.out)
+
+    def partial(self, details, code='delete_failed'):
+        error = EventLogError('Schola could not delete the event log (EACCES). The log is unchanged.', code, 500, details=details)
+        with mock.patch.object(EventLog, 'delete', side_effect=error):
+            return self.go('events', 'delete', '--confirm')
+
+    def test_a_partial_delete_says_exactly_what_is_gone_and_what_is_left(self):
+        result = self.partial({'logRemoved': True, 'reflectionsRemoved': 2})
+        self.assertEqual(result.code, 1)
+        self.assertIn('Deleted the event log.', result.out.splitlines())
+        self.assertIn('Deleted 2 reflections.', result.out.splitlines())
+        self.assertIn('Run the command again to delete what is left.', result.out.splitlines())
+        self.assertIn('code: delete_failed', result.err)
+        self.assertNotIn('EACCES', result.out)
+
+    def test_a_partial_delete_that_kept_the_log_says_so(self):
+        result = self.partial({'logRemoved': False, 'reflectionsRemoved': 0})
+        self.assertEqual(result.code, 1)
+        self.assertIn('The event log is still there.', result.out.splitlines())
+        self.assertIn('Deleted 0 reflections.', result.out.splitlines())
+
+    def test_a_delete_whose_disk_flush_failed_says_the_files_are_gone(self):
+        result = self.partial({'logRemoved': True, 'reflectionsRemoved': 1, 'removed': True}, 'fsync_failed')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Deleted the event log.', result.out.splitlines())
+        self.assertIn('Deleted 1 reflection.', result.out.splitlines())
+        self.assertIn('code: fsync_failed', result.err)
+
+    def test_details_that_cannot_be_trusted_are_not_printed(self):
+        for details in (None, 'text', {'logRemoved': 'yes', 'reflectionsRemoved': ESCAPES}, {'logRemoved': 'yes', 'reflectionsRemoved': 2},
+                        {'logRemoved': 1, 'reflectionsRemoved': 2}, {'logRemoved': None, 'reflectionsRemoved': 2}, {'logRemoved': True}, {'logRemoved': True, 'reflectionsRemoved': True},
+                        {'logRemoved': True, 'reflectionsRemoved': -1}, {}):
+            result = self.partial(details)
+            self.assertEqual(result.code, 1, details)
+            self.assertIn('Schola cannot tell what was removed. Read your event log.', result.out.splitlines())
+            self.assertSafe(result.out)
+            self.assertSafe(result.err)
+
+    def test_an_error_that_is_not_a_delete_fault_prints_no_removal_lines(self):
+        error = EventLogError('The event folder cannot be read (EACCES).', 'log_unreadable', 500)
+        with mock.patch.object(EventLog, 'delete', side_effect=error):
+            result = self.go('events', 'delete', '--confirm')
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.out, '')
+        self.assertIn('code: log_unreadable', result.err)
 
     def test_a_second_delete_is_harmless(self):
         self.log().append(event())
@@ -1875,6 +2532,7 @@ class LauncherTests(unittest.TestCase):
         LessonStore(self.data).import_files([('m.json', json.dumps(module_document()))])
         done = self.launch('modules', env={'SCHOLA_DATA_DIR': str(self.data)})
         self.assertIn('hello-module', done.stdout)
+        (self.data / 'empty').mkdir()
         flagged = self.launch('modules', '--data-dir', str(self.data / 'empty'), env={'SCHOLA_DATA_DIR': str(self.data)})
         self.assertIn('No modules', flagged.stdout)
 
@@ -1886,6 +2544,55 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn('Traceback', done.stderr)
         self.assertIn('hello-module', done.stdout)
+
+    def shell(self, text, *arguments, **kwargs):
+        env = {'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'en_US.UTF-8', 'LANG': 'en_US.UTF-8', 'HOME': self.temp.name}
+        return subprocess.run(['sh', '-c', text, str(LAUNCHER), *arguments], capture_output=True, text=True, timeout=60, cwd=self.temp.name, env=env, **kwargs)
+
+    def assertQuietFailure(self, done, code):
+        self.assertEqual(done.returncode, code, done.stderr)
+        for text in ('Traceback', 'Exception ignored', 'BrokenPipe', 'Errno'):
+            self.assertNotIn(text, done.stderr)
+
+    def test_a_closed_standard_output_is_exit_one_and_says_why(self):
+        done = self.shell('"$0" modules --data-dir "$1" >&-', str(self.data))
+        self.assertQuietFailure(done, 1)
+        self.assertIn('code: output_unwritable', done.stderr)
+
+    def test_a_closed_standard_error_changes_no_exit_code(self):
+        self.assertQuietFailure(self.shell('"$0" nonsense 2>&-'), 2)
+        self.assertQuietFailure(self.shell('"$0" module show nope --data-dir "$1" 2>&-', str(self.data)), 1)
+        self.assertQuietFailure(self.shell('"$0" events delete --data-dir "$1" 2>&-', str(self.data)), 3)
+        done = self.shell('"$0" version 2>&-')
+        self.assertEqual((done.returncode, done.stdout), (0, 'schola 0.1.0\n'))
+
+    def test_both_outputs_closed_is_exit_one(self):
+        self.assertQuietFailure(self.shell('"$0" version >&- 2>&-'), 1)
+
+    def test_a_standard_input_that_is_closed_is_not_a_terminal(self):
+        done = self.shell('"$0" version <&-')
+        self.assertEqual((done.returncode, done.stdout), (0, 'schola 0.1.0\n'))
+
+    def test_a_standard_output_that_cannot_be_written_is_exit_one(self):
+        target = Path(self.temp.name) / 'read-only.txt'
+        target.write_text('x')
+        with open(target, 'rb') as read_only:
+            done = subprocess.run([str(LAUNCHER), 'modules', '--data-dir', str(self.data)], stdout=read_only, stderr=subprocess.PIPE, text=True, timeout=60,
+                                  cwd=self.temp.name, env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'en_US.UTF-8', 'LANG': 'en_US.UTF-8'})
+        self.assertQuietFailure(done, 1)
+        self.assertIn('code: output_unwritable', done.stderr)
+        self.assertEqual(target.read_text(), 'x')
+
+    def test_a_closed_pipe_is_exit_one_for_every_kind_of_output(self):
+        LessonStore(self.data).import_files([('m.json', json.dumps(module_document()))])
+        EventLog(self.data).append(event())
+        for argv in (['version'], ['--version'], ['--help'], ['modules'], ['events', 'list'], ['events', 'export'], ['module', 'show', 'hello-module']):
+            process = subprocess.Popen([str(LAUNCHER), *argv, '--data-dir', str(self.data)] if argv[0] not in ('version', '--version', '--help') else [str(LAUNCHER), *argv],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'en_US.UTF-8', 'LANG': 'en_US.UTF-8', 'HOME': self.temp.name})
+            process.stdout.close()
+            _out, err = process.communicate(timeout=60)
+            self.assertQuietFailure(subprocess.CompletedProcess(argv, process.returncode, '', err), 1)
 
     def test_a_closed_pipe_ends_the_tool_quietly(self):
         LessonStore(self.data).import_files([('m.json', json.dumps(module_document()))])

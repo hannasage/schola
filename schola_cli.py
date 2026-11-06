@@ -61,6 +61,10 @@ CONSENT_PREFIX_CHARS = 8
 PROMPT_READ_CHARS = 200
 EXPORT_LINE_CHARS = 20000
 MAX_EVIDENCE_ROWS = 40
+# A list value shows this many items in text. JSON output shows all of them.
+MAX_LIST_ITEMS = 20
+# More combining marks than this in a row are cut from displayed text, because they can pile up and hide the line.
+MAX_MARK_RUN = 2
 
 # (key, the words that call it, its help line). The words are the only place the command names are written.
 COMMAND_TABLE = (
@@ -97,8 +101,9 @@ KEY_FIELDS = (
 NOT_TEXT = '<not text>'
 _REASON = re.compile(r'[a-z_]{1,40}', re.ASCII)
 # Characters that are not control characters but still hide text or break a line.
-_HIDDEN_CODES = frozenset({0x034f, 0x115f, 0x1160, 0x3164, 0xffa0})
+_HIDDEN_CODES = frozenset({0x00a0, 0x034f, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x2800, 0x3164, 0xffa0})
 _HIDDEN_CATEGORIES = frozenset({'Cc', 'Cf', 'Cs', 'Co', 'Zl', 'Zp'})
+_MARK_CATEGORIES = frozenset({'Mn', 'Mc', 'Me'})
 
 
 # ---------------------------------------------------------------------------
@@ -119,21 +124,48 @@ def _show_char(char):
     return '<U+%04X>' % ord(char) if _is_hidden(char) else char
 
 
+def _is_mark(char):
+    """True for a combining mark that is shown as it is. Marks that hide text are escaped by `_show_char` first."""
+    return ord(char) >= 0x300 and unicodedata.category(char) in _MARK_CATEGORIES and not _is_hidden(char)
+
+
+def _display_pieces(value):
+    """(piece, index of its first source character) for each piece of displayed text. A run of marks longer than the limit is cut."""
+    run, cut, cut_start = 0, 0, 0
+    for index, char in enumerate(value):
+        if _is_mark(char):
+            run += 1
+            if run > MAX_MARK_RUN:
+                if not cut:
+                    cut_start = index
+                cut += 1
+                continue
+            yield char, index
+            continue
+        if cut:
+            yield f'<{cut} marks cut>', cut_start
+            cut = 0
+        run = 0
+        yield _show_char(char), index
+    if cut:
+        yield f'<{cut} marks cut>', cut_start
+
+
 def safe_text(value, limit=MAX_LINE_CHARS):
     """One line of text that is safe to print on a terminal. Time grows in step with the text.
 
     Control characters (including ESC, CSI, OSC, CR, NUL, and the eight-bit controls), bidirectional controls,
-    zero-width characters, tag characters, private use characters, and lone surrogates show as `<U+XXXX>`.
+    zero-width characters, tag characters, private use characters, look-alike blanks, and lone surrogates show as `<U+XXXX>`.
+    A run of more than two combining marks is cut and replaced by a note.
     The result is cut after `limit` characters, and the cut says how many characters are missing.
     A value that is not exactly a `str` gives `<not text>`.
     """
     if type(value) is not str:
         return NOT_TEXT
     pieces, size = [], 0
-    for index, char in enumerate(value):
-        piece = _show_char(char)
+    for piece, start in _display_pieces(value):
         if size + len(piece) > limit:
-            pieces.append(f'...[{len(value) - index} more characters]')
+            pieces.append(f'...[{len(value) - start} more characters]')
             break
         pieces.append(piece)
         size += len(piece)
@@ -141,15 +173,20 @@ def safe_text(value, limit=MAX_LINE_CHARS):
 
 
 def _script_blocks(source, width):
-    """For each line of a script, (the bytes it takes including its newline, its display rows)."""
+    """For each line of a script, (the bytes it takes including its newline, its display rows). Nothing is cut or hidden."""
     lines = source.split('\n')
     if lines and lines[-1] == '':
         lines.pop()
     blocks = []
     for number, line in enumerate(lines, 1):
-        rows, chunk, size = [], [], 0
+        rows, chunk, size, run = [], [], 0, 0
         for char in line:
-            piece = _show_char(char)
+            if _is_mark(char):
+                run += 1
+                piece = char if run <= MAX_MARK_RUN else '<U+%04X>' % ord(char)
+            else:
+                run = 0
+                piece = _show_char(char)
             if chunk and size + len(piece) > width:
                 rows.append(''.join(chunk))
                 chunk, size = [], 0
@@ -191,7 +228,10 @@ def show_value(value):
     if kind is float:
         return repr(value) if value == value and value not in (float('inf'), float('-inf')) else '<bad number>'
     if kind in (list, tuple):
-        return ', '.join(show_value(item) for item in value[:20])
+        text = ', '.join(show_value(item) for item in value[:MAX_LIST_ITEMS])
+        return text + (f', ...[{len(value) - MAX_LIST_ITEMS} more]' if len(value) > MAX_LIST_ITEMS else '')
+    if kind is dict:
+        return f'<object with {len(value)} {"entry" if len(value) == 1 else "entries"}>'
     return '<object>'
 
 
@@ -208,6 +248,62 @@ def count_of(number, word):
 # Context, errors, and output
 # ---------------------------------------------------------------------------
 
+class _OutputFailed(Exception):
+    """Writing to an output failed. `broken` is true for a closed pipe, which needs no message."""
+
+    def __init__(self, broken):
+        super().__init__(broken)
+        self.broken = broken
+
+
+class _Buffer:
+    """The byte layer of an output, with the same guard."""
+
+    def __init__(self, buffer):
+        self._buffer = buffer
+
+    def write(self, data):
+        return _guarded(lambda: self._buffer.write(data))
+
+    def flush(self):
+        return _guarded(lambda: self._buffer.flush())
+
+
+def _guarded(call):
+    try:
+        return call()
+    except BrokenPipeError:
+        raise _OutputFailed(True) from None
+    except (OSError, ValueError, AttributeError):
+        raise _OutputFailed(False) from None
+
+
+class Output:
+    """Standard output or error output. A write that fails is one error with one meaning, and never a fault of the data folder or the port.
+
+    The stream can be `None`: a program that starts with a closed output has no `sys.stdout`.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return _guarded(lambda: self._stream.write(text))
+
+    def flush(self):
+        return _guarded(lambda: self._stream.flush())
+
+    def isatty(self):
+        return is_terminal(self._stream)
+
+    @property
+    def buffer(self):
+        buffer = getattr(self._stream, 'buffer', None)
+        if buffer is None:
+            raise AttributeError('buffer')
+        return _Buffer(buffer)
+
+
 @dataclasses.dataclass(frozen=True)
 class Streams:
     stdin: object
@@ -219,6 +315,7 @@ class Streams:
 class Context:
     streams: Streams
     data_dir: Path
+    data_source: str
     home: Path
     as_json: bool
 
@@ -244,7 +341,11 @@ def say(stream, text=''):
 
 
 def report(stream, failure):
-    say(stream, f'schola: {safe_text(failure.message, 400)} (code: {safe_text(failure.code, 60)})')
+    """Print one failure on the error output. A dead error output changes nothing else, so this never raises."""
+    try:
+        say(stream, f'schola: {safe_text(failure.message, 400)} (code: {safe_text(failure.code, 60)})')
+    except _OutputFailed:
+        pass
 
 
 def convert(error):
@@ -278,6 +379,25 @@ def resolve_data_dir(flag, environ):
     return ROOT / 'data'
 
 
+def data_dir_source(flag, environ):
+    """Where the data folder came from: `flag`, `env`, or `default`."""
+    if flag:
+        return 'flag'
+    value = environ.get(DATA_DIR_VARIABLE)
+    return 'env' if type(value) is str and value else 'default'
+
+
+def require_data_dir(ctx):
+    """Refuse a data folder that was named and is not there. The default folder may be missing on a fresh install."""
+    if ctx.data_dir.is_dir():
+        return
+    named = {'flag': 'from --data-dir', 'env': f'from {DATA_DIR_VARIABLE}'}.get(ctx.data_source)
+    if ctx.data_dir.exists():
+        raise CliError('data_dir_not_a_folder', 'The data folder ' + (f'({named}) ' if named else '') + 'is not a folder.')
+    if named:
+        raise CliError('data_dir_missing', f'The data folder ({named}) does not exist. Check the name, or create the folder.')
+
+
 def resolve_home(environ):
     value = environ.get('HOME')
     if type(value) is str and os.path.isabs(value):
@@ -290,27 +410,22 @@ def resolve_home(environ):
 # ---------------------------------------------------------------------------
 
 def resolve_version(store, module_id, version):
-    """The version asked for, else the pinned one, else the newest stored one."""
+    """The version asked for, else the pinned one. With no pin the answer is None, and the store refuses it, as the hub does."""
     if version is not None:
         return version
-    pinned = store.pins()['pins'].get(module_id)
-    if pinned:
-        return pinned
-    stored = store.versions(module_id)
-    return stored[-1] if stored else None
+    return store.pins()['pins'].get(module_id)
 
 
 def load_module(ctx, module_id, version):
     store = LessonStore(ctx.data_dir)
     version = resolve_version(store, module_id, version)
-    return version, store.get_module(module_id, version), store
+    return version, store.get_module(module_id, version)
 
 
 def load_check(ctx, args):
     store = LessonStore(ctx.data_dir)
     version = resolve_version(store, args.module_id, args.version)
-    check = check_routes._find_check(store, args.module_id, version, args.check_id)
-    return version, check
+    return version, check_routes.find_check(store, args.module_id, version, args.check_id)
 
 
 def passed_workspace(ctx, path):
@@ -321,6 +436,23 @@ def passed_workspace(ctx, path):
         return check_routes.validate_workspace(path, ctx.data_dir, ctx.home)
     except check_routes.CheckError as error:
         raise CliError('invalid_workspace', str(error), EXIT_REFUSED) from None
+
+
+def folder_identity(path):
+    """The device and inode of a folder. A folder that is replaced at the same path has another identity."""
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def workspace_lines(real, typed):
+    """The workspace as the consent view shows it: the real folder, and the typed path when it is not the same text."""
+    lines = [f'Workspace: {safe_text(real)}']
+    if typed != real:
+        lines.append(f'Typed as: {safe_text(typed)}')
+    return lines
 
 
 def dict_of(value):
@@ -363,9 +495,9 @@ def cmd_hub(args, ctx):
 
     try:
         server.run_server(args.port, ctx.data_dir, announce)
-    except BrokenPipeError:
-        raise  # the output closed; this is not a port problem
-    except OSError:
+    except OSError as error:
+        if getattr(error, 'hub_phase', None) != 'bind':
+            raise  # only a failed bind is a port problem
         raise CliError('hub_unavailable', 'Schola cannot start the hub on that port. Use --port to choose another.') from None
     return EXIT_OK
 
@@ -375,6 +507,7 @@ def cmd_hub(args, ctx):
 # ---------------------------------------------------------------------------
 
 def cmd_modules(args, ctx):
+    require_data_dir(ctx)
     store = LessonStore(ctx.data_dir)
     rows = []
     for entry in store.list_modules()['modules']:
@@ -382,7 +515,7 @@ def cmd_modules(args, ctx):
         document = store.get_module(entry['id'], version)
         rows.append({'id': entry['id'], 'version': version, 'title': entry['title'], 'tasks': len(list_of(document.get('tasks'))),
                      'checks': len(list_of(document.get('checks'))), 'versions': entry['versions'],
-                     'newerVersionAvailable': entry['newerVersionAvailable']})
+                     'newerVersionAvailable': entry['newerVersionAvailable'], 'pinned': entry['pinnedVersion'] is not None})
     out = ctx.streams.stdout
     if ctx.as_json:
         say(out, to_json({'modules': rows}))
@@ -393,18 +526,15 @@ def cmd_modules(args, ctx):
     say(out, f'Modules: {len(rows)}')
     for row in rows:
         say(out, f"{safe_text(row['id'])} {safe_text(row['version'])}  {safe_text(row['title'])}  "
-                 f"({count_of(row['tasks'], 'task')}, {count_of(row['checks'], 'check')})")
+                 f"({count_of(row['tasks'], 'task')}, {count_of(row['checks'], 'check')})" + ('' if row['pinned'] else ' (not pinned)'))
         if row['newerVersionAvailable']:
             say(out, f"  {safe_text(row['newerVersionAvailable'])} is newer and stored. The pin stays on {safe_text(row['version'])}.")
     return EXIT_OK
 
 
-def consent_label(check):
-    return 'needs consent' if needs_consent(check) else 'no consent needed'
-
-
 def cmd_module_show(args, ctx):
-    version, document, _store = load_module(ctx, args.module_id, args.version)
+    require_data_dir(ctx)
+    version, document = load_module(ctx, args.module_id, args.version)
     tasks = [{'id': dict_of(task).get('id'), 'prompt': dict_of(task).get('prompt')} for task in list_of(document.get('tasks'))]
     checks = [{'id': dict_of(check).get('id'), 'kind': dict_of(check).get('kind'), 'runnerType': runner_type(check),
                'needsConsent': needs_consent(check), 'description': dict_of(check).get('description')} for check in list_of(document.get('checks'))]
@@ -432,16 +562,16 @@ def cmd_module_show(args, ctx):
 # check show
 # ---------------------------------------------------------------------------
 
-def shown_check(ctx, args, version, check, workspace):
+def shown_check(args, version, check, workspace, typed):
     """The facts about a check. The engine's own function builds them, so the hub and this tool agree."""
     digest = check_consent.check_hash(check)
-    facts = check_routes._shown(check, None, digest)
+    facts = check_routes.describe_check(check, None, digest)
     runner = dict_of(check.get('runner'))
     return {
         'moduleId': args.module_id, 'version': version, 'checkId': check.get('id'), 'kind': check.get('kind'),
         'runnerType': facts['runnerType'], 'description': facts['description'], 'needsConsent': facts['needsConsent'],
         'checkHash': digest, 'runtime': facts['runtime'], 'source': facts['source'], 'args': facts['args'],
-        'timeoutSeconds': facts['timeoutSeconds'], 'workspace': workspace, 'limits': facts['limits'],
+        'timeoutSeconds': facts['timeoutSeconds'], 'workspace': workspace, 'workspaceTyped': typed, 'limits': facts['limits'],
         'limitsNotApplied': facts['limitsNotApplied'], 'runner': runner if runner else None,
     }
 
@@ -467,11 +597,11 @@ def print_what_runs(out, facts):
 
 
 def cmd_check_show(args, ctx):
+    require_data_dir(ctx)
     version, check = load_check(ctx, args)
-    passed = args.workspace
-    if passed is not None:
-        passed_workspace(ctx, passed)  # the same rules as the hub; the path as passed is what is shown
-    facts = shown_check(ctx, args, version, check, passed)
+    typed = args.workspace
+    real = passed_workspace(ctx, typed) if typed is not None else None  # the same rules as the hub
+    facts = shown_check(args, version, check, real, typed)
     out = ctx.streams.stdout
     if ctx.as_json:
         say(out, to_json(facts))
@@ -484,8 +614,9 @@ def cmd_check_show(args, ctx):
         say(out, f"Description: {safe_text(facts['description'])}")
     say(out, f"Needs consent: {'yes' if facts['needsConsent'] else 'no'}")
     say(out, f"Check hash: {facts['checkHash']}")
-    if passed is not None:
-        say(out, f'Workspace: {safe_text(passed)}')
+    if real is not None:
+        for line in workspace_lines(real, typed):
+            say(out, line)
     fields = {key: value for key, value in dict_of(facts['runner']).items() if key != 'type'}
     if fields:
         say(out, 'Runner fields:')
@@ -509,36 +640,42 @@ def cmd_check_show(args, ctx):
 # check run
 # ---------------------------------------------------------------------------
 
-def ask_for_consent(args, ctx, version, check, digest, shown_path):
-    """Return when the student agreed to this exact script. Raise a refusal otherwise. Consent lasts for this command only."""
-    streams, out = ctx.streams, ctx.streams.stdout
+def ask_for_consent(args, ctx, version, check, digest, real, typed):
+    """Return when the student agreed to this exact script. Raise a refusal otherwise. Consent lasts for this command only.
+
+    The question goes to the error output, so standard output (and `--json`) never carries it.
+    It is asked only when the keyboard and the error output are both terminals.
+    """
+    streams = ctx.streams
+    err = streams.stderr
     if args.consent is not None:
         # An exact match of the full hash. A wrong value is refused, and it never falls back to the question.
         if not hmac.compare_digest(args.consent.encode('utf-8', errors='replace'), digest.encode('ascii')):
             raise CliError('hash_mismatch', 'That hash does not match this check. Run "schola check show" and read the script again.', EXIT_REFUSED)
         return
-    if not is_terminal(streams.stdin):
+    if not (is_terminal(streams.stdin) and is_terminal(err)):
         raise CliError('consent_required', 'This check runs a script. Read it with "schola check show", '
                                            'then run this command again with --consent and the check hash.', EXIT_REFUSED)
-    facts = check_routes._shown(check, None, digest)
+    facts = check_routes.describe_check(check, None, digest)
     rows, hidden = _prompt_view(facts['source'] if type(facts['source']) is str else '')
-    say(out, 'This check runs a script on your computer.')
-    say(out, 'Read the script before you agree.')
-    say(out, f'Module: {safe_text(args.module_id)} {safe_text(version)}')
-    say(out, f'Check: {safe_text(check.get("id"))}')
-    say(out, f'Workspace: {safe_text(shown_path)}')
-    print_what_runs(out, facts)
-    print_script(out, facts, rows)
+    say(err, 'This check runs a script on your computer.')
+    say(err, 'Read the script before you agree.')
+    say(err, f'Module: {safe_text(args.module_id)} {safe_text(version)}')
+    say(err, f'Check: {safe_text(check.get("id"))}')
+    for line in workspace_lines(real, typed):
+        say(err, line)
+    print_what_runs(err, facts)
+    print_script(err, facts, rows)
     if hidden:
-        say(out, f'{hidden} bytes of the script are not shown.')
-    say(out, f'Check hash: {digest}')
-    say(out, 'This is consent, not a sandbox. The script can read your files and use the network.')
+        say(err, f'{hidden} bytes of the script are not shown.')
+    say(err, f'Check hash: {digest}')
+    say(err, 'This is consent, not a sandbox. The script can read your files and use the network.')
     if hidden:
-        out.flush()
+        err.flush()
         raise CliError('consent_required', 'The script is too long to agree to by typing. Read it with "schola check show", '
                                            'then run this command again with --consent and the check hash.', EXIT_REFUSED)
-    out.write(f'To agree, type the first {CONSENT_PREFIX_CHARS} characters of the check hash and press Enter: ')
-    out.flush()
+    err.write(f'To agree, type the first {CONSENT_PREFIX_CHARS} characters of the check hash and press Enter: ')
+    err.flush()
     try:
         answer = streams.stdin.readline(PROMPT_READ_CHARS)
     except (OSError, ValueError):
@@ -555,33 +692,45 @@ def print_result(out, args, version, outcome):
     say(out, 'Evidence:' if evidence else 'Evidence: none')
     for key in list(evidence)[:MAX_EVIDENCE_ROWS]:
         say(out, f'  {safe_text(key)}: {show_value(evidence[key])}')
+    if len(evidence) > MAX_EVIDENCE_ROWS:
+        say(out, f'  ...[{len(evidence) - MAX_EVIDENCE_ROWS} more]')
     log = list_of(outcome.get('log'))
     say(out, 'Log:' if log else 'Log: none')
     for line in log[:MAX_EVIDENCE_ROWS]:
         say(out, f'  {safe_text(line)}')
+    if len(log) > MAX_EVIDENCE_ROWS:
+        say(out, f'  ...[{len(log) - MAX_EVIDENCE_ROWS} more]')
 
 
 def cmd_check_run(args, ctx):
+    require_data_dir(ctx)
     version, check = load_check(ctx, args)
     workspace = passed_workspace(ctx, args.workspace)
+    identity = folder_identity(workspace)
     digest = check_consent.check_hash(check)
-    consent, tier = None, 1
-    if needs_consent(check):
-        tier = 2
-        ask_for_consent(args, ctx, version, check, digest, args.workspace)
+    needs = needs_consent(check)
+    if needs:
+        ask_for_consent(args, ctx, version, check, digest, workspace, args.workspace)
+    elif args.consent is not None:
+        say(ctx.streams.stderr, 'schola: This check needs no consent. The --consent value was ignored.')
+    # The folder may change while the student reads. Look again, right before the run, and run only in the folder that was shown.
+    again = passed_workspace(ctx, args.workspace)
+    if again != workspace or folder_identity(again) != identity:
+        raise CliError('workspace_changed', 'The workspace changed after you saw it. Nothing was run. Run the command again.', EXIT_REFUSED)
+    consent = None
+    if needs:
         registry = check_consent.ConsentRegistry()  # in memory, for this command only
         granted = registry.grant(args.module_id, version, args.check_id, digest, workspace)
         consent = registry.find(args.module_id, version, args.check_id, digest, workspace, granted['consentId'])
-    elif args.consent is not None:
-        say(ctx.streams.stderr, 'schola: This check needs no consent. The --consent value was ignored.')
     outcome = check_runner.run(check, workspace, None, None, consent=consent)
     out = ctx.streams.stdout
     if ctx.as_json:
-        say(out, to_json({'moduleId': args.module_id, 'version': version, 'checkId': args.check_id, 'checkHash': digest, 'tier': tier, 'result': outcome}))
+        say(out, to_json({'moduleId': args.module_id, 'version': version, 'checkId': args.check_id, 'checkHash': digest, 'tier': 2 if needs else 1,
+                          'result': outcome}))
     else:
         print_result(out, args, version, outcome)
-    # A check that ran and failed is a result, not a fault. Only a check that could not run is exit 1.
-    return EXIT_FAILED if dict_of(outcome).get('status') not in ('passed', 'failed', 'skipped') else EXIT_OK
+    # A check that ran and reported `failed` is a result: exit 0. A check that could not run (`error`) or that Schola cannot run (`skipped`) is exit 1.
+    return EXIT_OK if dict_of(outcome).get('status') in ('passed', 'failed') else EXIT_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +767,7 @@ def damaged_lines(report):
 
 
 def cmd_events_list(args, ctx):
+    require_data_dir(ctx)
     report = EventLog(ctx.data_dir).read(limit=args.limit, offset=args.offset)
     damaged = damaged_lines(report)
     out = ctx.streams.stdout
@@ -659,12 +809,14 @@ def write_new_file(path, data):
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-    except OSError:
+    except BaseException as error:  # a stop (Control-C) must leave no half-written file either
         try:
             os.unlink(path)  # only the file this command just created
         except OSError:
             pass
-        raise CliError('output_unwritable', 'Schola cannot write that file. The file was removed.') from None
+        if isinstance(error, OSError):
+            raise CliError('output_unwritable', 'Schola cannot write that file. The file was removed.') from None
+        raise
 
 
 def write_export(streams, data):
@@ -684,9 +836,10 @@ def write_export(streams, data):
 
 
 def cmd_events_export(args, ctx):
+    require_data_dir(ctx)
     exported = EventLog(ctx.data_dir).export_checked()
     data = exported['data']
-    if args.output is not None:
+    if args.output is not None and args.output != '-':
         write_new_file(args.output, data)
         say(ctx.streams.stdout, f'Wrote {count_of(len(data), "byte")} to {safe_text(args.output)}.')
     else:
@@ -696,18 +849,33 @@ def cmd_events_export(args, ctx):
     return EXIT_OK
 
 
+def removal_lines(details):
+    """What a delete that stopped half way removed, from the engine's `details`. Details that cannot be trusted are not printed."""
+    if (type(details) is dict and type(details.get('logRemoved')) is bool and type(details.get('reflectionsRemoved')) is int
+            and details['reflectionsRemoved'] >= 0):
+        return ['Deleted the event log.' if details['logRemoved'] else 'The event log is still there.',
+                f'Deleted {count_of(details["reflectionsRemoved"], "reflection")}.',
+                'Run the command again to delete what is left.']
+    return ['Schola cannot tell what was removed. Read your event log.']
+
+
 def cmd_events_delete(args, ctx):
     if not args.confirm:
         raise CliError('confirmation_required', 'This deletes your event log and your reflections for good. '
                                                 'Run the command again with --confirm to do it.', EXIT_REFUSED)
+    require_data_dir(ctx)
     out = ctx.streams.stdout
     try:
         done = EventLog(ctx.data_dir).delete(True)
     except StoreError as error:
-        if error.payload().get('code') != 'log_missing':
-            raise
-        say(out, 'There is no event log. Nothing was removed.')
-        return EXIT_OK
+        code = error.payload().get('code')
+        if code == 'log_missing':
+            say(out, 'There is no event log. Nothing was removed.')
+            return EXIT_OK
+        if code in ('delete_failed', 'fsync_failed'):
+            for line in removal_lines(getattr(error, 'details', None)):
+                say(out, line)
+        raise
     say(out, 'Deleted the event log.' if done.get('logRemoved') else 'There was no event log file.')
     say(out, f'Deleted {count_of(done.get("reflectionsRemoved", 0), "reflection")}.')
     say(out, 'This cannot be undone.')
@@ -777,7 +945,7 @@ def _add_arguments(key, parser):
                             help=f'How many lines to read. The most is {MAX_LIST_LIMIT}. The default is {DEFAULT_LIST_LIMIT}.')
         parser.add_argument('--offset', type=_number(0, MAX_OFFSET, 'offset'), default=0, help='How many lines to skip. The default is 0.')
     if key == 'events-export':
-        parser.add_argument('--output', metavar='FILE', type=_file_name, help='Write to a new file. Schola does not overwrite a file.')
+        parser.add_argument('--output', metavar='FILE', type=_file_name, help='Write to a new file. Schola does not overwrite a file. A dash (-) means standard output.')
     if key == 'events-delete':
         parser.add_argument('--confirm', action='store_true', help='Say that you want to delete the log and the reflections for good.')
     if key in ('modules', 'module-show', 'check-show', 'check-run', 'events-list', 'version'):
@@ -787,13 +955,20 @@ def _add_arguments(key, parser):
 
 
 def build_parser(streams):
+    class VersionAction(argparse.Action):
+        def __init__(self, option_strings, dest, **kwargs):
+            super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help='Print the version of this tool.')
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            say(streams.stdout, f'schola {CLI_VERSION}')
+            parser.exit(EXIT_OK)
+
     class Parser(argparse.ArgumentParser):
         def __init__(self, *args, **kwargs):
             kwargs.setdefault('allow_abbrev', False)
-            try:
-                super().__init__(*args, color=False, **kwargs)
-            except TypeError:  # Python before 3.14 has no color option
-                super().__init__(*args, **kwargs)
+            if sys.version_info >= (3, 14):
+                kwargs.setdefault('color', False)  # help text has no color codes
+            super().__init__(*args, **kwargs)
 
         def print_help(self, file=None):
             super().print_help(streams.stdout if file is None else file)
@@ -802,20 +977,24 @@ def build_parser(streams):
             super().print_usage(streams.stderr if file is None else file)
 
         def error(self, message):
-            self.print_usage(streams.stderr)
-            say(streams.stderr, f'{self.prog}: error: {safe_text(message, 400)}')
+            try:
+                self.print_usage(streams.stderr)
+                say(streams.stderr, f'{self.prog}: error: {safe_text(message, 400)}')
+            except _OutputFailed:
+                pass  # a dead error output does not change the exit code
             raise _Stop(EXIT_USAGE)
 
         def exit(self, status=0, message=None):
             if message:
-                streams.stderr.write(safe_text(message, 400) + '\n')
+                report_text(streams.stderr, safe_text(message, 400))
             raise _Stop(status)
 
     parser = Parser(prog='schola', description='Open the Schola hub, read modules, run checks, and read your event log.')
+    parser.add_argument('--version', action=VersionAction)
     parser.add_argument('--data-dir', metavar='DIR', type=_folder_name, default=None,
                         help=f'The data folder. The default is the data folder of the repository, or ${DATA_DIR_VARIABLE}.')
     top = parser.add_subparsers(dest='command', metavar='COMMAND', required=True)
-    groups = {}
+    groups, leaves = {}, {}
     for key, words, help_line in COMMAND_TABLE:
         if len(words) == 1:
             leaf = top.add_parser(words[0], help=help_line, description=help_line)
@@ -827,7 +1006,16 @@ def build_parser(streams):
             leaf = groups[words[0]].add_parser(words[1], help=help_line, description=help_line)
         _add_arguments(key, leaf)
         leaf.set_defaults(key=key)
+        leaves[key] = leaf
+    parser.leaves = leaves
     return parser
+
+
+def report_text(stream, text):
+    try:
+        say(stream, text)
+    except _OutputFailed:
+        pass
 
 
 def _all_help(parser):
@@ -849,42 +1037,84 @@ def help_text():
 # Entry points
 # ---------------------------------------------------------------------------
 
-def main(argv=None, *, stdin=None, stdout=None, stderr=None, environ=None):
-    """Run one command and return its exit code. Nothing here stops the program or keeps state between calls."""
-    streams = Streams(sys.stdin if stdin is None else stdin, sys.stdout if stdout is None else stdout, sys.stderr if stderr is None else stderr)
-    environ = os.environ if environ is None else environ
-    arguments = list(sys.argv[1:] if argv is None else argv)
+def output_failed(streams, failed):
+    """Report a failed write once, on the error output. A closed pipe (`| head`) is quiet. The exit code is 1 either way."""
+    if not failed.broken:
+        report(streams.stderr, CliError('output_unwritable', 'Schola cannot write its output.'))
+    return EXIT_FAILED
+
+
+def run_command(args, context):
+    streams = context.streams
     try:
-        args = build_parser(streams).parse_args(arguments)
-    except _Stop as stop:
-        return stop.status
-    context = Context(streams, resolve_data_dir(args.data_dir, environ), resolve_home(environ), bool(getattr(args, 'json', False)))
-    try:
-        return HANDLERS[args.key](args, context)
-    except BrokenPipeError:
-        return EXIT_FAILED
+        code = HANDLERS[args.key](args, context)
+        streams.stdout.flush()
+        return code
+    except _OutputFailed as failed:
+        return output_failed(streams, failed)
     except KeyboardInterrupt:
-        say(streams.stderr, 'schola: Stopped.')
+        report_text(streams.stderr, 'schola: Stopped.')
         return EXIT_FAILED
     except Exception as error:  # noqa: BLE001 - every fault becomes one fixed sentence and a code
         failure = convert(error)
         report(streams.stderr, failure)
+        try:
+            streams.stdout.flush()
+        except _OutputFailed as failed:
+            return output_failed(streams, failed)
         return failure.exit_code
+
+
+def main(argv=None, *, stdin=None, stdout=None, stderr=None, environ=None):
+    """Run one command and return its exit code. Nothing here stops the program or keeps state between calls."""
+    streams = Streams(sys.stdin if stdin is None else stdin, Output(sys.stdout if stdout is None else stdout),
+                      Output(sys.stderr if stderr is None else stderr))
+    environ = os.environ if environ is None else environ
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser(streams)
+    try:
+        args, extra = parser.parse_known_args(arguments)
+        if extra:  # the usage of the command that was named, not the top level
+            parser.leaves[args.key].error('unrecognized arguments: ' + ' '.join(extra))
+    except _Stop as stop:
+        return stop.status
+    except _OutputFailed:
+        return EXIT_FAILED
+    flag = args.data_dir
+    context = Context(streams, resolve_data_dir(flag, environ), data_dir_source(flag, environ), resolve_home(environ), bool(getattr(args, 'json', False)))
+    return run_command(args, context)
+
+
+def _silence(descriptor):
+    """Point a broken output at the null device, so the exit of the program cannot fail on the data it still holds."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, descriptor)
+        finally:
+            os.close(null)
+    except OSError:
+        pass
 
 
 def cli_entry():
     """What the `schola` launcher runs. This is the only place that stops the program."""
     for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue  # the program started with this output closed
         try:
             stream.reconfigure(errors='backslashreplace')  # a terminal that cannot show a character gets an escape, not a crash
-        except (AttributeError, ValueError):
+        except (AttributeError, ValueError, OSError):
             pass
     code = main()
-    try:
-        sys.stdout.flush()
-    except BrokenPipeError:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        code = EXIT_FAILED
+    for stream, descriptor in ((sys.stdout, 1), (sys.stderr, 2)):
+        if stream is None:
+            continue
+        try:
+            stream.flush()
+        except (BrokenPipeError, AttributeError, ValueError, OSError):
+            code = EXIT_FAILED
+            _silence(descriptor)
     sys.exit(code)
 
 
