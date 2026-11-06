@@ -15,6 +15,8 @@ Only the Python standard library is used.
 import collections
 import datetime
 import re
+import sys
+import zoneinfo
 
 from event_log import EventLogError
 from lesson_store import LessonStoreError
@@ -25,11 +27,19 @@ SKILL_WINDOW = 5
 CHECK_LIMIT = 20
 MIN_OFFSET = -840
 MAX_OFFSET = 840
-# The caps of the lesson contract: a title is at most 200 characters and a task prompt at most 5000.
+# The maxima of the lesson contract, so a valid module is never cut: a title is at most 200 characters, a task prompt
+# at most 5000, and a check description at most 2000. The hub shows the description of a check as its title.
 TITLE_CAP = 200
 TASK_TEXT_CAP = 5000
+CHECK_TEXT_CAP = 2000
+SKILL_LIMIT = 100
 HINT_LADDER = ('nudge', 'question', 'partial-example', 'full-answer')
 CHECK_STATUSES = frozenset({'passed', 'failed', 'error', 'skipped', 'self-reported'})
+# A check is passed by the app (`passed`) or by the student's own report (`self-reported`). A report is not skill evidence.
+PASS_STATUSES = frozenset({'passed', 'self-reported'})
+SKILL_STATUSES = frozenset({'passed', 'failed', 'error'})
+TASK_RESULTS = frozenset({'passed', 'abandoned', 'skipped'})
+SKIP_NOTES = 5  # how many skipped events the reader names on stderr, one line each
 SOURCES = frozenset({'student', 'app', 'agent'})
 # Only these two sources count as the student's activity. The agent's own events never do.
 COUNTED_SOURCES = frozenset({'student', 'app'})
@@ -38,6 +48,8 @@ UNREADABLE_CODES = frozenset({'log_corrupt', 'log_unreadable', 'unsafe_path'})
 
 _LEVEL = {name: number for number, name in enumerate(HINT_LADDER)}
 _TIME = re.compile(r'([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})', re.ASCII)
+_ZONE_NAME = re.compile(r'[A-Za-z][A-Za-z0-9_+-]{0,31}(?:/[A-Za-z0-9_+-]{1,32}){0,2}', re.ASCII)
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _MINUTES_PER_DAY = 1440
 _WEEK_DAYS = 7
 
@@ -57,16 +69,23 @@ class ModuleInfo(collections.namedtuple('ModuleInfo', 'module_id version title t
     __slots__ = ()
 
 
-class LogFacts(collections.namedtuple('LogFacts', 'exists ok events damaged_lines truncated_tail')):
-    """What the log reader found. `events` counts the valid events, `damaged_lines` the lines that are not valid events."""
+class LogFacts(collections.namedtuple('LogFacts', 'exists ok events damaged_lines truncated_tail fault', defaults=(None,))):
+    """What the log reader found. `events` counts the valid events, `damaged_lines` the lines that are not valid events.
+
+    `fault` is the code of the log store when the log could not be read at all, else None.
+    """
     __slots__ = ()
 
 
-_Row = collections.namedtuple('_Row', 'seq day session module task kind skills status check level')
+_Row = collections.namedtuple('_Row', 'seq day session module task kind skills status check level result')
 
 
 class _Malformed(Exception):
-    """An event does not have the fields the contract promises."""
+    """An event does not have the fields the contract promises. `reason` names the field and holds no event content."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 # ----------------------------------------------------------------------
@@ -150,56 +169,107 @@ def check_offset(value):
     return value
 
 
+def load_zone(name):
+    """The time zone of an IANA name such as `America/New_York`. A bad or unknown name is a ValueError.
+
+    The name must match a strict pattern before it is looked up, so it can never name a path.
+    """
+    if type(name) is not str or _ZONE_NAME.fullmatch(name) is None:
+        raise ValueError('The time zone must be an IANA name such as America/New_York.')
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (KeyError, ValueError, OSError):  # not found, not a zone file, or a folder
+        raise ValueError('The time zone must be an IANA name such as America/New_York.') from None
+
+
+def _fixed_day(offset):
+    return lambda minutes: (minutes + offset) // _MINUTES_PER_DAY
+
+
+def _zone_day(zone):
+    """A function from UTC minutes to the local day number, using the offset the zone had at that moment."""
+    def day_of(minutes):
+        try:
+            local = (_EPOCH + datetime.timedelta(minutes=minutes)).astimezone(zone)
+        except (OverflowError, ValueError, OSError):
+            # The instant is outside the years 1 to 9999 once placed in the zone. It is far from the window,
+            # so the UTC day is as good as any: a zone is at most a day away.
+            return minutes // _MINUTES_PER_DAY
+        return _days_from_civil(local.year, local.month, local.day)
+    return day_of
+
+
 # ----------------------------------------------------------------------
 # Reading the events
 # ----------------------------------------------------------------------
 
-def _text(value, allow_empty=False):
-    if type(value) is not str or not (value or allow_empty):
-        raise _Malformed()
+def _text(value, name):
+    if type(value) is not str or not value:
+        raise _Malformed(f'bad {name}')
     return value
 
 
-def _rows(events, offset):
-    """The counted events as rows, in log order. Raises _Malformed if a field the hub reads is not what the contract says."""
-    rows = []
+def _row(seq, item, day_of):
+    """One counted event as a row, or None for an event of the agent. Raises _Malformed if a field the hub reads is wrong."""
+    if type(item) is not dict:
+        raise _Malformed('the event is not an object')
+    source = item.get('source')
+    if type(source) is not str or source not in SOURCES:
+        raise _Malformed('bad source')
+    if source not in COUNTED_SOURCES:
+        return None
+    stamp = _utc_minutes(item.get('time'))
+    if stamp is None:
+        raise _Malformed('bad time')
+    session = _text(item.get('sessionId'), 'sessionId')
+    module = _text(item.get('moduleId'), 'moduleId')
+    task = item.get('taskId')
+    if task is not None:
+        _text(task, 'taskId')
+    kind = _text(item.get('type'), 'type')
+    skills = item.get('skills')
+    if type(skills) is not list or any(type(skill) is not str for skill in skills):
+        raise _Malformed('bad skills')
+    data = item.get('data')
+    if type(data) is not dict:
+        raise _Malformed('bad data')
+    status = check = level = result = None
+    if kind == 'check_result':
+        status, check = data.get('status'), data.get('checkId')
+        if type(status) is not str or status not in CHECK_STATUSES:
+            raise _Malformed('bad data.status')
+        if task is None:
+            raise _Malformed('missing taskId')
+        _text(check, 'data.checkId')
+    elif kind == 'hint_requested':
+        level = data.get('level')
+        if type(level) is not str or level not in _LEVEL:
+            raise _Malformed('bad data.level')
+        if task is None:
+            raise _Malformed('missing taskId')
+    elif kind == 'task_finished':
+        result = data.get('result')
+        if type(result) is not str or result not in TASK_RESULTS:
+            raise _Malformed('bad data.result')
+        if task is None:
+            raise _Malformed('missing taskId')
+    return _Row(seq, day_of(stamp), session, module, task, kind, tuple(dict.fromkeys(skills)), status, check, level, result)
+
+
+def _rows(events, day_of, on_skip):
+    """The counted events as rows, in log order, and the number of events skipped because a field was wrong."""
+    rows, skipped = [], 0
     for seq, item in enumerate(events):
-        if type(item) is not dict:
-            raise _Malformed()
-        source = item.get('source')
-        if type(source) is not str or source not in SOURCES:
-            raise _Malformed()
-        if source not in COUNTED_SOURCES:
+        try:
+            row = _row(seq, item, day_of)
+        except _Malformed as bad:
+            skipped += 1
+            if on_skip is not None:
+                on_skip(seq, bad.reason)
             continue
-        stamp = _utc_minutes(item.get('time'))
-        if stamp is None:
-            raise _Malformed()
-        session = _text(item.get('sessionId'))
-        module = _text(item.get('moduleId'))
-        task = item.get('taskId')
-        if task is not None:
-            _text(task)
-        kind = _text(item.get('type'))
-        skills = item.get('skills')
-        if type(skills) is not list or any(type(skill) is not str for skill in skills):
-            raise _Malformed()
-        data = item.get('data')
-        if type(data) is not dict:
-            raise _Malformed()
-        status = check = level = None
-        if kind == 'check_result':
-            status, check = data.get('status'), data.get('checkId')
-            if type(status) is not str or status not in CHECK_STATUSES or task is None:
-                raise _Malformed()
-            _text(check)
-        elif kind == 'hint_requested':
-            level = data.get('level')
-            if type(level) is not str or level not in _LEVEL or task is None:
-                raise _Malformed()
-        elif kind == 'task_finished' and task is None:
-            raise _Malformed()
-        rows.append(_Row(seq, (stamp + offset) // _MINUTES_PER_DAY, session, module, task, kind, tuple(dict.fromkeys(skills)), status, check, level))
-    return rows
+        if row is not None:
+            rows.append(row)
+    return rows, skipped
 
 
 def _cap(text, limit):
@@ -223,39 +293,48 @@ def _check_modules(modules):
 # The rollup
 # ----------------------------------------------------------------------
 
-def compute_hub(events, log, modules, now, tz_offset_minutes=0):
+def compute_hub(events, log, modules, now, tz_offset_minutes=0, time_zone=None, on_skip=None):
     """The hub response as plain data.
 
     `events` are the valid events of the log as dicts, in log order. `log` is a `LogFacts`. `modules` are the
     pinned modules in the order the store lists them. `now` is a datetime with a time zone: the caller's clock.
-    `tz_offset_minutes` is the student's offset east of UTC. Nothing here reads a file or a clock.
+    The student's day is set by `tz_offset_minutes` (a fixed offset east of UTC) or by `time_zone` (a tzinfo such
+    as a ZoneInfo, which gives each event the offset it had at that moment), never both.
+    `on_skip(seq, reason)` is called for each event that is left out because a field is wrong; `seq` is the
+    position in `events`. Nothing here reads a file or a clock.
     """
     offset = check_offset(tz_offset_minutes)
     if not isinstance(log, LogFacts):
         raise ValueError('log must be a LogFacts value.')
+    if time_zone is None:
+        day_of = _fixed_day(offset)
+    elif not isinstance(time_zone, datetime.tzinfo):
+        raise ValueError('time_zone must be a tzinfo value.')
+    elif offset != 0:
+        raise ValueError('Give an offset or a time zone, not both.')
+    else:
+        day_of = _zone_day(time_zone)
     now_minutes, generated_at = _clock_minutes(now)
     modules = _check_modules(modules)
-    today = (now_minutes + offset) // _MINUTES_PER_DAY
-    log_ok = log.ok
-    try:
-        rows = _rows(events, offset)
-    except _Malformed:
-        # A valid log never holds such an event. Trust no event rollup, and say so through log.ok.
-        rows, log_ok = [], False
-    rows = [row for row in rows if row.day <= today]  # an event after today counts in nothing
+    today = day_of(now_minutes)
+    rows, skipped = _rows(events, day_of, on_skip)
+    future = sum(1 for row in rows if row.day > today)
+    rows = [row for row in rows if row.day <= today]  # an event after today counts in nothing but futureEvents
 
     pinned = {info.module_id: info for info in modules}
     check_ids = {info.module_id: frozenset(check.check_id for check in info.checks) for info in modules}
     window_start = today - _weekday(today) - _WEEK_DAYS * (WINDOW_WEEKS - 1)
     sessions_by_day = {}
-    completed, finished, last_seq = set(), {}, {}
-    hints, check_state = {}, {}
-    skill_windows = {}
+    completed, results, last_seq = set(), {}, {}
+    hints, check_state, skill_state = {}, {}, {}
+    unmatched = 0
     for row in rows:
         sessions_by_day.setdefault(row.day, set()).add(row.session)
-        if row.kind == 'check_result' and row.status != 'skipped':
+        if row.kind == 'check_result' and row.status in SKILL_STATUSES:
             for skill in row.skills:
-                skill_windows.setdefault(skill, collections.deque(maxlen=SKILL_WINDOW)).append(row.status == 'passed')
+                entry = skill_state.setdefault(skill, [collections.deque(maxlen=SKILL_WINDOW), 0])
+                entry[0].append(row.status == 'passed')
+                entry[1] = row.seq
         module = row.module
         if module not in pinned:
             continue
@@ -263,34 +342,41 @@ def compute_hub(events, log, modules, now, tz_offset_minutes=0):
         if row.kind == 'module_completed':
             completed.add(module)
         elif row.kind == 'task_finished':
-            finished.setdefault(module, set()).add(row.task)
+            results.setdefault(module, {})[row.task] = row.result
         elif row.kind == 'hint_requested':
             key = (module, row.task)
             hints[key] = max(hints.get(key, -1), _LEVEL[row.level])
-        elif row.kind == 'check_result' and row.check in check_ids[module]:
-            state = check_state.setdefault((module, row.check), {'retries': 0, 'passed': False, 'last': 0, 'tasks': set()})
-            state['last'] = row.seq
-            state['tasks'].add(row.task)
-            if not state['passed']:
-                if row.status == 'passed':
-                    state['passed'] = True
-                else:
-                    state['retries'] += 1
+        elif row.kind == 'check_result':
+            if row.check not in check_ids[module]:
+                unmatched += 1
+            elif row.status != 'skipped':
+                state = check_state.setdefault((module, row.check), {'retries': 0, 'passed': False, 'last': 0, 'tasks': set(), 'level': -1})
+                state['last'] = row.seq
+                state['tasks'].add(row.task)
+                if not state['passed']:
+                    if row.status in PASS_STATUSES:
+                        state['passed'] = True
+                        # The hints that came before the pass, on the tasks this check has been run for.
+                        state['level'] = max((hints.get((module, task), -1) for task in state['tasks']), default=-1)
+                    else:
+                        state['retries'] += 1
 
     focus_id = _choose_focus(modules, completed, last_seq)
+    recent_skills = sorted(skill_state.items(), key=lambda item: item[1][1], reverse=True)[:SKILL_LIMIT]
     return {
         'schemaVersion': SCHEMA_VERSION,
         'generatedAt': generated_at,
-        'log': {'exists': log.exists, 'ok': log_ok, 'events': log.events, 'damagedLines': log.damaged_lines, 'truncatedTail': log.truncated_tail},
-        'focus': _focus(pinned.get(focus_id), finished),
+        'log': {'exists': log.exists, 'ok': log.ok, 'fault': log.fault, 'events': log.events, 'damagedLines': log.damaged_lines,
+                'truncatedTail': log.truncated_tail, 'skippedEvents': skipped, 'futureEvents': future, 'unmatchedEvents': unmatched},
+        'focus': _focus(pinned.get(focus_id), results),
         'participation': _participation(sessions_by_day, window_start, today),
         'checkpoints': {'done': len(completed), 'total': len(modules)},
-        'skills': [{'skillId': skill, 'passed': sum(window), 'tried': len(window), 'window': SKILL_WINDOW}
-                   for skill, window in sorted(skill_windows.items())],
+        'skills': [{'skillId': skill, 'passed': sum(entry[0]), 'tried': len(entry[0]), 'window': SKILL_WINDOW}
+                   for skill, entry in sorted(recent_skills)],
+        'skillsTotal': len(skill_state),
         'checks': _checks(check_state, pinned, hints),
-        'library': [{'moduleId': info.module_id, 'version': info.version, 'title': _cap(info.title, TITLE_CAP),
-                     'status': 'done' if info.module_id in completed else 'focus' if info.module_id == focus_id else 'next',
-                     'tasksTotal': len(info.tasks), 'tasksDone': _tasks_done(info, finished)} for info in modules],
+        'checksTotal': len(check_state),
+        'library': [_library_entry(info, completed, focus_id, results) for info in modules],
     }
 
 
@@ -303,21 +389,33 @@ def _choose_focus(modules, completed, last_seq):
     return max(touched, key=last_seq.__getitem__) if touched else open_modules[0]
 
 
-def _tasks_done(info, finished):
-    done = finished.get(info.module_id, ())
-    return len({task.task_id for task in info.tasks if task.task_id in done})
+def _task_counts(info, results):
+    """(passed, skipped) task counts of a module. The latest result of a task wins. A result for a task the module lacks counts nowhere."""
+    found = results.get(info.module_id, {})
+    mine = {task.task_id for task in info.tasks}
+    done = sum(1 for task_id in mine if found.get(task_id) == 'passed')
+    skipped = sum(1 for task_id in mine if found.get(task_id) in ('abandoned', 'skipped'))
+    return done, skipped
 
 
-def _focus(info, finished):
+def _focus(info, results):
     if info is None:
         return None
-    done = finished.get(info.module_id, ())
-    upcoming = next((task for task in info.tasks if task.task_id not in done), None)
+    found = results.get(info.module_id, {})
+    upcoming = next((task for task in info.tasks if task.task_id not in found), None)  # any finish moves past a task
+    done, skipped = _task_counts(info, results)
     return {
         'moduleId': info.module_id, 'version': info.version, 'title': _cap(info.title, TITLE_CAP),
-        'tasksTotal': len(info.tasks), 'tasksDone': _tasks_done(info, finished),
+        'tasksTotal': len(info.tasks), 'tasksDone': done, 'tasksSkipped': skipped,
         'nextTask': None if upcoming is None else {'taskId': upcoming.task_id, 'text': _cap(upcoming.text, TASK_TEXT_CAP)},
     }
+
+
+def _library_entry(info, completed, focus_id, results):
+    done, skipped = _task_counts(info, results)
+    return {'moduleId': info.module_id, 'version': info.version, 'title': _cap(info.title, TITLE_CAP),
+            'status': 'done' if info.module_id in completed else 'focus' if info.module_id == focus_id else 'next',
+            'tasksTotal': len(info.tasks), 'tasksDone': done, 'tasksSkipped': skipped}
 
 
 def _participation(sessions_by_day, window_start, today):
@@ -336,12 +434,17 @@ def _participation(sessions_by_day, window_start, today):
 
 
 def _checks(check_state, pinned, hints):
-    recent = sorted(check_state.items(), key=lambda item: item[1]['last'], reverse=True)[:CHECK_LIMIT]
+    """Up to CHECK_LIMIT checks: the open ones first, then the most recent. They are listed newest first."""
+    chosen = sorted(check_state.items(), key=lambda item: (item[1]['passed'], -item[1]['last']))[:CHECK_LIMIT]
+    chosen.sort(key=lambda item: item[1]['last'], reverse=True)
     rows = []
-    for (module, check_id), state in recent:
+    for (module, check_id), state in chosen:
         title = next(check.title for check in pinned[module].checks if check.check_id == check_id)
-        reached = max((hints.get((module, task), -1) for task in state['tasks']), default=-1)
-        rows.append({'moduleId': module, 'checkId': check_id, 'title': _cap(title, TITLE_CAP),
+        if state['passed']:
+            reached = state['level']
+        else:  # not passed yet: every hint so far counts
+            reached = max((hints.get((module, task), -1) for task in state['tasks']), default=-1)
+        rows.append({'moduleId': module, 'checkId': check_id, 'title': _cap(title, CHECK_TEXT_CAP),
                      'retriesBeforeFirstPass': state['retries'], 'open': not state['passed'],
                      'hintLevelReached': HINT_LADDER[reached] if reached >= 0 else None})
     return rows
@@ -351,19 +454,33 @@ def _checks(check_state, pinned, hints):
 # The thin reader
 # ----------------------------------------------------------------------
 
+def _warn(message):
+    """One line on stderr. A closed or broken stderr must never break the hub."""
+    try:
+        print(message, file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+
 def _read_log(events):
-    """The log facts and the valid events. One `read`. An unreadable log is a finding, not an error."""
+    """The log facts, the valid events, and the line number of each. One `read`.
+
+    A log that cannot be read is a finding, not an error: `log.ok` is false and `log.fault` holds the code
+    of the log store. The class and the code go to stderr, so the fault is not silent.
+    """
     try:
         report = events.read()
     except EventLogError as error:
         if error.code in UNREADABLE_CODES:
-            return LogFacts(True, False, 0, 0, False), []
+            _warn(f'hub: the event log cannot be read ({type(error).__name__} {error.code}). The hub shows log.ok false.')
+            return LogFacts(True, False, 0, 0, False, error.code), [], []
         raise
     if not report['exists']:
-        return LogFacts(False, True, 0, 0, False), []
+        return LogFacts(False, True, 0, 0, False), [], []
     valid = [item['event'] for item in report['events']]
+    lines = [item['line'] for item in report['events']]
     damaged = sum(1 for line in report['lines'] if line['ok'] is not True and line.get('reason') != 'truncated_tail')
-    return LogFacts(True, report['ok'] is True, len(valid), damaged, report['truncatedTail'] is True), valid
+    return LogFacts(True, report['ok'] is True, len(valid), damaged, report['truncatedTail'] is True), valid, lines
 
 
 def _corrupt():
@@ -398,8 +515,21 @@ def _read_modules(lessons):
     return found
 
 
-def build_hub(events, lessons, now, tz_offset_minutes=0):
-    """Read the event log once and the lesson store, and return the hub response. Writes nothing."""
+def build_hub(events, lessons, now, tz_offset_minutes=0, time_zone=None):
+    """Read the event log once and the lesson store, and return the hub response. Writes no file.
+
+    `time_zone` is a tzinfo from `load_zone`, or None. A skipped event is named on stderr by its line number.
+    """
     offset = check_offset(tz_offset_minutes)
-    log, valid = _read_log(events)
-    return compute_hub(valid, log, _read_modules(lessons), now, offset)
+    log, valid, lines = _read_log(events)
+    skipped = [0]
+
+    def note(seq, reason):
+        skipped[0] += 1
+        if skipped[0] <= SKIP_NOTES:
+            _warn(f'hub: skipped the event on line {lines[seq]}: {reason}')
+
+    result = compute_hub(valid, log, _read_modules(lessons), now, offset, time_zone, note)
+    if skipped[0] > SKIP_NOTES:
+        _warn(f'hub: skipped {skipped[0]} events in all. The first {SKIP_NOTES} are named above.')
+    return result

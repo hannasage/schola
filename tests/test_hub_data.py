@@ -1,6 +1,8 @@
 """The hub rollups: pure functions over events and modules, and the thin reader of the two stores."""
+import contextlib
 import datetime
 import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 import uuid
+import zoneinfo
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -30,6 +33,7 @@ S2 = '22222222-2222-4222-8222-222222222222'
 S3 = '33333333-3333-4333-8333-333333333333'
 APP_TYPES = ('attempt_submitted', 'check_result', 'task_finished', 'module_completed')
 LOG_OK = LogFacts(exists=True, ok=True, events=0, damaged_lines=0, truncated_tail=False)
+NEW_YORK = zoneinfo.ZoneInfo('America/New_York')
 FIXTURE = ROOT / 'tests' / 'fixtures' / 'contracts' / 'valid' / 'lesson-module-minimal.json'
 
 
@@ -65,8 +69,23 @@ def module(module_id='intro', version='1.0.0', title='Intro', tasks=('t1', 't2',
                       tuple(CheckInfo(c, f'Check {c}') for c in checks))
 
 
-def hub(events=(), modules=(), now=NOW, tz=0, log=LOG_OK):
-    return hub_data.compute_hub(list(events), log, list(modules), now, tz)
+def hub(events=(), modules=(), now=NOW, tz=0, log=LOG_OK, zone=None, skipped=None):
+    return hub_data.compute_hub(list(events), log, list(modules), now, tz, zone, skipped)
+
+
+def log_block(**changes):
+    """The `log` object of a response, with the defaults of a clean log."""
+    block = {'exists': True, 'ok': True, 'fault': None, 'events': 0, 'damagedLines': 0, 'truncatedTail': False,
+             'skippedEvents': 0, 'futureEvents': 0, 'unmatchedEvents': 0}
+    block.update(changes)
+    return block
+
+
+def iso(stamp, minutes=0):
+    """An aware datetime as RFC 3339 text written with a fixed offset of `minutes` (Z when 0)."""
+    local = stamp.astimezone(datetime.timezone(datetime.timedelta(minutes=minutes)))
+    zone = 'Z' if minutes == 0 else f"{'+' if minutes > 0 else '-'}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+    return local.strftime('%Y-%m-%dT%H:%M:%S') + zone
 
 
 def local_day(text, tz):
@@ -92,13 +111,14 @@ def day_count(result, date):
 class ShapeTests(unittest.TestCase):
     def test_an_empty_hub_has_the_decided_closed_shape(self):
         result = hub()
-        self.assertEqual(list(result), ['schemaVersion', 'generatedAt', 'log', 'focus', 'participation', 'checkpoints', 'skills', 'checks', 'library'])
+        self.assertEqual(list(result), ['schemaVersion', 'generatedAt', 'log', 'focus', 'participation', 'checkpoints', 'skills', 'skillsTotal', 'checks', 'checksTotal', 'library'])
         self.assertEqual(result['schemaVersion'], '1.0')
         self.assertEqual(result['generatedAt'], '2026-11-05T12:00:00Z')
-        self.assertEqual(result['log'], {'exists': True, 'ok': True, 'events': 0, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=True, ok=True, events=0, damagedLines=0, truncatedTail=False))
         self.assertIsNone(result['focus'])
         self.assertEqual(result['checkpoints'], {'done': 0, 'total': 0})
         self.assertEqual((result['skills'], result['checks'], result['library']), ([], [], []))
+        self.assertEqual((result['skillsTotal'], result['checksTotal']), (0, 0))
 
     def test_the_response_is_plain_json(self):
         result = hub([event('task_opened')], [module()])
@@ -108,14 +128,15 @@ class ShapeTests(unittest.TestCase):
         events = [event('task_opened'), check('failed', skills=['loops']), check('passed', skills=['loops']), hint('question'),
                   event('task_finished')]
         result = hub(events, [module(), module('second')])
-        self.assertEqual(set(result['focus']), {'moduleId', 'version', 'title', 'tasksTotal', 'tasksDone', 'nextTask'})
+        self.assertEqual(list(result['log']), list(log_block()))
+        self.assertEqual(set(result['focus']), {'moduleId', 'version', 'title', 'tasksTotal', 'tasksDone', 'tasksSkipped', 'nextTask'})
         self.assertEqual(set(result['focus']['nextTask']), {'taskId', 'text'})
         self.assertEqual(set(result['participation']), {'windowWeeks', 'weeks', 'totals'})
         self.assertEqual(set(result['participation']['weeks'][0]), {'start', 'days', 'sessions', 'activeDays'})
         self.assertEqual(set(result['participation']['totals']), {'sessions', 'activeDays', 'days'})
         self.assertEqual(set(result['skills'][0]), {'skillId', 'passed', 'tried', 'window'})
         self.assertEqual(set(result['checks'][0]), {'moduleId', 'checkId', 'title', 'retriesBeforeFirstPass', 'open', 'hintLevelReached'})
-        self.assertEqual(set(result['library'][0]), {'moduleId', 'version', 'title', 'status', 'tasksTotal', 'tasksDone'})
+        self.assertEqual(set(result['library'][0]), {'moduleId', 'version', 'title', 'status', 'tasksTotal', 'tasksDone', 'tasksSkipped'})
 
     def test_no_key_names_a_streak_a_rank_a_total_time_or_a_feeling(self):
         banned = re.compile(r'streak|leader|rank|score|badge|minutes|duration|time|total_?time|guess|frustrat|emotion|mood', re.I)
@@ -274,7 +295,7 @@ class DayConversionTests(unittest.TestCase):
             events, expected = [], {}
             for index in range(40):
                 stamp = now + datetime.timedelta(minutes=rng.randrange(-60 * 24 * 80, 60 * 24 * 3))
-                text = stamp.strftime('%Y-%m-%dT%H:%M:%SZ')
+                text = iso(stamp, rng.choice([0, 0, 330, -480, 60, -30, 840, -840, 545]))
                 session = [S1, S2, S3][rng.randrange(3)]
                 source = rng.choice(['student', 'app', 'agent'])
                 events.append(event('task_opened', text, source=source, session=session))
@@ -433,14 +454,43 @@ class SkillTests(unittest.TestCase):
         result = hub(events)['skills'][0]
         self.assertEqual((result['passed'], result['tried']), (1, 5))
 
-    def test_every_status_but_passed_is_tried_and_not_passed_except_skipped_which_is_ignored(self):
-        for status in ('failed', 'error', 'self-reported'):
+    def test_failed_and_error_are_tried_and_not_passed(self):
+        for status in ('failed', 'error'):
             self.assertEqual(hub([check(status, skills=['loops'])])['skills'], [{'skillId': 'loops', 'passed': 0, 'tried': 1, 'window': 5}], status)
-        self.assertEqual(hub([check('skipped', skills=['loops'])])['skills'], [])
 
-    def test_a_skipped_result_does_not_push_a_real_result_out_of_the_window(self):
-        events = [check('passed', skills=['loops'])] + [check('skipped', skills=['loops']) for _ in range(9)]
-        self.assertEqual(hub(events)['skills'], [{'skillId': 'loops', 'passed': 1, 'tried': 1, 'window': 5}])
+    def test_a_self_reported_or_skipped_result_is_not_skill_evidence(self):
+        for status in ('self-reported', 'skipped'):
+            result = hub([check(status, skills=['loops'])])
+            self.assertEqual((result['skills'], result['skillsTotal']), ([], 0), status)
+
+    def test_a_self_reported_or_skipped_result_does_not_push_a_real_result_out_of_the_window(self):
+        for status in ('skipped', 'self-reported'):
+            events = [check('passed', skills=['loops'])] + [check(status, skills=['loops']) for _ in range(9)]
+            self.assertEqual(hub(events)['skills'], [{'skillId': 'loops', 'passed': 1, 'tried': 1, 'window': 5}], status)
+
+    def test_only_the_hundred_most_recently_tried_skills_are_kept_and_the_total_is_given(self):
+        events = [check('passed', skills=[f's{n:03d}']) for n in range(120)]
+        result = hub(events)
+        self.assertEqual(result['skillsTotal'], 120)
+        self.assertEqual([item['skillId'] for item in result['skills']], [f's{n:03d}' for n in range(20, 120)])
+
+    def test_a_later_result_makes_an_old_skill_recent_again(self):
+        events = [check('passed', skills=[f's{n:03d}']) for n in range(101)] + [check('failed', skills=['s000'])]
+        result = hub(events)
+        ids = [item['skillId'] for item in result['skills']]
+        self.assertIn('s000', ids)
+        self.assertNotIn('s001', ids)
+        self.assertEqual((result['skillsTotal'], len(ids)), (101, 100))
+
+    def test_a_skipped_result_does_not_make_a_skill_recent(self):
+        events = [check('passed', skills=[f's{n:03d}']) for n in range(100)] + [check('skipped', skills=['s000']), check('passed', skills=['extra'])]
+        ids = [item['skillId'] for item in hub(events)['skills']]
+        self.assertNotIn('s000', ids)
+        self.assertIn('extra', ids)
+
+    def test_under_the_limit_the_total_is_the_length(self):
+        result = hub([check('passed', skills=['a-skill']), check('failed', skills=['b-skill'])])
+        self.assertEqual((result['skillsTotal'], len(result['skills'])), (2, 2))
 
     def test_skills_are_tracked_apart(self):
         events = [check('passed', skills=['a-skill']) for _ in range(6)] + [check('failed', skills=['b-skill'])]
@@ -477,9 +527,24 @@ class CheckRowTests(unittest.TestCase):
         row = hub([check('failed'), check('error')], [module()])['checks'][0]
         self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (2, True))
 
-    def test_a_skipped_or_self_reported_result_is_not_a_pass(self):
-        row = hub([check('skipped'), check('self-reported')], [module()])['checks'][0]
-        self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (2, True))
+    def test_a_self_reported_result_counts_as_a_pass_for_the_check(self):
+        row = hub([check('failed'), check('self-reported'), check('failed')], [module()])['checks'][0]
+        self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (1, False))
+
+    def test_a_self_reported_result_on_the_first_try_is_a_pass_with_no_retries(self):
+        row = hub([check('self-reported')], [module()])['checks'][0]
+        self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (0, False))
+
+    def test_a_skipped_result_is_neither_a_retry_nor_a_pass(self):
+        row = hub([check('failed'), check('skipped'), check('skipped'), check('passed')], [module()])['checks'][0]
+        self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (1, False))
+        self.assertEqual(hub([check('skipped'), check('skipped')], [module()])['checks'], [])
+        row = hub([check('failed'), check('skipped')], [module()])['checks'][0]
+        self.assertEqual((row['retriesBeforeFirstPass'], row['open']), (1, True))
+
+    def test_a_skipped_result_does_not_make_a_check_recent(self):
+        events = [check('failed', check_id='c1'), check('failed', check_id='c2'), check('skipped', check_id='c1')]
+        self.assertEqual([r['checkId'] for r in hub(events, [module()])['checks']], ['c2', 'c1'])
 
     def test_checks_are_tracked_apart_by_module_and_id(self):
         events = [check('failed', check_id='c1'), check('passed', check_id='c2'), check('failed', module='second', check_id='c1')]
@@ -526,13 +591,52 @@ class CheckRowTests(unittest.TestCase):
         events = [check('failed', task='t1'), hint('full-answer', task='t2'), hint('full-answer', task='t1', module='second')]
         self.assertIsNone(hub(events, [module(), module('second')])['checks'][0]['hintLevelReached'])
 
-    def test_a_hint_before_the_check_result_still_counts(self):
+    def test_a_hint_before_the_check_result_counts_when_it_comes_before_the_pass(self):
         events = [hint('question', task='t1'), check('failed', task='t1')]
         self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'question')
+        events = [hint('question', task='t1'), check('passed', task='t1')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'question')
+
+    def test_a_hint_after_the_first_pass_does_not_count(self):
+        events = [hint('nudge', task='t1'), check('passed', task='t1'), hint('full-answer', task='t1')]
+        row = hub(events, [module()])['checks'][0]
+        self.assertEqual(row['hintLevelReached'], 'nudge')
+        events = [check('passed', task='t1'), hint('full-answer', task='t1')]
+        self.assertIsNone(hub(events, [module()])['checks'][0]['hintLevelReached'])
+
+    def test_a_check_not_passed_yet_counts_every_hint_so_far(self):
+        events = [check('failed', task='t1'), hint('partial-example', task='t1'), check('failed', task='t1'), hint('full-answer', task='t1')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'full-answer')
+
+    def test_two_checks_on_one_task_share_the_hints_before_their_own_pass(self):
+        events = [hint('nudge', task='t1'), check('passed', task='t1', check_id='c1'), hint('full-answer', task='t1'),
+                  check('passed', task='t1', check_id='c2')]
+        rows = {r['checkId']: r for r in hub(events, [module()])['checks']}
+        self.assertEqual((rows['c1']['hintLevelReached'], rows['c2']['hintLevelReached']), ('nudge', 'full-answer'))
+        events = [hint('nudge', task='t1'), check('passed', task='t1', check_id='c1'), hint('full-answer', task='t1'),
+                  check('failed', task='t1', check_id='c2')]
+        rows = {r['checkId']: r for r in hub(events, [module()])['checks']}
+        self.assertEqual((rows['c1']['hintLevelReached'], rows['c2']['hintLevelReached']), ('nudge', 'full-answer'))
+
+    def test_a_self_reported_pass_also_ends_the_hint_window(self):
+        events = [hint('question', task='t1'), check('self-reported', task='t1'), hint('full-answer', task='t1')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'question')
+
+    def test_a_pass_on_one_task_counts_the_hints_on_the_other_task_the_check_was_run_for(self):
+        events = [check('failed', task='t1'), hint('full-answer', task='t1'), check('passed', task='t2')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'full-answer')
+
+    def test_the_hint_window_takes_the_tasks_seen_up_to_the_pass(self):
+        events = [check('failed', task='t1'), hint('full-answer', task='t2'), check('passed', task='t2')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'full-answer')
+        events = [check('failed', task='t1'), check('passed', task='t1'), hint('full-answer', task='t2'), check('failed', task='t2')]
+        self.assertIsNone(hub(events, [module()])['checks'][0]['hintLevelReached'])
 
     def test_a_check_run_for_two_tasks_takes_the_highest_hint_of_either(self):
         events = [check('failed', task='t1'), check('failed', task='t2'), hint('question', task='t1'), hint('full-answer', task='t2')]
         self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'full-answer')
+        events = [check('failed', task='t1'), check('failed', task='t2'), hint('question', task='t1'), hint('partial-example', task='t2')]
+        self.assertEqual(hub(events, [module()])['checks'][0]['hintLevelReached'], 'partial-example')
 
     def test_only_the_twenty_most_recently_active_checks_are_kept_newest_first(self):
         ids = [f'c{n:02d}' for n in range(30)]
@@ -540,6 +644,30 @@ class CheckRowTests(unittest.TestCase):
         rows = hub(events, [module(checks=ids)])['checks']
         self.assertEqual(len(rows), 20)
         self.assertEqual([r['checkId'] for r in rows], ids[::-1][:20])
+        self.assertEqual(hub(events, [module(checks=ids)])['checksTotal'], 30)
+
+    def test_over_the_limit_open_checks_are_kept_first_then_the_most_recent(self):
+        ids = [f'c{n:02d}' for n in range(25)]
+        events = [check('failed', check_id=name) for name in ids[:5]] + [check('passed', check_id=name) for name in ids[5:]]
+        result = hub(events, [module(checks=ids)])
+        shown = [r['checkId'] for r in result['checks']]
+        self.assertEqual(result['checksTotal'], 25)
+        self.assertEqual(sorted(shown), ids[:5] + ids[10:])  # the 5 open checks and the 15 newest passed ones
+        self.assertEqual(shown, ids[10:][::-1] + ids[:5][::-1])  # newest first
+
+    def test_many_open_checks_are_cut_to_the_most_recent_open_ones(self):
+        ids = [f'c{n:02d}' for n in range(25)]
+        events = [check('failed', check_id=name) for name in ids] + [check('passed', check_id='c24')]
+        result = hub(events, [module(checks=ids)])
+        shown = [r['checkId'] for r in result['checks']]
+        self.assertEqual(len(shown), 20)
+        self.assertNotIn('c24', shown)  # it passed, so it ranks after every open check
+        self.assertEqual(sorted(shown), ids[4:24])
+
+    def test_under_the_limit_the_total_is_the_length(self):
+        result = hub([check('failed', check_id='c1'), check('passed', check_id='c2')], [module()])
+        self.assertEqual((result['checksTotal'], len(result['checks'])), (2, 2))
+        self.assertEqual(hub([], [module()])['checksTotal'], 0)
 
     def test_a_later_result_makes_an_old_check_recent_again(self):
         ids = [f'c{n:02d}' for n in range(21)]
@@ -566,7 +694,7 @@ class FocusTests(unittest.TestCase):
 
     def test_with_no_events_the_first_pinned_module_is_the_focus(self):
         result = hub([], [module('alpha', title='Alpha'), module('beta')])
-        self.assertEqual(result['focus'], {'moduleId': 'alpha', 'version': '1.0.0', 'title': 'Alpha', 'tasksTotal': 3, 'tasksDone': 0,
+        self.assertEqual(result['focus'], {'moduleId': 'alpha', 'version': '1.0.0', 'title': 'Alpha', 'tasksTotal': 3, 'tasksDone': 0, 'tasksSkipped': 0,
                                            'nextTask': {'taskId': 't1', 'text': 'Do t1'}})
 
     def test_the_module_with_the_latest_event_is_the_focus(self):
@@ -607,9 +735,32 @@ class FocusTests(unittest.TestCase):
         focus = hub(events, [module(), module('other')])['focus']
         self.assertEqual((focus['tasksDone'], focus['tasksTotal']), (2, 3))
 
-    def test_any_task_finished_result_counts_as_done(self):
+    def test_only_a_passed_task_counts_as_done_and_the_others_count_as_skipped(self):
+        events = [event('task_finished', task='t1', result='abandoned'), event('task_finished', task='t2', result='skipped'),
+                  event('task_finished', task='t3', result='passed')]
+        focus = hub(events, [module()])['focus']
+        self.assertEqual((focus['tasksDone'], focus['tasksSkipped'], focus['tasksTotal']), (1, 2, 3))
+        self.assertEqual(hub(events, [module()])['library'][0]['tasksSkipped'], 2)
+
+    def test_next_task_moves_past_any_finished_task(self):
         events = [event('task_finished', task='t1', result='abandoned'), event('task_finished', task='t2', result='skipped')]
-        self.assertEqual(hub(events, [module()])['focus']['tasksDone'], 2)
+        self.assertEqual(hub(events, [module()])['focus']['nextTask']['taskId'], 't3')
+        events = [event('task_finished', task=name, result='skipped') for name in ('t1', 't2', 't3')]
+        focus = hub(events, [module()])['focus']
+        self.assertEqual((focus['nextTask'], focus['tasksDone'], focus['tasksSkipped']), (None, 0, 3))
+
+    def test_the_latest_result_of_a_task_wins(self):
+        events = [event('task_finished', task='t1', result='abandoned'), event('task_finished', task='t1', result='passed')]
+        focus = hub(events, [module()])['focus']
+        self.assertEqual((focus['tasksDone'], focus['tasksSkipped']), (1, 0))
+        events.reverse()
+        focus = hub(events, [module()])['focus']
+        self.assertEqual((focus['tasksDone'], focus['tasksSkipped']), (0, 1))
+
+    def test_a_finish_for_a_task_the_module_does_not_have_counts_nowhere(self):
+        events = [event('task_finished', task='ghost', result='abandoned'), event('task_finished', task='ghost-2')]
+        focus = hub(events, [module()])['focus']
+        self.assertEqual((focus['tasksDone'], focus['tasksSkipped']), (0, 0))
 
     def test_the_next_task_is_the_first_in_module_order_without_a_finish(self):
         events = [event('task_finished', task='t1'), event('task_finished', task='t3')]
@@ -627,7 +778,7 @@ class FocusTests(unittest.TestCase):
     def test_a_module_with_no_tasks(self):
         result = hub([event('task_opened', task='t1')], [module(tasks=())])
         self.assertEqual((result['focus']['tasksTotal'], result['focus']['tasksDone'], result['focus']['nextTask']), (0, 0, None))
-        self.assertEqual((result['library'][0]['tasksTotal'], result['library'][0]['tasksDone']), (0, 0))
+        self.assertEqual((result['library'][0]['tasksTotal'], result['library'][0]['tasksDone'], result['library'][0]['tasksSkipped']), (0, 0, 0))
 
     def test_a_task_finished_by_an_agent_does_not_count(self):
         self.assertEqual(hub([event('task_finished', task='t1', source='agent')], [module()])['focus']['tasksDone'], 0)
@@ -639,7 +790,7 @@ class LibraryTests(unittest.TestCase):
         result = hub(events, [module('a'), module('b'), module('c'), module('d')])
         self.assertEqual([(m['moduleId'], m['status']) for m in result['library']], [('a', 'next'), ('b', 'done'), ('c', 'focus'), ('d', 'next')])
         self.assertEqual([m['tasksDone'] for m in result['library']], [0, 0, 1, 0])
-        self.assertEqual(result['library'][0], {'moduleId': 'a', 'version': '1.0.0', 'title': 'Intro', 'status': 'next', 'tasksTotal': 3, 'tasksDone': 0})
+        self.assertEqual(result['library'][0], {'moduleId': 'a', 'version': '1.0.0', 'title': 'Intro', 'status': 'next', 'tasksTotal': 3, 'tasksDone': 0, 'tasksSkipped': 0})
 
     def test_fifty_modules(self):
         modules = [module(f'm{n:02d}') for n in range(50)]
@@ -657,13 +808,28 @@ class LibraryTests(unittest.TestCase):
 
 
 class TextTests(unittest.TestCase):
-    def test_titles_and_task_text_are_cut_at_the_contract_caps(self):
+    def test_the_caps_are_the_maxima_of_the_lesson_contract(self):
+        common = json.loads((ROOT / 'contracts' / 'lesson-common.v1.schema.json').read_text(encoding='utf-8'))['$defs']
+        defs = json.loads((ROOT / 'contracts' / 'lesson-module.v1.schema.json').read_text(encoding='utf-8'))['$defs']
+        self.assertEqual(hub_data.TITLE_CAP, common['title']['maxLength'])
+        self.assertEqual(hub_data.TASK_TEXT_CAP, defs['task']['properties']['prompt']['maxLength'])
+        self.assertEqual(hub_data.CHECK_TEXT_CAP, defs['check']['properties']['description']['maxLength'])
+
+    def test_text_at_the_contract_maximum_is_never_cut(self):
+        info = ModuleInfo('intro', '1.0.0', 'T' * 200, (TaskInfo('t1', 'P' * 5000),), (CheckInfo('c1', 'D' * 2000),))
+        result = hub([check('failed', task='t1')], [info])
+        self.assertEqual(result['focus']['title'], 'T' * 200)
+        self.assertEqual(result['library'][0]['title'], 'T' * 200)
+        self.assertEqual(result['focus']['nextTask']['text'], 'P' * 5000)
+        self.assertEqual(result['checks'][0]['title'], 'D' * 2000)
+
+    def test_text_over_the_contract_maximum_is_cut_to_it(self):
         info = ModuleInfo('intro', '1.0.0', 'T' * 5000, (TaskInfo('t1', 'P' * 9000),), (CheckInfo('c1', 'D' * 3000),))
         result = hub([check('failed', task='t1')], [info])
         self.assertEqual(len(result['focus']['title']), 200)
         self.assertEqual(len(result['library'][0]['title']), 200)
         self.assertEqual(len(result['focus']['nextTask']['text']), 5000)
-        self.assertEqual(len(result['checks'][0]['title']), 200)
+        self.assertEqual(len(result['checks'][0]['title']), 2000)
 
     def test_control_and_bidirectional_characters_pass_through_as_data(self):
         nasty = 'a\x00b\x1b[31m‮⁦<script>alert(1)</script>\ud800'
@@ -684,12 +850,12 @@ class TextTests(unittest.TestCase):
 class DamageTests(unittest.TestCase):
     def test_log_facts_are_reported_as_given(self):
         log = LogFacts(exists=True, ok=False, events=7, damaged_lines=2, truncated_tail=True)
-        self.assertEqual(hub(log=log)['log'], {'exists': True, 'ok': False, 'events': 7, 'damagedLines': 2, 'truncatedTail': True})
+        self.assertEqual(hub(log=log)['log'], log_block(exists=True, ok=False, events=7, damagedLines=2, truncatedTail=True))
 
     def test_a_missing_log_gives_zeros(self):
         log = LogFacts(exists=False, ok=True, events=0, damaged_lines=0, truncated_tail=False)
         result = hub([], [module()], log=log)
-        self.assertEqual(result['log'], {'exists': False, 'ok': True, 'events': 0, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=False, ok=True, events=0, damagedLines=0, truncatedTail=False))
         self.assertEqual(result['participation']['totals']['sessions'], 0)
 
     def test_a_damaged_log_still_gives_the_lesson_side_and_the_valid_events(self):
@@ -700,22 +866,72 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(result['checkpoints']['total'], 1)
         self.assertEqual(len(result['library']), 1)
 
-    def test_a_malformed_event_stops_every_event_rollup_and_says_so(self):
+    def test_a_malformed_event_is_skipped_alone_and_counted(self):
         good = [event('task_finished', task='t1'), check('failed', skills=['loops']), event('module_completed', module='second')]
+        plain = hub(good, [module(), module('second')])
         for broken in self.malformed_events():
-            result = hub(good + [broken], [module(), module('second')])
-            self.assertFalse(result['log']['ok'], broken)
-            self.assertEqual(result['participation']['totals']['sessions'], 0)
-            self.assertEqual((result['skills'], result['checks']), ([], []))
-            self.assertEqual(result['checkpoints'], {'done': 0, 'total': 2})
-            self.assertEqual(result['focus']['moduleId'], 'intro')
-            self.assertEqual(result['focus']['tasksDone'], 0)
-            self.assertEqual([m['status'] for m in result['library']], ['focus', 'next'])
+            seen = []
+            result = hub(good + [broken], [module(), module('second')], skipped=lambda seq, reason: seen.append((seq, reason)))
+            self.assertEqual(result['log']['skippedEvents'], 1, broken)
+            self.assertTrue(result['log']['ok'], broken)
+            self.assertEqual([seq for seq, _ in seen], [3], broken)
+            self.assertTrue(seen[0][1] and isinstance(seen[0][1], str))
+            expected = dict(plain, log=dict(plain['log'], skippedEvents=1))
+            self.assertEqual(result, expected, broken)
+
+    def test_a_skipped_event_is_in_no_rollup(self):
+        broken = event('task_finished', task='t2')
+        broken['sessionId'] = None
+        result = hub([event('task_finished', task='t1'), broken], [module()])
+        self.assertEqual(result['focus']['tasksDone'], 1)
+        self.assertEqual(result['log']['skippedEvents'], 1)
+        self.assertEqual(result['participation']['totals']['sessions'], 1)
 
     def test_a_malformed_event_does_not_change_the_counts_the_log_reported(self):
         log = LogFacts(exists=True, ok=True, events=9, damaged_lines=0, truncated_tail=False)
         result = hub([None], log=log)
-        self.assertEqual(result['log'], {'exists': True, 'ok': False, 'events': 9, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=True, ok=True, events=9, damagedLines=0, truncatedTail=False, skippedEvents=1))
+
+    def test_the_skip_reasons_name_the_field_and_never_hold_event_content(self):
+        seen = []
+        secret = event('task_opened')
+        secret['moduleId'] = ['SECRET-VALUE']
+        hub([secret], skipped=lambda seq, reason: seen.append(reason))
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn('SECRET', seen[0])
+        self.assertIn('moduleId', seen[0])
+
+    def test_an_error_in_the_skip_sink_is_not_swallowed(self):
+        def explode(seq, reason):
+            raise RuntimeError('sink')
+        with self.assertRaises(RuntimeError):
+            hub([None], skipped=explode)
+
+    def test_future_events_are_counted_apart_from_the_rest(self):
+        events = [event('task_opened', '2026-11-06T00:00:00Z'), event('task_opened', '2027-01-01T00:00:00Z'), event('task_opened'),
+                  event('task_opened', '2030-01-01T00:00:00Z', source='agent')]
+        result = hub(events)
+        self.assertEqual(result['log']['futureEvents'], 2)  # an agent event is never counted, so it is not a future event either
+        self.assertEqual(result['participation']['totals']['sessions'], 1)
+
+    def test_a_future_event_is_judged_in_the_local_day(self):
+        late = event('task_opened', '2026-11-05T23:30:00Z')
+        self.assertEqual(hub([late], tz=0)['log']['futureEvents'], 0)
+        self.assertEqual(hub([late], tz=840)['log']['futureEvents'], 0)  # today is the 6th for +840
+        self.assertEqual(hub([late], tz=-840)['log']['futureEvents'], 1)  # today is the 4th for -840
+
+    def test_check_results_the_pinned_module_does_not_have_are_counted_as_unmatched(self):
+        events = [check('failed', check_id='nope'), check('passed', check_id='c1'), check('skipped', check_id='nope'),
+                  check('failed', check_id='nope', module='gone'), check('failed', check_id='nope', source='agent'),
+                  check('failed', '2027-01-01T00:00:00Z', check_id='nope')]
+        result = hub(events, [module()])
+        self.assertEqual(result['log']['unmatchedEvents'], 2)
+        self.assertEqual([r['checkId'] for r in result['checks']], ['c1'])
+
+    def test_the_fault_of_the_log_is_passed_through(self):
+        log = LogFacts(True, False, 0, 0, False, 'log_corrupt')
+        self.assertEqual(hub(log=log)['log'], log_block(ok=False, fault='log_corrupt'))
+        self.assertIsNone(hub()['log']['fault'])
 
     @staticmethod
     def malformed_events():
@@ -783,19 +999,25 @@ class DamageTests(unittest.TestCase):
         bad_finish['taskId'] = None
         out.append(bad_finish)
         out.append(with_field(lambda: event('task_finished'), taskId=3))
+        bad_finish = event('task_finished')
+        bad_finish['data'] = {'result': 'done'}
+        out.append(bad_finish)
+        bad_finish = event('task_finished')
+        bad_finish['data'] = {}
+        out.append(bad_finish)
         return out
 
     def test_an_agent_event_is_only_checked_for_the_fields_the_hub_reads(self):
         agent = event('task_opened', source='agent')
         agent['data'] = 'ignored'
-        self.assertTrue(hub([agent])['log']['ok'])
+        self.assertEqual(hub([agent])['log']['skippedEvents'], 0)
 
     def test_bool_is_not_a_number_and_a_subclass_of_str_is_not_a_string(self):
         class Name(str):
             pass
         weird = event('task_opened')
         weird['moduleId'] = Name('intro')
-        self.assertFalse(hub([weird])['log']['ok'])
+        self.assertEqual(hub([weird])['log']['skippedEvents'], 1)
 
 
 class LinearTimeTests(unittest.TestCase):
@@ -812,19 +1034,182 @@ class LinearTimeTests(unittest.TestCase):
         self.assertEqual(result['skills'][0]['tried'], 5)
         self.assertEqual(result['participation']['totals']['sessions'], 56)  # 28 days times 2 sessions
 
+    @staticmethod
+    def lines_run(count):
+        """The number of lines of hub_data.py that run for a log of `count` events. It does not depend on the machine."""
+        names = [f'c{i}' for i in range(20)]
+        info = module(checks=names)
+        events = [event('check_result', f'2026-10-{1 + i % 28:02d}T10:00:00Z', check_id=names[i % 20], skills=[f's{i % 50}'], session=str(uuid.UUID(int=i % 300)))
+                  for i in range(count)]
+        counter = [0]
+        source = hub_data.__file__
+
+        def tracer(frame, kind, argument):
+            if frame.f_code.co_filename == source:
+                if kind == 'line':
+                    counter[0] += 1
+                return tracer
+            return None
+        sys.settrace(tracer)
+        try:
+            hub(events, [info])
+        finally:
+            sys.settrace(None)
+        return counter[0]
+
     def test_work_grows_in_step_with_the_log(self):
+        small, large = self.lines_run(1000), self.lines_run(8000)
+        # 8 times the events. Linear work gives about 8 times the lines (a fixed part of the work does not grow). Quadratic work gives about 64.
+        self.assertGreater(large, small * 5)
+        self.assertLess(large, small * 9)
+
+    def test_cpu_time_grows_in_step_with_the_log_with_a_wide_floor(self):
         names = [f'c{i}' for i in range(20)]
         info = module(checks=names)
 
         def run(count):
             events = [event('check_result', f'2026-10-{1 + i % 28:02d}T10:00:00Z', check_id=names[i % 20]) for i in range(count)]
-            started = time.process_time()  # CPU time of this process, so other programs on the machine do not add noise
+            started = time.process_time()  # CPU time of this process, so other programs on the machine add little noise
             hub(events, [info])
             return time.process_time() - started
         run(2000)  # warm up
         small, large = min(run(10000) for _ in range(3)), min(run(80000) for _ in range(3))
-        # 8 times the events. Linear work gives about 8 times the time and quadratic work about 64 times.
-        self.assertLess(large, max(small, 0.005) * 24)
+        self.assertLess(large, max(small, 0.05) * 40)  # 8 times the events, quadratic work would take about 64 times
+
+
+class ZoneTests(unittest.TestCase):
+    """A named time zone converts each event with the offset it had at that moment."""
+
+    def test_a_fall_back_day_follows_the_zone_and_not_one_offset(self):
+        # New York leaves daylight time on 2026-11-01 at 06:00 UTC.
+        edt = event('task_opened', '2026-11-01T04:30:00Z')  # 00:30 on the 1st, offset -4
+        est = event('task_opened', '2026-11-02T04:30:00Z', session=S2)  # 23:30 on the 1st, offset -5
+        result = hub([edt, est], zone=NEW_YORK)
+        self.assertEqual(day_count(result, datetime.date(2026, 10, 31)), 0)
+        self.assertEqual(day_count(result, datetime.date(2026, 11, 1)), 2)
+        self.assertEqual(day_count(result, datetime.date(2026, 11, 2)), 0)
+        fixed = hub([edt, est], tz=-300)  # the winter offset puts the first event on the 31st
+        self.assertEqual((day_count(fixed, datetime.date(2026, 10, 31)), day_count(fixed, datetime.date(2026, 11, 1))), (1, 1))
+
+    def test_the_repeated_hour_of_a_fall_back_night_stays_on_one_day(self):
+        both = [event('task_opened', '2026-11-01T05:30:00Z'), event('task_opened', '2026-11-01T06:30:00Z', session=S2)]  # 01:30 twice
+        self.assertEqual(day_count(hub(both, zone=NEW_YORK), datetime.date(2026, 11, 1)), 2)
+
+    def test_a_spring_forward_day_follows_the_zone_and_not_one_offset(self):
+        # New York enters daylight time on 2026-03-08 at 07:00 UTC.
+        now = datetime.datetime(2026, 3, 12, 12, tzinfo=UTC)
+        events = [event('task_opened', '2026-03-08T04:59:00Z', session=S1),  # 23:59 on the 7th, offset -5
+                  event('task_opened', '2026-03-08T05:00:00Z', session=S2),  # 00:00 on the 8th
+                  event('task_opened', '2026-03-09T04:30:00Z', session=S3)]  # 00:30 on the 9th, offset -4
+        result = hub(events, now=now, zone=NEW_YORK)
+        self.assertEqual([day_count(result, datetime.date(2026, 3, day)) for day in (7, 8, 9)], [1, 1, 1])
+        fixed = hub(events, now=now, tz=-300)  # the winter offset puts the last event on the 8th
+        self.assertEqual([day_count(fixed, datetime.date(2026, 3, day)) for day in (7, 8, 9)], [1, 2, 0])
+
+    def test_an_event_time_with_its_own_offset_is_converted_to_the_zone(self):
+        events = [event('task_opened', '2026-11-01T00:30:00-04:00', session=S1), event('task_opened', '2026-11-01T23:30:00-05:00', session=S2),
+                  event('task_opened', '2026-11-02T05:30:00+01:00', session=S3)]
+        result = hub(events, zone=NEW_YORK)
+        self.assertEqual(day_count(result, datetime.date(2026, 11, 1)), 3)
+
+    def test_today_follows_the_zone(self):
+        now = datetime.datetime(2026, 11, 2, 4, 30, tzinfo=UTC)  # 23:30 on Sunday the 1st in New York
+        result = hub(now=now, zone=NEW_YORK)
+        self.assertEqual(result['participation']['weeks'][-1]['start'], '2026-10-26')
+        self.assertEqual(result['participation']['weeks'][-1]['days'], [0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(result['participation']['totals']['days'], 56)
+        self.assertEqual(hub(now=now)['participation']['weeks'][-1]['start'], '2026-11-02')
+        self.assertEqual(result['generatedAt'], '2026-11-02T04:30:00Z')
+
+    def test_a_zone_without_daylight_time_matches_the_same_fixed_offset(self):
+        rng = random.Random(7)
+        india = zoneinfo.ZoneInfo('Asia/Kolkata')
+        events = [event('task_opened', iso(NOW + datetime.timedelta(minutes=rng.randrange(-60 * 24 * 60, 60 * 24 * 2)), 0), session=[S1, S2, S3][rng.randrange(3)])
+                  for _ in range(200)]
+        self.assertEqual(hub(events, zone=india), hub(events, tz=330))
+
+    def test_a_differential_check_against_zoneinfo(self):
+        rng = random.Random(20261106)
+        for _ in range(40):
+            now = datetime.datetime(2025, 1, 1, tzinfo=UTC) + datetime.timedelta(minutes=rng.randrange(0, 60 * 24 * 900))
+            today = now.astimezone(NEW_YORK).date()
+            start = today - datetime.timedelta(days=today.weekday() + 49)
+            events, expected = [], {}
+            for _ in range(60):
+                stamp = now + datetime.timedelta(minutes=rng.randrange(-60 * 24 * 80, 60 * 24 * 3))
+                text = iso(stamp, rng.choice([0, 0, -240, -300, 330, 60]))
+                session = [S1, S2, S3][rng.randrange(3)]
+                events.append(event('task_opened', text, session=session))
+                day = stamp.astimezone(NEW_YORK).date()
+                if start <= day <= today:
+                    expected.setdefault(day, set()).add(session)
+            result = hub(events, now=now, zone=NEW_YORK)
+            for offset in range(56):
+                day = start + datetime.timedelta(days=offset)
+                want = None if day > today else len(expected.get(day, ()))
+                self.assertEqual(flat_days(result)[offset], want, (now, day))
+            self.assertEqual(result['participation']['totals']['days'], (today - start).days + 1)
+
+    def test_the_first_and_last_instants_of_the_calendar_do_not_fail_with_a_zone(self):
+        edge = [event('task_opened', '0001-01-01T00:00:00Z'), event('task_opened', '9999-12-31T23:59:59Z', session=S2),
+                event('task_opened', '0001-01-01T00:00:00+23:59', session=S3)]
+        result = hub(edge, zone=NEW_YORK)
+        self.assertEqual(result['log']['skippedEvents'], 0)
+        self.assertEqual(result['log']['futureEvents'], 1)
+        self.assertEqual(result['participation']['totals']['sessions'], 0)
+
+    def test_the_last_instant_of_the_calendar_in_a_zone_ahead_of_utc_is_still_the_future(self):
+        tokyo = zoneinfo.ZoneInfo('Asia/Tokyo')  # 9999-12-31T23:59:59Z is in the year 10000 there, which no date can hold
+        result = hub([event('task_opened', '9999-12-31T23:59:59Z')], zone=tokyo)
+        self.assertEqual((result['log']['futureEvents'], result['log']['skippedEvents']), (1, 0))
+        result = hub([event('task_opened', '0001-01-01T00:00:00Z')], zone=tokyo)  # fits in the zone: Tokyo is ahead
+        self.assertEqual(result['log']['futureEvents'], 0)
+
+    def test_an_offset_and_a_zone_together_are_refused(self):
+        with self.assertRaises(ValueError):
+            hub(tz=60, zone=NEW_YORK)
+        hub(tz=0, zone=NEW_YORK)
+
+    def test_the_zone_must_be_a_tzinfo(self):
+        for bad in ('America/New_York', 5, object()):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                hub(zone=bad)
+
+
+class LoadZoneTests(unittest.TestCase):
+    def test_valid_names_load(self):
+        for name in ('America/New_York', 'UTC', 'Asia/Kolkata', 'Etc/GMT+5', 'America/Argentina/Buenos_Aires', 'Europe/London'):
+            self.assertIsInstance(hub_data.load_zone(name), datetime.tzinfo, name)
+
+    def test_the_loaded_zone_is_the_zoneinfo_of_that_name(self):
+        self.assertEqual(hub_data.load_zone('America/New_York').key, 'America/New_York')
+
+    def test_bad_names_are_a_value_error(self):
+        bad = ('', ' ', 'x' * 100, '../etc/passwd', '/etc/passwd', 'America/', '/America', 'America//New_York', 'America/New York', 'Nope/Nowhere',
+               'a/b/c/d', 'America', 'America/New_York\n', 'America/..', '.', '..', './UTC', 'UTC/', 'Amerika/New_York', 'america/new_york\x00',
+               '\u202eUTC', 'America/New_York ', 5, None, ['UTC'], b'UTC', 'zone.tab', 'tzdata.zi')
+        for name in bad:
+            with self.assertRaises(ValueError, msg=repr(name)):
+                hub_data.load_zone(name)
+
+
+class ZoneNamePatternTests(unittest.TestCase):
+    """The pattern alone must refuse a bad name, whatever the zone database would say."""
+
+    def test_a_name_that_does_not_match_the_pattern_never_reaches_the_zone_database(self):
+        names = ('', '..', '.', 'zone.tab', './UTC', 'America/../UTC', 'a/b/c/d', 'UTC\n', 'America/New_York\n', '/UTC', 'UTC/', 'America//New_York',
+                 'America/New York', 'x' * 33, 'A/' + 'x' * 33, '\u202eUTC', '1UTC', '_UTC', '-UTC', 'UTC\x00')
+        with mock.patch.object(zoneinfo, 'ZoneInfo') as database:
+            for name in names:
+                with self.assertRaises(ValueError, msg=repr(name)):
+                    hub_data.load_zone(name)
+        database.assert_not_called()
+
+    def test_a_name_that_matches_the_pattern_is_looked_up_as_it_is(self):
+        with mock.patch.object(zoneinfo, 'ZoneInfo', return_value='zone') as database:
+            for name in ('UTC', 'America/New_York', 'Etc/GMT+5', 'America/Argentina/Buenos_Aires', 'x' * 32, 'A/' + 'x' * 32):
+                self.assertEqual(hub_data.load_zone(name), 'zone')
+        self.assertEqual(database.call_count, 6)
 
 
 class ReaderTests(unittest.TestCase):
@@ -837,8 +1222,13 @@ class ReaderTests(unittest.TestCase):
         self.log = EventLog(self.data)
         self.lessons = LessonStore(self.data)
 
-    def read(self, tz=0, now=NOW):
-        return hub_data.build_hub(self.log, self.lessons, now, tz)
+    def read(self, tz=0, now=NOW, zone=None):
+        """Build the hub. What the reader wrote to stderr is kept in self.stderr."""
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            result = hub_data.build_hub(self.log, self.lessons, now, tz, zone)
+        self.stderr = captured.getvalue()
+        return result
 
     def write_log(self, events, tail=b'', raw_lines=()):
         folder = self.data / '_events'
@@ -859,7 +1249,7 @@ class ReaderTests(unittest.TestCase):
     def test_no_stores_at_all(self):
         before = sorted(self.data.rglob('*'))
         result = self.read()
-        self.assertEqual(result['log'], {'exists': False, 'ok': True, 'events': 0, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=False, ok=True, events=0, damagedLines=0, truncatedTail=False))
         self.assertEqual((result['focus'], result['library'], result['checkpoints']), (None, [], {'done': 0, 'total': 0}))
         self.assertEqual(sorted(self.data.rglob('*')), before)  # reading creates nothing
 
@@ -870,8 +1260,8 @@ class ReaderTests(unittest.TestCase):
                   event('check_result', module='beta', task='task-2', status='failed', checkId='check-1')]
         self.write_log(events)
         result = self.read()
-        self.assertEqual(result['log'], {'exists': True, 'ok': True, 'events': 3, 'damagedLines': 0, 'truncatedTail': False})
-        self.assertEqual(result['focus'], {'moduleId': 'beta', 'version': '1.0.0', 'title': 'Beta', 'tasksTotal': 2, 'tasksDone': 1,
+        self.assertEqual(result['log'], log_block(exists=True, ok=True, events=3, damagedLines=0, truncatedTail=False))
+        self.assertEqual(result['focus'], {'moduleId': 'beta', 'version': '1.0.0', 'title': 'Beta', 'tasksTotal': 2, 'tasksDone': 1, 'tasksSkipped': 0,
                                            'nextTask': {'taskId': 'task-2', 'text': 'Prompt 2'}})
         self.assertEqual([(m['moduleId'], m['status']) for m in result['library']], [('alpha', 'next'), ('beta', 'focus')])
         self.assertEqual(result['checks'][0]['title'], 'Check number 1')
@@ -899,7 +1289,7 @@ class ReaderTests(unittest.TestCase):
         good = event('task_finished', module='alpha', task='task-1')
         self.write_log([good], raw_lines=[b'{"not": "an event"}\n', b'garbage\n'])
         result = self.read()
-        self.assertEqual(result['log'], {'exists': True, 'ok': False, 'events': 1, 'damagedLines': 2, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=True, ok=False, events=1, damagedLines=2, truncatedTail=False))
         self.assertEqual(result['focus']['tasksDone'], 1)
         self.assertEqual(result['participation']['totals']['sessions'], 1)
 
@@ -907,7 +1297,7 @@ class ReaderTests(unittest.TestCase):
         self.import_module('alpha')
         self.write_log([event('task_opened', module='alpha', task='task-1')], tail=b'{"schemaVersion":"1.0","eventId":"x')
         result = self.read()
-        self.assertEqual(result['log'], {'exists': True, 'ok': False, 'events': 1, 'damagedLines': 0, 'truncatedTail': True})
+        self.assertEqual(result['log'], log_block(exists=True, ok=False, events=1, damagedLines=0, truncatedTail=True))
         self.assertEqual(result['participation']['totals']['sessions'], 1)
 
     def test_a_log_over_its_limits_is_unreadable_not_an_error(self):
@@ -917,9 +1307,11 @@ class ReaderTests(unittest.TestCase):
         (folder / 'events.jsonl').write_bytes(b'\n' * 100_000)
         os.chmod(folder / 'events.jsonl', 0o600)
         result = self.read()
-        self.assertEqual(result['log'], {'exists': True, 'ok': False, 'events': 0, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(result['log'], log_block(exists=True, ok=False, fault='log_corrupt', events=0, damagedLines=0, truncatedTail=False))
         self.assertEqual(result['focus']['moduleId'], 'alpha')
         self.assertEqual(result['checkpoints'], {'done': 0, 'total': 1})
+        self.assertIn('EventLogError', self.stderr)
+        self.assertIn('log_corrupt', self.stderr)
 
     def test_an_unsafe_log_path_is_unreadable_not_an_error(self):
         self.import_module('alpha')
@@ -928,8 +1320,69 @@ class ReaderTests(unittest.TestCase):
         (self.data / 'elsewhere.jsonl').write_bytes(b'')
         (folder / 'events.jsonl').symlink_to(self.data / 'elsewhere.jsonl')
         result = self.read()
-        self.assertFalse(result['log']['ok'])
+        self.assertEqual((result['log']['ok'], result['log']['fault']), (False, 'unsafe_path'))
         self.assertEqual(result['library'][0]['moduleId'], 'alpha')
+        self.assertIn('unsafe_path', self.stderr)
+
+    def test_a_folder_that_is_a_symbolic_link_is_an_unsafe_path_with_a_fault(self):
+        self.import_module('alpha')
+        (self.data / 'elsewhere').mkdir(mode=0o700)
+        (self.data / '_events').symlink_to(self.data / 'elsewhere')
+        result = self.read()
+        self.assertEqual((result['log']['ok'], result['log']['fault']), (False, 'unsafe_path'))
+
+    def test_a_file_that_cannot_be_read_is_a_fault(self):
+        self.import_module('alpha')
+        broken = EventLogError('The event log cannot be read (EIO).', 'log_unreadable')
+        with mock.patch.object(EventLog, 'read', side_effect=broken):
+            result = self.read()
+        self.assertEqual((result['log']['ok'], result['log']['fault'], result['log']['exists']), (False, 'log_unreadable', True))
+        self.assertIn('log_unreadable', self.stderr)
+        self.assertNotIn(str(self.data), self.stderr)
+
+    def test_a_healthy_log_has_no_fault_and_writes_nothing_to_stderr(self):
+        self.import_module('alpha')
+        self.write_log([event('task_opened', module='alpha')])
+        result = self.read()
+        self.assertEqual(result['log'], log_block(events=1))
+        self.assertEqual(self.stderr, '')
+
+    def test_a_damaged_but_readable_log_has_no_fault(self):
+        self.write_log([event('task_opened')], raw_lines=[b'garbage\n'])
+        self.assertIsNone(self.read()['log']['fault'])
+
+    def test_a_malformed_event_in_a_valid_report_is_skipped_and_named_on_stderr(self):
+        good, broken = event('task_opened'), event('task_opened')
+        broken['sessionId'] = None
+        report = {'ok': True, 'exists': True, 'lines': [{'line': 1, 'ok': True}, {'line': 2, 'ok': True}],
+                  'events': [{'line': 1, 'event': good}, {'line': 2, 'event': broken}], 'truncatedTail': False,
+                  'total': 2, 'offset': 0, 'limit': None, 'more': False}
+        with mock.patch.object(EventLog, 'read', return_value=report):
+            result = self.read()
+        self.assertEqual(result['log'], log_block(events=2, skippedEvents=1))
+        self.assertEqual(result['participation']['totals']['sessions'], 1)
+        self.assertIn('line 2', self.stderr)
+        self.assertIn('sessionId', self.stderr)
+
+    def test_a_flood_of_skipped_events_writes_a_few_lines_and_a_total(self):
+        broken = []
+        for index in range(40):
+            item = event('task_opened')
+            item['time'] = 'nonsense'
+            broken.append({'line': index + 1, 'event': item})
+        report = {'ok': True, 'exists': True, 'lines': [{'line': n + 1, 'ok': True} for n in range(40)], 'events': broken,
+                  'truncatedTail': False, 'total': 40, 'offset': 0, 'limit': None, 'more': False}
+        with mock.patch.object(EventLog, 'read', return_value=report):
+            result = self.read()
+        self.assertEqual(result['log']['skippedEvents'], 40)
+        self.assertLessEqual(len(self.stderr.splitlines()), 8)
+        self.assertIn('40', self.stderr.splitlines()[-1])
+
+    def test_a_time_zone_name_is_used_by_the_reader(self):
+        self.write_log([event('task_opened', '2026-11-01T04:30:00Z')])
+        result = self.read(zone=NEW_YORK)
+        self.assertEqual(day_count(result, datetime.date(2026, 11, 1)), 1)
+        self.assertEqual(day_count(self.read(tz=-300), datetime.date(2026, 10, 31)), 1)
 
     def test_a_busy_lock_is_not_hidden_as_damage(self):
         busy = EventLogError('Another program is using the event log.', 'lock_unavailable', 503, retryable=True)
