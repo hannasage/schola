@@ -351,9 +351,9 @@ shell.bind({
  navigate:async view=>{
   const epoch=viewEpoch;
   if(accountInvalidated){if(view!=='sync')return false;}
-  else {const loaded=(await ready)||!!record;requireEpoch(epoch);if(!loaded&&!['sync','home','library'].includes(view))return false;if(loaded&&!(await save()))return false;requireEpoch(epoch);}
+  else {const loaded=(await ready)||!!record;requireEpoch(epoch);if(!loaded&&!['sync','home','library','hub'].includes(view))return false;if(loaded&&!(await save()))return false;requireEpoch(epoch);}
   if(view==='home'||view==='library'){try{await refreshLibrary();requireEpoch(epoch);}catch(error){screens.update({loading:false,error:message(error)});}}
-  for(const id of ['home','library','curriculum','experiments','guide','sync'])$('#'+id+'-view').hidden=id!==view;
+  for(const id of ['hub','home','library','curriculum','experiments','guide','sync'])$('#'+id+'-view').hidden=id!==view;
   if(view==='guide')guide();if(view==='curriculum')detail();
   return true;
  },

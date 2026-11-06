@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild web.jsx --bundle --format=esm --minify --outfile=web.bundle.js",
+    "build": "esbuild web.jsx --bundle --format=esm --minify --external:/assets/* --outfile=web.bundle.js",
     "test": "python3 -m unittest -v test_server.py && python3 -m unittest discover -s tests -p \"test_*.py\" -v && node --test tests/*.test.mjs tests/browser/server.test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test:browser": "node tests/run-browser.mjs",
+    "test:hub": "node tests/run-hub-browser.mjs",
     "test:appearance": "node tests/run-appearance.mjs",
     "verify": "python3 scripts/check_permissions.py && npm run typecheck && npm run lint && npm test && npm run build",
     "test:backend": "python3 -m unittest discover -s backend/tests -p \"test_*.py\" -v"

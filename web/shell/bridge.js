@@ -1,4 +1,4 @@
-/** @typedef {'home' | 'library' | 'curriculum' | 'experiments' | 'guide' | 'sync'} WorkspaceView */
+/** @typedef {'hub' | 'home' | 'library' | 'curriculum' | 'experiments' | 'guide' | 'sync'} WorkspaceView */
 /** @typedef {{view:WorkspaceView,ready:boolean,navigating:boolean,progress:{done:number,total:number}|null}} ShellSnapshot */
 /** @typedef {{navigate:(view:WorkspaceView)=>Promise<boolean>,exportProgress:()=>void,restoreBackup:()=>void,reportError:(error:Error)=>void}} ShellCommands */
 export function createShellBridge() {

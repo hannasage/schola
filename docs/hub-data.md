@@ -8,7 +8,7 @@ The code is `hub_data.py` (the numbers) and `hub_routes.py` (the route). The rou
 The type of the answer is `types/hub.d.ts`.
 The tests are `tests/test_hub_data.py` and `tests/test_hub_routes.py`.
 The code uses only the Python standard library. It needs Python 3.10 or later.
-No screen calls the route yet. A later step draws it.
+The Hub view draws it. See `docs/hub-screen.md`.
 
 ## What this step does and does not do
 
@@ -21,7 +21,7 @@ It does not:
 
 - write anything. The route and the code only read.
 - keep a cache. Each request computes the numbers again. See "What a request costs".
-- draw anything. The screens are a later step.
+- draw anything. The Hub view does that. See `docs/hub-screen.md`.
 - show a streak, a leaderboard, a ranking, a total of time, or a label about the student, such as "guessing" or "frustrated". The answer has no field for any of these. A test checks the field names.
 - call a model.
 
