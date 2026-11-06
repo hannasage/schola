@@ -866,6 +866,17 @@ class EventsRouteTests(RouteCase):
         self.assertEqual(self.adapter.calls, [])
         self.assertFalse(self.log_exists())
 
+    def test_a_task_id_that_is_not_text_gets_its_own_message(self):
+        self.set_workspace()
+        for value in (5, ['task-1'], None, True, {'a': 1}):
+            with self.subTest(value=value):
+                status, payload = self.run_check('has-readme', taskId=value)
+                self.assertEqual((status, payload['code'], payload['field']), (400, 'invalid_request', 'taskId'))
+                self.assertIn('must be text', payload['error'])
+        status, payload = self.run_check('has-readme', taskId='no-such-task')
+        self.assertEqual((status, payload['field']), (400, 'taskId'))
+        self.assertIn('not in that module version', payload['error'])
+
     def test_a_run_with_no_workspace_writes_no_event(self):
         status, payload = self.run_check()
         self.assertEqual((status, payload['code']), (409, 'workspace_required'))

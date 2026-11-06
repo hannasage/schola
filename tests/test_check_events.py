@@ -181,7 +181,10 @@ class EvidenceCodeTests(unittest.TestCase):
             def __eq__(self, other):
                 return True
 
-        self.assertEqual(check_events.evidence_code({'evidence': {'reason': Sneaky('anything')}}), '')
+        answer = check_events.evidence_code({'evidence': {'reason': Sneaky('anything')}})
+        self.assertIs(type(answer), str)
+        self.assertEqual(answer, '')
+        self.assertIs(type(check_events.evidence_code({'evidence': {'reason': 'not_found'}})), str)
 
     def test_every_code_fits_the_schema_rule_for_evidence(self):
         pattern = re.compile(r"^[A-Za-z0-9 .,:;()'_/-]{0,200}$")
@@ -285,6 +288,55 @@ class ArtifactTests(EventsCase):
             with self.assertRaises(check_events.ArtifactError) as raised:
                 self.artifact('has-readme')
         self.assertEqual(raised.exception.code, 'artifact_too_large')
+
+    def test_several_small_files_over_the_cap_together_are_reported(self):
+        """Each file is under the cap. Their sum is not."""
+        with mock.patch.object(check_events, 'MAX_ARTIFACT_BYTES', 15):
+            with self.assertRaises(check_events.ArtifactError) as raised:
+                self.artifact('script-a')
+        self.assertEqual(raised.exception.code, 'artifact_too_large')
+        with mock.patch.object(check_events, 'MAX_ARTIFACT_BYTES', 31):
+            self.assertEqual(self.artifact('script-a').size, 31)
+
+    def test_a_path_with_extra_slashes_and_dots_is_hashed_under_its_plain_form(self):
+        plain = {'id': 'x', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'file-exists', 'path': 'src/app.py'}}
+        for path in ('./src//app.py', 'src/./app.py', 'src/app.py/'):
+            odd = {'id': 'y', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'file-exists', 'path': path}}
+            with self.subTest(path=path):
+                self.assertEqual(check_events.artifact_for(odd, self.work, check_runner.Limits()), check_events.artifact_for(plain, self.work, check_runner.Limits()))
+        self.assertEqual(check_events.artifact_for(plain, self.work, check_runner.Limits()).digest, manifest_digest({'src/app.py': b'print("hi")\n'}))
+
+    def test_file_exists_hashes_a_file_that_is_over_the_read_limit_of_the_other_runners(self):
+        (self.work / 'README.md').write_bytes(b'x' * 50)
+        limits = check_runner.Limits(max_file_bytes=10)
+        artifact = self.artifact('has-readme', limits=limits)
+        self.assertEqual((artifact.digest, artifact.size), (manifest_digest({'README.md': b'x' * 50}), 50))
+
+    def test_a_file_that_grows_past_the_limit_while_it_is_read(self):
+        big = self.work / 'big.bin'
+        big.write_bytes(b'x' * 50)
+
+        def open_big(*args, **kwargs):
+            return os.open(big, os.O_RDONLY)
+
+        with mock.patch.object(check_events.check_workspace, 'open_inside', open_big):
+            with mock.patch.object(check_events, 'MAX_ARTIFACT_BYTES', 10):
+                with self.assertRaises(check_events.ArtifactError) as raised:
+                    self.artifact('has-readme')
+            self.assertEqual(raised.exception.code, 'artifact_too_large')
+            limits = check_runner.Limits(max_file_bytes=10)
+            self.assertEqual(self.artifact('has-todo', limits=limits), check_events.Artifact(EMPTY_SHA, 0))
+
+    def test_a_read_error_while_hashing_is_reported_and_the_descriptor_is_closed(self):
+        def open_descriptors():
+            return len(os.listdir('/dev/fd'))
+
+        before = open_descriptors()
+        with mock.patch.object(check_events.os, 'read', side_effect=OSError(5, 'I/O error')):
+            with self.assertRaises(check_events.ArtifactError) as raised:
+                self.artifact('has-readme')
+        self.assertEqual(raised.exception.code, 'artifact_unavailable')
+        self.assertEqual(open_descriptors(), before)
 
     def test_a_script_check_hashes_the_files_the_runner_copies(self):
         (self.work / '.git').mkdir()
