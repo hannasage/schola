@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 import {chromium} from 'playwright';
 import {isolateContext} from './network.mjs';
 
@@ -17,7 +18,7 @@ export async function verifyAppearanceState(server) {
     const selected = library.records.find(record=>record.curriculumId==='appearance-second').recordId;
     const focused = await fetch(server.url+'/api/library',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({focusRecordId:focus,expectedRevision:library.revision})});
     assert.equal(focused.status,200);
-    await page.goto(server.url);await page.locator('#notes').waitFor();
+    await page.goto(server.url);await openCurriculum(page);
     await page.locator('#curriculum-select').selectOption(selected);
     await page.waitForFunction(id=>document.querySelector('#curriculum-select').value===id&&!document.querySelector('#curriculum-select').disabled,selected);
     await page.locator('[data-module="m02"]').click();

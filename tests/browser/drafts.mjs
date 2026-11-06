@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 
 async function saved(page) {
   await page.waitForFunction(() => document.querySelector('#save-state').textContent === 'Saved on this computer');
@@ -9,7 +10,7 @@ async function choose(page,id) {
 }
 export async function verifyDrafts({page, server}) {
   await page.goto(server.url);
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   const first = await page.locator('#curriculum-select').inputValue();
   const address=`${server.url}/api/records/${first}`;
   const firstRecord = await (await fetch(address)).json();
@@ -21,7 +22,7 @@ export async function verifyDrafts({page, server}) {
   await saved(page);
   await server.restart();
   await page.reload();
-  await page.locator('#notes').waitFor();
+  await openCurriculum(page);
   assert.equal(await page.locator('.module.selected').getAttribute('data-module'), 'm02');
   assert.equal(await page.locator('#experiment-form [name=title]').inputValue(), '');
   assert.equal(await page.locator('#experiment-form [name=hypothesis]').inputValue(), 'Keep this hypothesis before any title or result exists.');
@@ -41,7 +42,7 @@ export async function verifyDrafts({page, server}) {
   await page.locator(`[data-edit="${entry.id}"]`).click();
   await page.locator('#experiment-form [name=title]').fill('An edit still in progress');
   await saved(page);
-  await page.reload();await page.locator('#notes').waitFor();
+  await page.reload();await openCurriculum(page);
   assert.equal(await page.locator('#experiment-form [name=title]').inputValue(),'An edit still in progress');
   const edited=(await (await fetch(address)).json()).draft.experiment;
   assert.equal(edited.id,entry.id);assert.equal(edited.date,entry.date);
@@ -54,11 +55,12 @@ export async function verifyDrafts({page, server}) {
   await page.waitForFunction(() => document.querySelector('#save-state').textContent === 'Not saved');
   await page.locator('#curriculum-select').selectOption(second);
   await page.waitForFunction(id => document.querySelector('#curriculum-select').value === id && !document.querySelector('#curriculum-select').disabled,first);
-  await page.reload();await page.locator('#notes').waitFor();
+  await page.reload();await page.locator('#notes').waitFor({state:'attached'});
   assert.equal(await page.locator('#notes').inputValue(), 'Recover this note after a failed save.');
   await page.waitForFunction(() => document.querySelector('#save-state').textContent === 'Not saved');
   await page.unroute('**/api/records/*');
   await page.locator('#retry').click();await saved(page);
+  await openCurriculum(page);
   assert.equal((await (await fetch(address)).json()).state.modules.m02.notes, 'Recover this note after a failed save.');
   // A device journal may not silently overwrite a different writer's newer revision.
   await page.route('**/api/records/*', async route => {
@@ -71,7 +73,7 @@ export async function verifyDrafts({page, server}) {
   otherWriter.state.modules.m02.notes='Newer saved record from another writer.';
   assert.equal((await fetch(address,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({expectedRevision:otherWriter.state.revision,record:otherWriter})})).status,200);
   await page.unroute('**/api/records/*');
-  await page.reload();await page.locator('#notes').waitFor();
+  await page.reload();await page.locator('#notes').waitFor({state:'attached'});
   assert.equal(await page.locator('#notes').inputValue(),'Keep this conflicting device note for export.');
   assert.equal(await page.locator('#save-state').textContent(),'Recovery conflict');
   assert.match(await page.locator('#notice').textContent(),/older version/);
@@ -94,6 +96,7 @@ export async function verifyDrafts({page, server}) {
 }
 
 export async function verifyRecordScopes({page,server}) {
+  await openCurriculum(page);
   const localId=await page.locator('#curriculum-select').inputValue();
   const local=await (await fetch(`${server.url}/api/records/${localId}`)).json();
   assert.equal(local.origin.kind,'local');
@@ -151,6 +154,7 @@ export async function verifyRecordScopes({page,server}) {
 }
 
 export async function verifyAccountInvalidation({page,server}) {
+  await openCurriculum(page);
   const localId=await page.locator('#curriculum-select').inputValue();
   const local=await (await fetch(`${server.url}/api/records/${localId}`)).json();
   const origin={kind:'cloud',hubId:crypto.randomUUID(),backendOrigin:'https://expired-account.invalid',accountId:crypto.randomUUID()};

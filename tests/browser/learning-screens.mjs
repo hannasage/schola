@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import {openCurriculum} from './open.mjs';
 
 export async function verifyLearningScreens({page,server}) {
  await page.goto(server.url);
- await page.locator('#notes').waitFor();
+ await openCurriculum(page);
  const first=await page.locator('#curriculum-select').inputValue();
  const firstBefore=await (await fetch(`${server.url}/api/records/${first}`)).json();
  const original=(await (await fetch(server.url+'/curriculum.json')).json());
@@ -103,13 +104,13 @@ export async function verifyRecoveredStartup({page,server}) {
  if(await page.locator('#notes').count()!==0)failures.push('Recovered-startup sign-out must remove the private lesson form.');
  if(!(await page.locator('#export').isDisabled()))failures.push('Recovered-startup sign-out must disable export while local reload fails.');
  if((await page.locator('body').innerText()).includes('Recovered startup private curriculum'))failures.push('Recovered-startup sign-out must hide every private curriculum title.');
- await page.unroute('**/api/library');await page.reload();await page.locator('#notes').waitFor();
+ await page.unroute('**/api/library');await page.reload();await openCurriculum(page);
  assert.deepEqual(failures,[]);
  console.log('PASS: recovered startup supports status changes before selection and still hides private data and export on account invalidation.');
 }
 
 export async function verifyStatusWriterConflict({page,server}) {
- await page.reload();await page.locator('#notes').waitFor();
+ await page.reload();await openCurriculum(page);
  const id=await page.locator('#curriculum-select').inputValue();
  const original=await (await fetch(`${server.url}/api/records/${id}`)).json();
  const selected=original.view.selectedModuleId;
@@ -130,7 +131,7 @@ export async function verifyStatusWriterConflict({page,server}) {
  if(statusResult.status()!==409)failures.push('A status change on a stale open record must return a conflict.');
  if(latest.state.modules[selected].notes!=='A newer note from the other writer.')failures.push('Editing hours after a status conflict must not overwrite the newer note.');
  await page.evaluate(id=>localStorage.removeItem('touchline-recovery:'+id),id);
- await page.reload();await page.locator('#notes').waitFor();
+ await page.reload();await openCurriculum(page);
  assert.deepEqual(failures,[]);
  console.log('PASS: a second writer cannot lose notes through a status change followed by an hours edit.');
 }
@@ -141,7 +142,7 @@ export async function verifyEditsDuringStatusSave({page,server}) {
   const transport=window.fetch;window.statusTestRecordId='';window.statusTestWrites=[];
   window.fetch=(input,options)=>{if(window.statusTestRecordId&&String(input).startsWith('/api/records/'+window.statusTestRecordId)&&options?.method==='PUT')window.statusTestWrites.push(JSON.parse(options.body));return transport(input,options);};
  });
- await page.reload();await page.locator('#notes').waitFor();
+ await page.reload();await openCurriculum(page);
  const id=await page.locator('#curriculum-select').inputValue();
  await page.locator('[data-module="m02"]').click();
  await page.locator('[data-view=experiments]').click();
@@ -182,7 +183,7 @@ export async function verifyEditsDuringStatusSave({page,server}) {
  assert.equal(after.state.modules.m02.notes,'Keep this edit made while the status write is pending.');
  assert.equal(after.view.selectedModuleId,'m02');
  assert.deepEqual(after.draft,before.draft);
- await page.reload();await page.locator('#notes').waitFor();
+ await page.reload();await openCurriculum(page);
  assert.equal(await page.locator('#notes').inputValue(),'Keep this edit made while the status write is pending.');
  assert.equal(await page.locator('#experiment-form [name=title]').inputValue(),'A draft preserved during status changes.');
  console.log('PASS: edits during a delayed status save keep the selected lesson and unfinished experiment.');

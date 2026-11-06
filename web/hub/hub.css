@@ -131,6 +131,9 @@
 .hub-lib-state{display:block;margin-top:2px;font:400 .75rem var(--hub-mono);color:var(--ui-muted)}
 .hub-lib li[data-status=focus] .hub-lib-state{color:var(--ui-primary)}
 
+/* a refresh keeps the old numbers on screen, a little dimmer. The layout does not move. */
+.hub-refreshing .hub-shell{opacity:.6}
+
 /* loading and error */
 .hub-state{padding:16px;display:grid;gap:12px}
 .hub-state .hub-skel{display:grid;gap:10px}

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createHubService, HubServiceError, hubQuery, offsetMinutes} from '../web/services/hub.js';
+import {createHubService, HubServiceError, hubQuery, offsetMinutes, errorFacts} from '../web/services/hub.js';
 import {sampleHub} from './hub-fixture.mjs';
 
 const json = (value, status = 200) => new Response(JSON.stringify(value), {status, headers: {'content-type': 'application/json'}});
@@ -48,8 +48,8 @@ test('the offset is east of UTC: the sign of the browser value is flipped, and -
 test('the first request sends the token and the zone name, and returns the validated answer', async () => {
   const {calls, transport} = fake({hub: () => json(sampleHub())});
   const service = createHubService({transport, zone: () => 'Europe/Paris', now: () => new Date(0)});
-  const hub = await service.getHub();
-  assert.deepEqual(hub, sampleHub());
+  const answer = await service.getHub();
+  assert.deepEqual(answer, {hub: sampleHub(), offsetFallback: false});
   assert.equal(calls.length, 2);
   assert.equal(calls[1].path, '/api/hub?timeZone=Europe%2FParis');
   assert.equal(calls[1].init.method, 'GET');
@@ -60,8 +60,9 @@ test('the first request sends the token and the zone name, and returns the valid
 test('a 400 for the zone field is retried once with the offset', async () => {
   const {calls, transport} = fake({hub: path => path.includes('timeZone=') ? bad('timeZone') : json(sampleHub())});
   const service = createHubService({transport, zone: () => 'Nowhere/Land', now: () => ({getTimezoneOffset: () => -120})});
-  const hub = await service.getHub();
-  assert.equal(hub.schemaVersion, '1.0');
+  const answer = await service.getHub();
+  assert.equal(answer.hub.schemaVersion, '1.0');
+  assert.equal(answer.offsetFallback, true, 'the screen is told that the offset stood in for the zone');
   const paths = calls.map(call => call.path).filter(path => path.startsWith('/api/hub'));
   assert.deepEqual(paths, ['/api/hub?timeZone=Nowhere%2FLand', '/api/hub?tzOffsetMinutes=120']);
 });
@@ -84,7 +85,8 @@ test('with no zone name from the browser, the offset is sent at once', async () 
   const {calls, transport} = fake({hub: () => json(sampleHub())});
   for (const zone of [() => undefined, () => '', () => { throw new Error('no Intl'); }]) {
     calls.length = 0;
-    await createHubService({transport, zone, now: () => ({getTimezoneOffset: () => 240})}).getHub();
+    const answer = await createHubService({transport, zone, now: () => ({getTimezoneOffset: () => 240})}).getHub();
+    assert.equal(answer.offsetFallback, true);
     assert.deepEqual(calls.map(call => call.path).filter(path => path.startsWith('/api/hub')), ['/api/hub?tzOffsetMinutes=-240']);
   }
 });
@@ -132,6 +134,7 @@ test('a network failure, a busy log, a damaged lesson store and an unknown fault
   const network = await run(() => { throw new TypeError('Failed to fetch'); });
   assert.equal(network.code, 'network_error');
   assert.equal(network.status, 0);
+  assert.match(network.message, /could not connect/);
   const busy = await run(() => json({error: 'busy', code: 'lock_unavailable', retryable: true}, 503));
   assert.equal(busy.code, 'busy');
   const corrupt = await run(() => json({error: 'bad file', code: 'corrupt_file', retryable: false}, 500));
@@ -143,11 +146,11 @@ test('a network failure, a busy log, a damaged lesson store and an unknown fault
   assert.equal(nothing.code, 'request_failed');
 });
 
-test('server text is untrusted: the error message is fixed and the detail has no control or bidi characters', async () => {
+test('server text is untrusted: the error message is fixed and the body is not kept', async () => {
   const {transport} = fake({hub: () => json({error: 'bad\u{202E}\u{7}text', code: 'internal_error', retryable: false}, 500)});
   const error = await createHubService({transport, zone: () => 'UTC', now: () => new Date(0)}).getHub().then(() => null, caught => caught);
   assert.doesNotMatch(error.message, /bad/);
-  assert.ok(![...error.detail].some(char => char.codePointAt(0) < 32 || char === '\u{202e}'), 'no control or bidi character in the detail');
+  assert.equal(error.detail, '');
 });
 
 test('a code that is not a plain code is dropped from the message', async () => {
@@ -157,10 +160,96 @@ test('a code that is not a plain code is dropped from the message', async () => 
   assert.doesNotMatch(error.message, /xxxx|\u{202e}/u);
 });
 
-test('a request can be cancelled', async () => {
+test('every request carries a signal, and the caller cancelling aborts it', async () => {
   const controller = new AbortController();
+  let seen;
+  const transport = async (path, init) => { if (path === '/api/checks/session') return json({token: 't'}); seen = init.signal; return new Promise(() => {}); };
+  const pending = createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 5000}).getHub({signal: controller.signal}).catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(seen.aborted, false);
+  controller.abort();
+  await pending;
+  assert.equal(seen.aborted, true);
+});
+
+test('a signal that is already aborted gives an abort at once, with no request', async () => {
   const {calls, transport} = fake({hub: () => json(sampleHub())});
-  const service = createHubService({transport, zone: () => 'UTC', now: () => new Date(0)});
-  await service.getHub({signal: controller.signal});
-  assert.equal(calls.at(-1).init.signal, controller.signal);
+  const controller = new AbortController();
+  controller.abort();
+  const error = await createHubService({transport, zone: () => 'UTC', now: () => new Date(0)}).getHub({signal: controller.signal}).then(() => null, caught => caught);
+  assert.equal(error.name, 'AbortError');
+  assert.equal(calls.length, 0);
+});
+
+test('a server that accepts and never answers ends in a timeout error that says so', async () => {
+  const transport = async path => path === '/api/checks/session' ? json({token: 't'}) : new Promise(() => {});
+  const started = Date.now();
+  const error = await createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 40}).getHub().then(() => null, caught => caught);
+  assert.ok(error instanceof HubServiceError);
+  assert.equal(error.code, 'timeout');
+  assert.match(error.message, /did not answer/);
+  assert.doesNotMatch(error.message, /could not connect/);
+  assert.ok(Date.now() - started < 2000);
+});
+
+test('the timeout also covers a token request that never answers, and a body that never ends', async () => {
+  const hangingToken = async () => new Promise(() => {});
+  const one = await createHubService({transport: hangingToken, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 30}).getHub().then(() => null, caught => caught);
+  assert.equal(one.code, 'timeout');
+  const slowBody = async path => path === '/api/checks/session' ? json({token: 't'}) : {status: 200, ok: true, json: () => new Promise(() => {})};
+  const two = await createHubService({transport: slowBody, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 30}).getHub().then(() => null, caught => caught);
+  assert.equal(two.code, 'timeout');
+});
+
+test('the timeout aborts the request it started, and the default is 30 seconds', async () => {
+  let seen;
+  const transport = async (path, init) => { if (path === '/api/checks/session') return json({token: 't'}); seen = init.signal; return new Promise(() => {}); };
+  await createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 30}).getHub().catch(() => {});
+  assert.equal(seen.aborted, true);
+  const {DEFAULT_TIMEOUT_MS} = await import('../web/services/hub.js');
+  assert.equal(DEFAULT_TIMEOUT_MS, 30_000);
+});
+
+test('a fast answer clears the timer and a later call has a fresh clock', async () => {
+  const {transport} = fake({hub: () => json(sampleHub())});
+  const service = createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 25});
+  await service.getHub();
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal((await service.getHub()).hub.schemaVersion, '1.0');
+});
+
+test('a caller who cancels gets an abort, which is not a timeout and not a network error', async () => {
+  const controller = new AbortController();
+  const transport = async path => path === '/api/checks/session' ? json({token: 't'}) : new Promise(() => {});
+  const pending = createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 5000}).getHub({signal: controller.signal}).then(() => null, caught => caught);
+  setTimeout(() => controller.abort(), 20);
+  const error = await pending;
+  assert.equal(error.name, 'AbortError');
+});
+
+test('an error keeps its HTTP status and its server code, and nothing else of the body', async () => {
+  const {transport} = fake({hub: () => json({error: 'secret body text', code: 'internal_error', retryable: false}, 500)});
+  const error = await createHubService({transport, zone: () => 'UTC', now: () => new Date(0)}).getHub().then(() => null, caught => caught);
+  assert.equal(error.status, 500);
+  assert.equal(error.serverCode, 'internal_error');
+  assert.equal(error.detail, '');
+  assert.doesNotMatch(JSON.stringify({...error, message: error.message}), /secret/);
+});
+
+test('error facts name a timeout and a failed connection apart, and show status and code only', () => {
+  assert.equal(errorFacts({code: 'timeout', status: 0}), 'Timed out waiting for the server.');
+  assert.equal(errorFacts({code: 'network_error', status: 0}), 'Could not connect to the server.');
+  assert.equal(errorFacts({code: 'request_failed', status: 500, serverCode: 'internal_error'}), 'HTTP 500 \u00b7 code internal_error');
+  assert.equal(errorFacts({code: 'busy', status: 503, serverCode: 'lock_unavailable'}), 'HTTP 503 \u00b7 code lock_unavailable');
+  assert.equal(errorFacts({code: 'request_failed', status: 502, serverCode: ''}), 'HTTP 502');
+  assert.equal(errorFacts({code: 'invalid_response', status: 200, serverCode: ''}), 'HTTP 200 \u00b7 answer not readable');
+  assert.equal(errorFacts({}), '');
+});
+
+test('a finished load leaves no timer behind: the request signal stays unaborted after the time limit passes', async () => {
+  let seen;
+  const transport = async (path, init) => { if (path !== '/api/checks/session') seen = init.signal; return path === '/api/checks/session' ? json({token: 't'}) : json(sampleHub()); };
+  await createHubService({transport, zone: () => 'UTC', now: () => new Date(0), timeoutMs: 30}).getHub();
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(seen.aborted, false);
 });

@@ -13,13 +13,19 @@ const ELLIPSIS = '…';
 const NOT_TEXT = '<not text>';
 /** Characters that are not control characters but still hide text or break a line. */
 const HIDDEN_CODES = new Set([0x00a0, 0x034f, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x2800, 0x3164, 0xffa0]);
-const HIDDEN_CATEGORY = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]$/u;
+/** Controls, format characters, surrogates, private use, line and paragraph separators, unassigned code points, and default-ignorable code points. */
+const HIDDEN_CATEGORY = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}\p{Cn}\p{Default_Ignorable_Code_Point}]$/u;
+/** Every space-like character except the plain space. */
+const SPACE_LIKE = /^\p{Zs}$/u;
+const OBJECT_REPLACEMENT = 0xfffc;
+const TAB_SPACES = '    ';
 const MARK = /^\p{M}$/u;
 
 /** @param {string} char */
 function isHidden(char) {
   const code = /** @type {number} */(char.codePointAt(0));
   if (code < 0x80) return code < 0x20 || code === 0x7f;
+  if (code === OBJECT_REPLACEMENT || SPACE_LIKE.test(char)) return true;
   if (HIDDEN_CODES.has(code) || (code >= 0x180b && code <= 0x180f) || (code >= 0xfe00 && code <= 0xfe0f) || (code >= 0xe0100 && code <= 0xe01ef)) return true;
   return HIDDEN_CATEGORY.test(char);
 }
@@ -46,6 +52,13 @@ function pieces(value, multiline) {
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (multiline && char === '\r' && chars[index + 1] === '\n') continue;
+    if (multiline && char === '\t') {
+      flush();
+      run = 0;
+      newlines = 0;
+      result.push(TAB_SPACES);
+      continue;
+    }
     if (multiline && char === '\n') {
       flush();
       run = 0;
@@ -89,4 +102,14 @@ export function safeText(value, {limit = 200, multiline = false} = {}) {
     text += all[index];
   }
   return text + ELLIPSIS;
+}
+
+/**
+ * Like `safeText`, but a value with nothing visible in it shows `(blank)`, so no row is ever empty.
+ * @param {unknown} value
+ * @param {{limit?: number, multiline?: boolean}} [options]
+ */
+export function displayText(value, options) {
+  const text = safeText(value, options);
+  return text.trim() === '' ? '(blank)' : text;
 }

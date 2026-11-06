@@ -18,14 +18,18 @@ The tests are `tests/hub-*.test.mjs` and `tests/browser/hub.mjs`.
 
 ## What the screen shows
 
+The Hub is the landing view. It is the first view on load and after a reload. The older Overview and Library views stay one click away. A person who opens a curriculum goes to the learning path as before.
+
 The screen has five panels and a library rail.
 
-- **Continue.** The module in focus, its tasks done and skipped, and the next task. A strip of segments shows the tasks: done first, then skipped, then open. A module with more than 12 tasks is scaled to 12 segments. A part is never drawn as nothing or as all.
-- **Participation.** Sessions and active days for each of the last 8 weeks, as plain counts. A table has one row for each week and one cell for each day. Each cell holds its count as a digit. A day after today is empty and dashed. There is no goal and no comparison.
-- **Checkpoints.** The number of finished modules out of the number of pinned modules, and a grid with one cell for each checkpoint. A grid of more than 60 cells is scaled to 60. The number beside the grid is exact.
+- **Continue.** The module in focus, its tasks done and skipped, and the next task. A strip of segments shows the tasks: done first, then skipped, then open. A module with more than 12 tasks is scaled to 12 segments. Every part that is not zero keeps at least one segment, and the largest part gives up the cells to make room.
+- **Participation.** Sessions and active days for each of the last 8 weeks, as plain counts. The readout ends with the number of days counted so far: the days from the start of the first week up to today, from 50 to 56. A table has one row for each week and one cell for each day. Each cell holds its count as a digit. A day after today is empty and dashed. There is no goal and no comparison.
+- **Checkpoints.** The number of finished modules out of the number of pinned modules, and a grid with one cell for each checkpoint. A grid of more than 60 cells is scaled to 60. The next cell stays one cell, and done and ahead each keep at least one cell when they exist. The number beside the grid is exact.
 - **Skill estimate.** One row for each skill: its label, a window of 5 cells, passed over tried, and a percent. A button, "How is this computed?", opens the rules. The cells show counts. They do not show the order of the results.
 - **Tries and hints.** One row for each check: the retries before the first pass and the highest hint level reached. A check with no pass yet says "Not passed yet", and its retries read "so far". The screen shows these figures and adds no judgment.
-- **Library.** Every pinned module, in the order of the lesson store, with its status (Done, In focus, or Next) and its tasks done. On a screen under 961 pixels wide, the rail folds into a section below the panels.
+- **Library.** Every pinned module, in the order of the lesson store, with its status (Done, In focus, or Next), its tasks done, and its skipped tasks when there are some, such as "Done · 1 of 2 tasks · 1 skipped". On a screen under 961 pixels wide, the rail folds into a section below the panels.
+
+The top bar shows when the numbers were made, such as "Updated 14:05", in the student's own time. An answer from another day also shows a short date.
 
 The tutor offer is one line at the foot of the Continue panel. It shows only when an offer exists and offers are not muted. See "Limits".
 
@@ -53,13 +57,17 @@ The answer has no field for these, and the browser test reads the whole screen f
 The screen has its own state for each case. No case shows a silent zero.
 
 - **Loading.** A status line and grey blocks. It shows while the first request runs.
-- **Request failed.** A red notice, the reason in plain words, and a "Try again" button. The screen shows no numbers beside the notice. The reasons are: the server did not answer, the page token was refused, the log is busy, a lesson file is damaged, the server sent an answer that Schola cannot read, and any other fault with its code.
+- **Refreshing.** The Hub asks again each time it opens. The old numbers stay on screen, a little dimmer, with "Refreshing…" in the top bar. The region says it is busy. The layout does not move.
+- **Request failed.** A red notice, the reason in plain words, a line of small text with the HTTP status and the plain error code, and a "Try again" button. The screen shows no numbers beside the notice, not even old ones. The small text never holds the body of the answer. A request that the server never answers ends after 30 seconds with "The local server did not answer in time." A server that refuses the connection gets its own message: Schola cannot reach the local server. The other reasons are: the page token was refused, the log is busy, a lesson file is damaged, and the server sent an answer that Schola cannot read.
 - **Empty log.** The log is whole and has no events, or there is no log yet. The screen says "No activity yet" and still shows the modules and the library. Counts read 0.
 - **Ready.** Everything else. The screen shows one notice for each finding below.
+- **Draw crash.** If the Hub fails while it draws, a message and a "Try again" button replace the Hub. The rest of the app keeps working. New numbers get one more try at drawing.
+
+After "Try again", keyboard focus goes to the Hub title while the request runs. It then goes to the new "Try again" button if the request fails again, or stays on the title when the numbers return.
 
 Each finding about the data has its own notice with its count:
 
-- The log cannot be read at all (`log.fault`). The notice names the cause. The numbers that come from events show as empty. A fault is not an empty log.
+- The log cannot be read at all (`log.fault`). The notice names the cause. A fault is not an empty log.
 - Lines of the log are damaged (`log.damagedLines`).
 - The last line of the log is cut off (`log.truncatedTail`).
 - The log is not whole and none of the above says why (`log.ok` is false). The notice says that Schola cannot say more.
@@ -68,6 +76,21 @@ Each finding about the data has its own notice with its count:
 - Check results name a check that the pinned version does not have (`log.unmatchedEvents`).
 - The list of checks is cut (`checksTotal` is more than the list).
 - The list of skills is cut (`skillsTotal` is more than the list).
+
+### When the event log cannot be read
+
+Whenever `log.ok` is false, the screen does not show any number that comes from events. That covers a fault and a damaged log.
+Participation, the checkpoint count, Skill estimate, Tries and hints, and the next task each show one plain line instead: "Not available while the event log cannot be read."
+Zeros and empty-state sentences are false here, so the screen shows neither.
+
+The lesson store does not depend on the log, so these stay: the module titles, the module in the Continue panel, the number of tasks in each module, and the number of checkpoints in all.
+The library drops each status and each count of tasks done, because they come from events.
+The module in focus is also chosen from events. With no readable events it is the first open module. The Continue panel shows its title and no more.
+
+### Days and the time zone
+
+The first request sends the name of the time zone. If the server refuses that name, one more request sends the clock offset. An offset does not know about clock changes.
+The screen then says under Participation: "Days use your current clock offset, so a day near a clock change can be off." The same line shows when the browser reports no time zone name.
 
 The skills list is empty until modules tag their checks with skills. The panel then says "Skill estimates need modules that tag their checks with skills. None of your modules do yet." It draws no meter.
 
@@ -78,12 +101,13 @@ It uses no `dangerouslySetInnerHTML`, no markdown, no automatic links, and no `h
 
 `web/hub/text.js` makes the text safe before it is drawn. It follows the rule of `safe_text` in `schola_cli.py`:
 
-- A control character, a bidirectional control, a zero-width character, a tag character, a private use character, a look-alike blank, or a lone surrogate shows as `<U+XXXX>`.
+- A control character, a bidirectional control, a zero-width or other default-ignorable character, a tag character, a private use character, an unassigned code point, an object-replacement character, any space-like character except the plain space, or a lone surrogate shows as `<U+XXXX>`.
 - A run of more than two combining marks is cut, and the cut says how many marks.
 - Long text ends in an ellipsis. The limit counts shown characters. An escape counts for all of its characters.
-- A task prompt keeps its line breaks, with at most one blank line in a row.
+- A task prompt keeps its line breaks, with at most one blank line in a row. A tab in a task prompt shows as four spaces.
+- A value with nothing visible in it shows `(blank)`, so no row is empty.
 
-The limits are 120 characters for a title, 600 for a task prompt, 160 for a check description, and 60 for an id. A cut never hides information that a person must hover to read.
+The limits are 120 characters for a title, 600 for a task prompt, 160 for a check description, and 60 for an id. A cut never hides information that a person must hover to read. A task prompt cut at 600 characters ends in an ellipsis.
 
 ## How the screen gets its data
 
@@ -92,7 +116,8 @@ The limits are 120 characters for a title, 600 for a task prompt, 160 for a chec
 - The first request sends `timeZone` with the name that the browser reports.
 - If the server answers 400 for the field `timeZone`, one more request sends `tzOffsetMinutes`, the minutes east of UTC. The page sends only one of the two fields in a request.
 - If the server rejects the token, the page fetches a new token once and sends the same request again.
-- `web/hub/model.js` checks the answer before the screen reads it: the schema version `1.0` and every field the screen uses. A wrong shape is the "request failed" state, not a crash.
+- The whole load, with its token request and its retry, has one limit of 30 seconds.
+- `web/hub/model.js` checks the answer before the screen reads it: the schema version `1.0` and every field the screen uses. It also checks the relations the server always keeps: the done checkpoints are at most the total, the library has one entry for each checkpoint, a module has at most as many tasks done and skipped as tasks, a skill has at most 5 results, the sessions and active days of a week equal the sum of its days, the weeks follow each other, and the totals equal the sums. A wrong shape or a broken relation is the "request failed" state, not a crash.
 - The screen asks again each time the Hub view opens. A newer request wins over an older one.
 
 ## Look and feel
@@ -112,9 +137,9 @@ The heat table and the checkpoint grid do not rely on colour. The heat table is 
 
 ## Limits
 
+- The rail comes after the panels in the page, and a screen of 961 pixels or more draws it on the left. Keyboard and screen reader order follow the page, not the picture. The rail holds no control except itself, so no control is reached out of its place.
 - No server route sends tutor offers yet. `TutorOffer` is built and tested with props, and the screen does not mount it with data.
 - No lesson screen exists yet, so the Continue panel has no button. The screen takes an optional `onContinue`.
-- The view is not the landing view. The owner has not decided that.
 - The numbers show what the log says. They do not prove that an event is true, and they are not a measure of learning. See `docs/hub-data.md`, "What this does not prove".
 - A student who has many modules scrolls the library rail. The rail is a focusable region so the keyboard reaches it.
 - The browser test cannot produce a skipped event or a list that is cut with the real stores. It tests those two cases with a stubbed answer. The unit tests cover them too.

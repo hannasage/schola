@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFile,writeFile,readdir} from 'node:fs/promises';
 import {join} from 'node:path';
-async function ready(page){await page.locator('#notes').waitFor();}
+async function ready(page){await page.locator('#notes').waitFor({state:'attached'});}
 async function saved(page){await page.waitForFunction(()=>document.querySelector('#save-state').textContent==='Saved on this computer');}
 const upload=(page,selector,value)=>page.locator(selector).setInputFiles({name:'review.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(value))});
 export async function verifyJournalImport({page,server}){

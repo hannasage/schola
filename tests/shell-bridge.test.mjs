@@ -6,7 +6,7 @@ import {createAccountBridge} from '../web/services/accounts.js';
 test('failed navigation preserves the selected view and exposes errors',async()=>{
  const bridge=createShellBridge(),errors=[];
  bridge.bind({navigate:async()=>false,exportProgress(){},restoreBackup(){},reportError:error=>errors.push(error.message)});
- assert.equal(await bridge.navigate('experiments'),false);assert.equal(bridge.getSnapshot().view,'curriculum');
+ assert.equal(await bridge.navigate('experiments'),false);assert.equal(bridge.getSnapshot().view,'hub');
  bridge.bind({navigate:async()=>{throw Error('Save failed');},exportProgress(){},restoreBackup(){},reportError:error=>errors.push(error.message)});
  assert.equal(await bridge.navigate('guide'),false);assert.deepEqual(errors,['Save failed']);
 });

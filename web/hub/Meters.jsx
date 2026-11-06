@@ -32,7 +32,7 @@ export function SkillRow({skill}) {
   const name = safeText(skill.skillId, {limit: 60});
   return <li className="hub-skill" data-skill>
     <span className="hub-skill-name">{name}</span>
-    <span className="hub-cells" role="img" aria-label={`${name}: ${skill.passed} of ${skill.tried} recent results passed. The window holds ${skill.window}.`}>
+    <span className="hub-cells" role="img" aria-label={`${name}: ${skill.passed} of ${skill.tried} passed. Based on the last ${skill.window} checks.`}>
       {cells.map((state, index) => <i key={index} data-state={state}/>)}
     </span>
     <span className="hub-skill-frac">{skill.passed}/{skill.tried}</span>

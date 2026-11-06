@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {safeText} from '../web/hub/text.js';
+import {safeText, displayText} from '../web/hub/text.js';
 
 test('plain text passes through unchanged', () => {
   assert.equal(safeText('Expected goals: a first model'), 'Expected goals: a first model');
@@ -72,4 +72,39 @@ test('multiline text keeps line breaks and nothing else that is hidden', () => {
 
 test('markup stays text: the helper never adds or removes angle brackets', () => {
   assert.equal(safeText('<img src=x onerror=alert(1)>'), '<img src=x onerror=alert(1)>');
+});
+
+test('default-ignorable, unassigned, and space-like characters show as their code', () => {
+  assert.equal(safeText('a\u{E0000}b'), 'a<U+E0000>b');
+  assert.equal(safeText('a\u{E0002}b'), 'a<U+E0002>b');
+  assert.equal(safeText('a\u{2065}b'), 'a<U+2065>b');
+  assert.equal(safeText('a\u{FFF0}b'), 'a<U+FFF0>b');
+  assert.equal(safeText('a\u{3000}b'), 'a<U+3000>b');
+  assert.equal(safeText('a\u{2000}b\u{2003}c\u{202F}d\u{205F}e'), 'a<U+2000>b<U+2003>c<U+202F>d<U+205F>e');
+  assert.equal(safeText('a\u{FFFC}b'), 'a<U+FFFC>b');
+  assert.equal(safeText('a\u{FFFD}b'), 'a\u{FFFD}b');
+  assert.equal(safeText('a b'), 'a b');
+});
+
+test('unassigned code points and noncharacters show as their code', () => {
+  assert.equal(safeText('a\u{378}b'), 'a<U+0378>b');
+  assert.equal(safeText('a\u{FFFF}b'), 'a<U+FFFF>b');
+  assert.equal(safeText('a\u{10FFFF}b'), 'a<U+10FFFF>b');
+});
+
+test('a value made only of hidden or blank characters shows a visible placeholder, never a blank row', () => {
+  assert.equal(displayText('\u{E0000}\u{E0002}'), '<U+E0000><U+E0002>');
+  assert.equal(displayText('\u{3000}\u{FFFC}\u{2065}'), '<U+3000><U+FFFC><U+2065>');
+  assert.equal(displayText(''), '(blank)');
+  assert.equal(displayText('   '), '(blank)');
+  assert.equal(displayText('\n\n', {multiline: true}), '(blank)');
+  assert.equal(displayText('Plain'), 'Plain');
+  assert.equal(displayText('x'.repeat(30), {limit: 10}), 'xxxxxxxxx\u2026');
+  assert.equal(displayText(undefined), '<not text>');
+});
+
+test('multiline text shows a tab as spaces', () => {
+  assert.equal(safeText('a\tb', {multiline: true}), 'a    b');
+  assert.equal(safeText('\tindented\n\t\tmore', {multiline: true}), '    indented\n        more');
+  assert.equal(safeText('a\tb'), 'a<U+0009>b', 'a single line keeps the command line rule');
 });
