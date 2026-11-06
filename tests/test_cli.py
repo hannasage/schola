@@ -37,6 +37,7 @@ if str(ROOT) not in sys.path:
 import check_consent
 import check_routes
 import check_runner
+import event_log
 import learning_event
 import schola_cli
 import server
@@ -2010,8 +2011,113 @@ class CheckRunEventsTests(CliCase):
         with mock.patch.object(EventLog, 'append', side_effect=RuntimeError('/Users/someone/secret')):
             result = self.run_check('has-readme')
         self.assertEqual(result.code, 0)
-        self.assertIn('Events error: events_failed', result.out)
+        self.assertIn('Events written: partial', result.out)
+        self.assertIn('Events error: log_uncertain', result.out)
         self.assertNotIn('Users', result.out + result.err)
+
+    def uncertain_failure(self):
+        return EventLogError('may be in the log', 'fsync_failed', details={'partialLine': False, 'maybeWritten': True})
+
+    def test_an_uncertain_write_says_may_or_may_not_be_saved_and_never_says_not_saved(self):
+        calls = []
+
+        def uncertain(log, event, from_page=False):
+            calls.append(event['type'])
+            raise self.uncertain_failure()
+
+        with mock.patch.object(EventLog, 'append', uncertain):
+            result = self.run_check('has-readme')
+        self.assertEqual(calls, ['attempt_submitted'])
+        self.assertEqual(result.code, 0)
+        self.assertIn('Events written: partial', result.out)
+        self.assertIn('Events error: log_uncertain', result.out)
+        self.assertIn('may or may not be saved. Read your event log before you retry.', result.err)
+        self.assertNotIn('not saved', result.err.replace('may or may not be saved', ''))
+        self.assertIn('log_uncertain', result.err)
+
+    def test_a_definite_failure_says_not_saved(self):
+        self.fill_log(10)
+        self.assertIn('were not saved', self.run_check('has-readme').err)
+
+    def test_a_half_write_says_which_half(self):
+        real = EventLog.append
+        calls = []
+
+        def second_fails(log, event, from_page=False):
+            calls.append(event['type'])
+            if len(calls) == 2:
+                raise EventLogError('x', 'log_unavailable_test', 409)
+            return real(log, event, from_page)
+
+        with mock.patch.object(EventLog, 'append', second_fails):
+            result = self.run_check('has-readme')
+        self.assertIn('Only the first event was saved', result.err)
+
+    def test_a_run_that_did_not_start_leaves_the_error_output_empty(self):
+        result = self.run_check('self')
+        self.assertEqual(result.err, '')
+
+    def test_the_command_line_does_not_use_the_page_reserve(self):
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES + 1000) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        result = self.run_check('has-readme')
+        self.assertIn('Events written: true', result.out)
+
+    def test_events_are_appended_with_from_page_false(self):
+        seen = []
+        real = EventLog.append
+
+        def spy(log, event, from_page=False):
+            seen.append(from_page)
+            return real(log, event, from_page)
+
+        with mock.patch.object(EventLog, 'append', spy):
+            self.run_check('has-readme')
+        self.assertEqual(seen, [False, False])
+
+    # --- --strict-events ---
+
+    def test_without_the_flag_a_write_failure_keeps_the_old_exit_codes(self):
+        self.fill_log(10)
+        self.assertEqual(self.run_check('has-readme').code, 0)
+        self.assertEqual(self.run_check('bad-pattern').code, 1)
+
+    def test_with_the_flag_a_write_failure_exits_with_four(self):
+        self.fill_log(10)
+        for check_id in ('has-readme', 'bad-pattern'):
+            with self.subTest(check=check_id):
+                result = self.run_check(check_id, '--strict-events')
+                self.assertEqual(result.code, 4)
+                self.assertIn('Events error: log_full', result.out)
+        document = json.loads(self.run_check('has-readme', '--strict-events', '--json').out)
+        self.assertEqual((document['eventsWritten'], document['result']['status']), (False, 'passed'))
+        self.assertEqual(self.run_check('has-readme', '--strict-events', '--json').code, 4)
+
+    def test_with_the_flag_a_partial_or_uncertain_write_exits_with_four(self):
+        with mock.patch.object(EventLog, 'append', side_effect=self.uncertain_failure()):
+            self.assertEqual(self.run_check('has-readme', '--strict-events').code, 4)
+
+    def test_with_the_flag_a_task_that_is_missing_exits_with_four(self):
+        document = module_document(version='2.0.0')
+        template = document['tasks'][0]
+        document['tasks'] = [dict(template, id='task-a'), dict(template, id='task-b')]
+        self.lessons.import_files([('m2.json', json.dumps(document))])
+        self.assertEqual(self.run_check('has-readme', '--version', '2.0.0', '--strict-events').code, 4)
+        self.assertEqual(self.run_check('has-readme', '--version', '2.0.0').code, 0)
+
+    def test_with_the_flag_a_good_write_and_a_run_that_did_not_start_keep_their_codes(self):
+        self.assertEqual(self.run_check('has-readme', '--strict-events').code, 0)
+        self.assertEqual(self.run_check('bad-pattern', '--strict-events').code, 1)
+        result = self.run_check('self', '--strict-events')
+        self.assertEqual(result.code, 1)
+        self.assertIn('Events error: not_run', result.out)
+
+    def test_the_flag_is_in_the_help_and_takes_no_value(self):
+        self.assertIn('--strict-events', self.go('check', 'run', '--help').out)
+        self.assertEqual(self.run_check('has-readme', '--strict-events=1').code, 2)
+        self.assertEqual(schola_cli.EXIT_EVENTS, 4)
 
     def test_the_task_option_names_the_task(self):
         document = module_document(version='2.0.0')

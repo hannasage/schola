@@ -46,6 +46,8 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_REFUSED = 3
+# With --strict-events: the check ran and the events were not (fully) saved.
+EXIT_EVENTS = 4
 
 DATA_DIR_VARIABLE = 'SCHOLA_DATA_DIR'
 DEFAULT_PORT = 8765
@@ -697,6 +699,18 @@ def events_text(written):
     return 'partial' if written == 'partial' else ('true' if written is True else 'false')
 
 
+def events_note(report):
+    """The line for the error output when the events were not fully saved, or None. It holds the code and nothing else."""
+    if report.error is None or report.error == check_events.NOT_RUN:
+        return None
+    code = safe_text(report.error)
+    if report.error == check_events.LOG_UNCERTAIN:
+        return f'schola: The events may or may not be saved. Read your event log before you retry. (code: {code})'
+    if report.written == 'partial':
+        return f'schola: Only the first event was saved to your event log. The result event was not saved (code: {code}).'
+    return f'schola: The events were not saved to your event log (code: {code}).'
+
+
 def print_events(out, report):
     say(out, f'Events written: {events_text(report.written)}')
     if report.error is not None:
@@ -747,16 +761,20 @@ def cmd_check_run(args, ctx):
     outcome, report = check_events.run_and_record(check, workspace, log=EventLog(ctx.data_dir), session_id=check_events.new_session_id(),
                                                   module=document, task_id=args.task, consent=consent)
     out = ctx.streams.stdout
-    if report.error not in (None, check_events.NOT_RUN):
-        say(ctx.streams.stderr, f'schola: The result was not saved to your event log (code: {safe_text(report.error)}).')
+    note = events_note(report)
+    if note:
+        say(ctx.streams.stderr, note)
     if ctx.as_json:
         say(out, to_json({'moduleId': args.module_id, 'version': version, 'checkId': args.check_id, 'checkHash': digest, 'tier': 2 if needs else 1,
                           'result': outcome, **report.fields()}))
     else:
         print_result(out, args, version, outcome)
         print_events(out, report)
+    # With --strict-events, events that were not (fully) saved give exit 4, whatever the status was. A run that did not start is not a fault.
+    if args.strict_events and report.written is not True and report.error != check_events.NOT_RUN:
+        return EXIT_EVENTS
     # A check that ran and reported `failed` is a result: exit 0. A check that could not run (`error`) or that Schola cannot run (`skipped`) is exit 1.
-    # The events never change the exit code.
+    # Without the flag, the events never change the exit code.
     return EXIT_OK if dict_of(outcome).get('status') in ('passed', 'failed') else EXIT_FAILED
 
 
@@ -967,6 +985,8 @@ def _add_arguments(key, parser):
     if key == 'check-run':
         parser.add_argument('--workspace', metavar='PATH', required=True, help='Your work folder. The check reads it.')
         parser.add_argument('--consent', metavar='HASH', help='For a script check without a terminal: the full check hash from "check show".')
+        parser.add_argument('--strict-events', action='store_true',
+                            help='Exit with code 4 when the events of the run were not (fully) saved. Without this, the exit code follows the check status only.')
         parser.add_argument('--task', metavar='TASK_ID', help='The task this check belongs to. Needed to write events when the module has more than one task.')
     if key == 'events-list':
         parser.add_argument('--limit', type=_number(1, MAX_LIST_LIMIT, 'limit'), default=DEFAULT_LIST_LIMIT,

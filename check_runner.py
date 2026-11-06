@@ -520,12 +520,22 @@ def default_registry():
     return _DEFAULT
 
 
+# Reasons with which an adapter refuses to start: it did not look at the work. A result with one of these is not a run.
+ADAPTER_REFUSALS = frozenset({'busy', 'consent_required', 'runtime_unavailable', 'script_not_started', 'script_not_defined'})
+
+
+def _refused(answer):
+    evidence = answer.get('evidence')
+    reason = evidence.get('reason') if isinstance(evidence, dict) else None
+    return type(reason) is str and reason in ADAPTER_REFUSALS
+
+
 @dataclasses.dataclass(frozen=True)
 class RunTrace:
     """A check result, and whether an adapter was started to produce it.
 
-    `started` is False when the runner refused before any adapter ran: the check has a bad shape, the student reports it
-    by hand, no adapter handles its type, or the workspace is not a folder. Nothing was examined then.
+    `started` is False when nothing was examined: the check has a bad shape, the student reports it by hand, no adapter
+    handles its type, the workspace is not a folder, or the adapter refused to start (see `ADAPTER_REFUSALS`).
     """
     result: dict
     started: bool
@@ -552,7 +562,8 @@ def run_traced(check, workspace, limits=None, registry=None, consent=None):
         return RunTrace(workspace_result(error), False)
     try:
         raw = adapter.run(check, root, limits, consent=consent) if getattr(adapter, 'needs_consent', False) else adapter.run(check, root, limits)
-        return RunTrace(normalize(raw, limits), True)
+        answer = normalize(raw, limits)
+        return RunTrace(answer, not _refused(answer))
     except Exception as error:  # noqa: BLE001 - an adapter fault must become an error result, with no detail
         return RunTrace(result('error', {'reason': 'adapter_failed'}, [f'The check stopped with an unexpected problem ({type(error).__name__}).']), True)
 

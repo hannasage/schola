@@ -825,6 +825,54 @@ class RunTraceTests(Workspace):
         trace = self.traced(automated({'type': 'broken-check'}), registry=registry)
         self.assertEqual((trace.result['evidence']['reason'], trace.started), ('adapter_failed', True))
 
+    def test_an_adapter_that_refuses_to_start_has_started_false(self):
+        for reason in ('busy', 'consent_required', 'runtime_unavailable', 'script_not_started', 'script_not_defined'):
+            class Refuser:
+                types = ('refuse-check',)
+
+                def run(self, check, workspace, limits, reason=reason):
+                    return {'status': 'error', 'evidence': {'reason': reason}, 'log': []}
+
+            registry = check_runner.Registry()
+            registry.register(Refuser())
+            with self.subTest(reason=reason):
+                trace = self.traced(automated({'type': 'refuse-check'}), registry=registry)
+                self.assertEqual((trace.result['evidence']['reason'], trace.started), (reason, False))
+
+    def test_the_refusal_list_is_exactly_these_five_reasons(self):
+        self.assertEqual(check_runner.ADAPTER_REFUSALS, frozenset({'busy', 'consent_required', 'runtime_unavailable', 'script_not_started', 'script_not_defined'}))
+
+    def test_a_text_subclass_cannot_pose_as_a_refusal_reason(self):
+        class Sneaky(str):
+            def __hash__(self):
+                return hash('busy')
+
+            def __eq__(self, other):
+                return True
+
+        class Plain:
+            types = ('plain-check',)
+
+            def run(self, check, workspace, limits):
+                return {'status': 'error', 'evidence': {'reason': Sneaky('anything')}, 'log': []}
+
+        registry = check_runner.Registry()
+        registry.register(Plain())
+        self.assertTrue(self.traced(automated({'type': 'plain-check'}), registry=registry).started)
+
+    def test_other_reasons_and_other_shapes_stay_started(self):
+        for evidence in ({'reason': 'git_unavailable'}, {'reason': 'not_found'}, {}, {'reason': 5}, {'reason': ['busy']}, {'other': 'busy'}):
+            class Plain:
+                types = ('plain-check',)
+
+                def run(self, check, workspace, limits, evidence=evidence):
+                    return {'status': 'error', 'evidence': dict(evidence), 'log': []}
+
+            registry = check_runner.Registry()
+            registry.register(Plain())
+            with self.subTest(evidence=evidence):
+                self.assertTrue(self.traced(automated({'type': 'plain-check'}), registry=registry).started)
+
 
 if __name__ == '__main__':
     unittest.main()

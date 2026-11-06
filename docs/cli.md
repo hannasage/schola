@@ -115,7 +115,7 @@ With `--workspace`, the tool checks the folder by the rules below.
 It prints the real folder after the links are followed. If you typed another path, it also prints `Typed as:` with your path.
 In JSON the keys are `workspace` (the real folder) and `workspaceTyped` (what you typed).
 
-### `schola check run MODULE_ID CHECK_ID [--version V] --workspace PATH [--consent HASH] [--task TASK_ID] [--json]`
+### `schola check run MODULE_ID CHECK_ID [--version V] --workspace PATH [--consent HASH] [--task TASK_ID] [--strict-events] [--json]`
 
 Runs one check in a workspace. It prints the status, the evidence, and the log.
 The check reads your workspace. It never changes it.
@@ -180,17 +180,20 @@ A check run that started writes two events to the event log: `attempt_submitted`
 - Each run of the tool has its own session id. A second run is a new session and a new attempt.
 - The tool writes to the log in the data folder, the same log that the hub uses.
 - A module with several tasks needs `--task TASK_ID`. The check has no link to a task, so the tool does not guess. Without `--task`, the tool runs the check and writes no event. A module with one task needs no `--task`. A task that the module does not have is refused before the check runs, with exit code 1 and the code `not_found`.
-- A `skipped` result for a self-reported check, a check with no runner, and a check that the runner cannot start writes no event. The code is `not_run`.
+- A `skipped` result for a self-reported check, a check with no runner, and a check that the runner cannot start writes no event. The code is `not_run`. So does a script runner that refuses to start: no consent, no runtime, a busy runner, or no script. The tool then copies and hashes nothing.
 
 The result stays the same. The tool only adds the state of the events:
 
 - In text, the last lines are `Events written: true`, `Events written: false`, or `Events written: partial`. If the value is not `true`, the next line is `Events error: CODE`.
 - In `--json`, the document has the keys `eventsWritten` (`true`, `false`, or `"partial"`) and, if it is not `true`, `eventsError`.
 - If `Events written` is not `true`, the tool also prints one line on the error output. That line has the code. The code `not_run` does not print this line, because it is not a fault.
+- The line says what is known. For `log_uncertain` it says: `The events may or may not be saved. Read your event log before you retry.` The tool never says `not saved` for a write that may have reached the disk.
 
-The codes are `not_run`, `task_required`, `log_full`, `log_damaged`, `log_unavailable`, `artifact_too_large`, `artifact_unavailable`, `event_invalid`, and `events_failed`. A code never holds a path or the text of an error.
-A fault in the log never changes the exit code. The exit code stays the one that the check status gives.
-The value `partial` means the attempt is in the log and the result is not. The tool never removes a line from the log.
+The codes are listed in `docs/check-events.md`. A code never holds a path or the text of an error.
+Without `--strict-events`, a fault in the log never changes the exit code. The exit code stays the one that the check status gives.
+The value `partial` means the attempt is in the log and the result is not, or that the first write may have reached the log (`log_uncertain`). The tool never removes a line from the log.
+
+A script or a scheduler that must not miss a lost event passes `--strict-events`. Then the tool exits with 4 when `eventsWritten` is not `true` and the code is not `not_run`. This wins over the exit code of the check status, so read `result.status` in the JSON for the status. The flag takes no value. This command uses no page reserve, so it can fill the log up to 100%. Only the hub keeps the last 20% free.
 
 Tests in `tests/test_cli.py` (`CheckRunEventsTests`) cover a full log, a damaged log, an unreadable log, a read-only data folder, and a log that takes only the first event.
 
@@ -254,6 +257,7 @@ Prints `schola` and the version. With `--json` it prints `{"name": "schola", "ve
   - The workspace is not allowed, or it changed after you saw it.
   - The output file exists.
   - A delete has no `--confirm`.
+- 4: the events were not saved. Only `check run --strict-events` returns it. The check ran, and `eventsWritten` is `false` or `"partial"`. A run that did not start (`not_run`) is not a fault and does not give 4.
 
 ## Limits
 

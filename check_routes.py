@@ -31,7 +31,8 @@ Check events
 ------------
 A run that started also writes two events to the event log (`check_events.py`): `attempt_submitted` and
 `check_result`, both with the source `app`. The response keeps its old fields and gains `eventsWritten`
-(`true`, `false`, or `"partial"`) and, when it is not `true`, `eventsError` (a stable code). A fault in the
+(`true`, `false`, or `"partial"`) and, when it is not `true`, `eventsError` (a stable code).
+Events of a hub run obey the 80 percent reserve of the log (`from_page`), so a loop of runs cannot fill it. A fault in the
 log never changes the result and never turns the answer into an error. A request that is refused before the
 run writes no event. `taskId` is optional: a module with one task uses that task, and a module with several
 tasks needs `taskId` or its events are not written (`eventsError: "task_required"`).
@@ -40,6 +41,7 @@ import hmac
 import json
 import os
 import secrets
+import sys
 import threading
 from pathlib import Path
 
@@ -353,7 +355,11 @@ def _run(session, lessons, payload, log):
     try:
         # The events are written inside the run lock, so two runs never read the folder for their digests at once.
         outcome, report = check_events.run_and_record(check, workspace, log=log, session_id=session.event_session_id, module=document,
-                                                      task_id=task_id, consent=consent, limits=session.limits, registry=session.adapters())
+                                                      task_id=task_id, consent=consent, limits=session.limits, registry=session.adapters(),
+                                                      from_page=True)
     finally:
         session.run_lock.release()
+    if report.error not in (None, check_events.NOT_RUN):
+        # The page gets the answer. The server log gets the code too, so a person who reads it sees the fault. No path, no text.
+        print(f'schola: the check events were not saved (code: {report.error}).', file=sys.stderr)
     return {'moduleId': module_id, 'version': version, 'checkId': check_id, 'checkHash': digest, 'tier': tier, 'result': outcome, **report.fields()}

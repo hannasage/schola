@@ -89,7 +89,7 @@ The byte cap is 4194304 bytes at 80%. The line cap is 40000 lines at 80%. Once t
 At exactly 80% the page is refused. One byte or one line below it, the page is accepted.
 The app writes through `EventLog.append`, which has no reserve, so it can use the rest up to 100%.
 A full log gives the page `log_reserved` and the app `log_full`.
-The check events use this path. When the log is full, the check still returns its result, and the response says `eventsWritten: false` with the code `log_full`.
+The check events of the command line tool use this path. The check events of a hub run do not: they are written with the page rule, so a loop of runs cannot fill the log. A hub run that meets the 80% limit still returns its result, and the response says `eventsWritten: false` with the code `log_reserved`.
 
 ## Reading, exporting, and deleting
 

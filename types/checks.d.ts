@@ -56,8 +56,16 @@ interface CheckResult {
   log: string[];
 }
 
-/** Whether the server wrote the events of a run: `true`, `false`, or `'partial'` (the attempt is in the log, the result is not). */
+/**
+ * Whether the server wrote the events of a run. `true`: both are in the log. `false`: the store says nothing was written.
+ * `'partial'`: the attempt is in the log and the result is not, or a write may have reached the log (`log_uncertain`).
+ */
 type CheckEventsWritten = boolean | 'partial';
+
+/** The stable codes of `eventsError`. */
+type CheckEventsError =
+  | 'not_run' | 'task_required' | 'task_unknown' | 'log_full' | 'log_reserved' | 'log_uncertain' | 'log_damaged' | 'log_unavailable'
+  | 'duplicate_event_id' | 'clock_unavailable' | 'artifact_too_large' | 'artifact_unavailable' | 'event_invalid' | 'events_failed';
 
 interface CheckRunResponse {
   moduleId: string;
@@ -68,8 +76,8 @@ interface CheckRunResponse {
   result: CheckResult;
   /** A fault in the event log never changes `result`. This field says what happened to the events. */
   eventsWritten: CheckEventsWritten;
-  /** A stable code such as `not_run`, `task_required`, `log_full`, `log_damaged`, or `log_unavailable`. Missing when `eventsWritten` is `true`. */
-  eventsError?: string;
+  /** A stable code. Missing when `eventsWritten` is `true`. For `log_uncertain`, read the event log before a retry. */
+  eventsError?: CheckEventsError;
 }
 
 interface CheckService {

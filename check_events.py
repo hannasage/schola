@@ -34,7 +34,9 @@ When no events are written
 --------------------------
 A run that never started writes nothing. The runner refuses before any adapter runs when the check has a bad
 shape, when the student reports the check by hand, when no adapter handles the runner type, and when the
-workspace is not a folder. Nothing was examined, so there is no work to point an attempt at. A `check_result`
+workspace is not a folder. An adapter that refuses to start counts the same (`check_runner.ADAPTER_REFUSALS`:
+no consent, no runtime, busy, the launcher stopped, no script). Nothing was examined, so there is no work to
+point an attempt at, and the app copies and hashes nothing. A `check_result`
 needs an attempt id, so it is not written alone either. A started run writes both events whatever its status:
 `passed`, `failed`, `error`, or `skipped`.
 
@@ -43,11 +45,26 @@ a task in the lesson module. So the task is the module's only task, or the task 
 with several tasks and no named task writes nothing, and the report says `task_required`. A task id is never
 made up.
 
+Faults while reading the work
+-----------------------------
+A check that reads no file by design, a path that names no file, and a file that was missing for the run too have
+the empty manifest. A check that tried to read and failed (a refused copy, a file over the read limit, a file
+that is gone or swapped at the digest, a read error) has no digest. Then no event is written, the report says
+`artifact_unavailable`, and the result is still returned.
+
 Reporting
 ---------
 Writing the events never changes the check result and never raises. The caller gets an `EventsReport`:
-`written` is `True`, `False`, or `'partial'` (the attempt is in the log and the result is not), and `error` is
-a stable code from `ERROR_CODES` when `written` is not `True`. The report never holds the text of an error.
+`written` is `True`, `False`, or `'partial'`, and `error` is a stable code from `ERROR_CODES` when `written` is not
+`True`. The report never holds the text of an error.
+
+`False` means the store said that nothing was written. `'partial'` means the attempt is in the log and the result
+is not, or a write may have reached the log. The second case has the code `log_uncertain`: the store marked the
+fault `maybeWritten` (a failed flush, a failed close, a write that stopped early), or the fault did not come from
+the store. After an uncertain first write the second event is not tried.
+
+Events of the hub route are written with `from_page=True`, so they stop at the 80 percent reserve of the log
+(`log_reserved`). The command line tool writes with no reserve.
 """
 import dataclasses
 import datetime
@@ -55,6 +72,7 @@ import hashlib
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import uuid
@@ -81,18 +99,22 @@ NOT_RUN = 'not_run'
 TASK_REQUIRED = 'task_required'
 TASK_UNKNOWN = 'task_unknown'
 LOG_FULL = 'log_full'
+LOG_RESERVED = 'log_reserved'
+LOG_UNCERTAIN = 'log_uncertain'
+CLOCK_UNAVAILABLE = 'clock_unavailable'
+DUPLICATE_EVENT_ID = 'duplicate_event_id'
 LOG_DAMAGED = 'log_damaged'
 LOG_UNAVAILABLE = 'log_unavailable'
 ARTIFACT_TOO_LARGE = 'artifact_too_large'
 ARTIFACT_UNAVAILABLE = 'artifact_unavailable'
 EVENT_INVALID = 'event_invalid'
 EVENTS_FAILED = 'events_failed'
-ERROR_CODES = frozenset({NOT_RUN, TASK_REQUIRED, TASK_UNKNOWN, LOG_FULL, LOG_DAMAGED, LOG_UNAVAILABLE, ARTIFACT_TOO_LARGE, ARTIFACT_UNAVAILABLE,
-                         EVENT_INVALID, EVENTS_FAILED})
+ERROR_CODES = frozenset({NOT_RUN, TASK_REQUIRED, TASK_UNKNOWN, LOG_FULL, LOG_RESERVED, LOG_UNCERTAIN, CLOCK_UNAVAILABLE, DUPLICATE_EVENT_ID, LOG_DAMAGED,
+                         LOG_UNAVAILABLE, ARTIFACT_TOO_LARGE, ARTIFACT_UNAVAILABLE, EVENT_INVALID, EVENTS_FAILED})
 
 # What each code of the event store becomes. A store code that is not here becomes `events_failed`.
 _STORE_CODES = {
-    'log_full': LOG_FULL, 'log_reserved': LOG_FULL,
+    'log_full': LOG_FULL, 'log_reserved': LOG_RESERVED, 'duplicate_event_id': DUPLICATE_EVENT_ID,
     'log_corrupt': LOG_DAMAGED,
     'log_unreadable': LOG_UNAVAILABLE, 'lock_unavailable': LOG_UNAVAILABLE, 'write_failed': LOG_UNAVAILABLE,
     'fsync_failed': LOG_UNAVAILABLE, 'unsafe_path': LOG_UNAVAILABLE,
@@ -158,6 +180,19 @@ def error_code(error):
     return EVENTS_FAILED
 
 
+def _warn(text):
+    """One line on standard error. It never raises: a closed error output must not stop a check."""
+    try:
+        sys.stderr.write(text + '\n')
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _warn_unexpected(error):
+    """Name the class of an unexpected fault and nothing else: the text of an error can hold a path."""
+    _warn(f'schola: check events hit an unexpected problem ({type(error).__name__}).')
+
+
 # ---------------------------------------------------------------------------
 # The digest of the work
 # ---------------------------------------------------------------------------
@@ -206,18 +241,30 @@ def _hash_descriptor(read, limit):
         digest.update(chunk)
 
 
-def _file_artifact(workspace, path, limit, limits, report_large):
-    """The artifact for one file inside the workspace. A file that cannot be examined is the empty manifest."""
+def _run_saw_it(outcome):
+    return type(outcome) is dict and outcome.get('status') == 'passed'
+
+
+def _file_artifact(workspace, path, limit, limits, report_large, outcome):
+    """The artifact for one file inside the workspace.
+
+    A path that names no file (an unsafe path, a folder) or a file that was missing for the run too is the empty
+    manifest. Any other failure to read is an `ArtifactError`: the digest would not be the digest of the work.
+    """
     try:
         parts = check_workspace.split_relative(path, **limits.path_limits())
         root = check_workspace.workspace_root(workspace)
         descriptor = check_workspace.open_inside(root, path, 'file', limit, **limits.path_limits())
     except WorkspaceError as error:
+        if error.code in (check_workspace.INVALID_PATH, check_workspace.WRONG_KIND):
+            return _EMPTY
+        if error.code == check_workspace.NOT_FOUND and not _run_saw_it(outcome):
+            return _EMPTY
         if error.code == check_workspace.TOO_LARGE and report_large:
             raise ArtifactError(ARTIFACT_TOO_LARGE) from None
-        return _EMPTY
+        raise ArtifactError(ARTIFACT_UNAVAILABLE) from None
     except OSError:
-        return _EMPTY
+        raise ArtifactError(ARTIFACT_UNAVAILABLE) from None
     try:
         found = _hash_descriptor(lambda size: os.read(descriptor, size), limit)
     except OSError:
@@ -228,9 +275,7 @@ def _file_artifact(workspace, path, limit, limits, report_large):
         except OSError:
             pass
     if found is None:
-        if report_large:
-            raise ArtifactError(ARTIFACT_TOO_LARGE)
-        return _EMPTY
+        raise ArtifactError(ARTIFACT_TOO_LARGE if report_large else ARTIFACT_UNAVAILABLE)
     return digest_entries([('/'.join(parts), found[0], found[1])])
 
 
@@ -239,7 +284,7 @@ def _tree_artifact(workspace, limits):
     try:
         root = check_workspace.workspace_root(workspace)
     except WorkspaceError:
-        return _EMPTY
+        raise ArtifactError(ARTIFACT_UNAVAILABLE) from None
     try:
         scratch = tempfile.mkdtemp(prefix=check_script.PRIVATE_PREFIX)
     except OSError:
@@ -249,9 +294,7 @@ def _tree_artifact(workspace, limits):
         try:
             os.mkdir(work, 0o700)
             check_script.copy_workspace(root, work, limits.script_copy_bytes, limits.script_copy_files)
-        except check_script.ScriptProblem:
-            return _EMPTY
-        except OSError:
+        except (check_script.ScriptProblem, OSError):
             raise ArtifactError(ARTIFACT_UNAVAILABLE) from None
         entries = []
         try:
@@ -267,14 +310,20 @@ def _tree_artifact(workspace, limits):
             raise ArtifactError(ARTIFACT_UNAVAILABLE) from None
         return digest_entries(entries)
     finally:
-        check_script.remove_scratch(scratch)
+        if not check_script.remove_scratch(scratch):
+            _warn('schola: Schola could not remove its temporary folder. It is safe to delete a folder named schola-script-* in your temp folder.')
 
 
-def artifact_for(check, workspace, limits):
+def artifact_for(check, workspace, limits, outcome=None):
     """The `Artifact` for the files a check reads, as they stand now. See the module notes for the rule.
 
-    Raises `ArtifactError` only when the work is over the size cap or the system cannot read it. A file that is
-    missing, a path that is not safe, or a runner that reads no file gives the empty manifest.
+    `outcome` is the result of the run. It tells a file that was missing for the run too from a file that was there for
+    the run and is gone now.
+
+    A runner that reads no file by design (such as `git-commit-exists`, or a type nobody handles), a path that names no
+    file, and a file that was missing for the run too give the empty manifest. Every other failure to read raises
+    `ArtifactError` (`artifact_unavailable`, or `artifact_too_large` over the size cap): the digest would not be the
+    digest of the work.
     """
     runner = check.get('runner') if type(check) is dict else None
     runner_type = runner.get('type') if type(runner) is dict else None
@@ -285,8 +334,8 @@ def artifact_for(check, workspace, limits):
         if type(path) is not str:
             return _EMPTY
         if runner_type == 'file-exists':
-            return _file_artifact(workspace, path, MAX_ARTIFACT_BYTES, limits, True)
-        return _file_artifact(workspace, path, limits.max_file_bytes, limits, False)
+            return _file_artifact(workspace, path, MAX_ARTIFACT_BYTES, limits, True, outcome)
+        return _file_artifact(workspace, path, limits.max_file_bytes, limits, False, outcome)
     return _EMPTY
 
 
@@ -345,12 +394,25 @@ def build_events(*, session_id, module, task_id, check, outcome, duration_ms, ar
     return [attempt, result]
 
 
-def _append(log, events):
+def _uncertain(error):
+    """True unless the store says that nothing reached the file. Only a store error with no `maybeWritten` is trusted."""
+    if not isinstance(error, EventLogError):
+        return True
+    details = error.details
+    return type(details) is dict and (details.get('maybeWritten') is True or details.get('partialLine') is True)
+
+
+def _append(log, events, from_page):
     written = 0
     for event in events:
         try:
-            log.append(event)
+            log.append(event, from_page=from_page)
         except Exception as error:  # noqa: BLE001 - any fault becomes a code; a KeyboardInterrupt still stops the program
+            if not isinstance(error, EventLogError):
+                _warn_unexpected(error)
+            if _uncertain(error):
+                # The line may be in the log. Say so, and do not try the second event.
+                return EventsReport('partial', LOG_UNCERTAIN)
             return EventsReport('partial' if written else False, error_code(error))
         written += 1
     return EventsReport(True)
@@ -363,11 +425,12 @@ def _read_clock(clock):
         return None
 
 
-def run_and_record(check, workspace, *, log, session_id, module, task_id=None, consent=None, limits=None, registry=None, sources=None):
+def run_and_record(check, workspace, *, log, session_id, module, task_id=None, consent=None, limits=None, registry=None, sources=None, from_page=False):
     """Run one check and write its events. Returns `(result, EventsReport)`.
 
     The result is exactly what `check_runner.run` gives. It never changes because of the log. `module` is the stored
     module document the check belongs to. `task_id` is optional; see the module notes. `log` is an `EventLog`.
+    `from_page` is True for the hub route: its events obey the 80 percent reserve of the log, so other app events keep room.
     """
     sources = sources or Sources()
     started_at = _read_clock(sources.now)
@@ -378,10 +441,17 @@ def run_and_record(check, workspace, *, log, session_id, module, task_id=None, c
     if not trace.started:
         return trace.result, EventsReport(False, NOT_RUN)
     try:
+        # Check the clock first, so a bad clock is named and is not mistaken for another fault.
+        _stamp(started_at)
+        _stamp(finished_at)
+        _duration_ms(began, ended)
+    except Exception:  # noqa: BLE001
+        return trace.result, EventsReport(False, CLOCK_UNAVAILABLE)
+    try:
         chosen, problem = resolve_task(module, task_id)
         if problem is not None:
             return trace.result, EventsReport(False, problem)
-        artifact = artifact_for(check, workspace, limits or check_runner.Limits())
+        artifact = artifact_for(check, workspace, limits or check_runner.Limits(), trace.result)
         events = build_events(session_id=session_id, module=module, task_id=chosen, check=check, outcome=trace.result,
                               duration_ms=_duration_ms(began, ended), artifact=artifact, started_at=started_at, finished_at=finished_at,
                               sources=sources)
@@ -389,6 +459,7 @@ def run_and_record(check, workspace, *, log, session_id, module, task_id=None, c
             return trace.result, EventsReport(False, EVENT_INVALID)
     except ArtifactError as error:
         return trace.result, EventsReport(False, error.code)
-    except Exception:  # noqa: BLE001 - the check result must come back whatever goes wrong here
+    except Exception as error:  # noqa: BLE001 - the check result must come back whatever goes wrong here
+        _warn_unexpected(error)
         return trace.result, EventsReport(False, EVENTS_FAILED)
-    return trace.result, _append(log, events)
+    return trace.result, _append(log, events, from_page)

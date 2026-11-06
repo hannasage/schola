@@ -7,6 +7,7 @@ against a hostile local program, which already has the student's permissions.
 """
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -937,22 +938,42 @@ class EventsRouteTests(RouteCase):
         self.assertEqual(payload['tier'], 1)
         return payload
 
-    def test_a_full_log(self):
+    def test_a_full_log_is_refused_by_the_reserve_first(self):
         self.set_workspace()
         folder = self.data / '_events'
         folder.mkdir(mode=0o700)
         (folder / 'events.jsonl').write_bytes(b'x' * (learning_event.MAX_BYTES - 10) + b'\n')
         os.chmod(folder / 'events.jsonl', 0o600)
-        self.assertResultKept('log_full')
+        self.assertResultKept('log_reserved')
 
-    def test_a_log_over_the_page_reserve_still_takes_the_events_of_the_app(self):
+    def test_a_log_over_the_page_reserve_refuses_the_events_of_a_hub_run(self):
+        """A hub run is page traffic. Its events stop at 80 percent, so the rest stays free for other app events."""
         self.set_workspace()
         folder = self.data / '_events'
         folder.mkdir(mode=0o700)
         (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES + 100) + b'\n')
         os.chmod(folder / 'events.jsonl', 0o600)
-        status, payload = self.run_check()
-        self.assertEqual((status, payload['eventsWritten']), (200, True))
+        before = (folder / 'events.jsonl').read_bytes()
+        self.assertResultKept('log_reserved')
+        self.assertEqual((folder / 'events.jsonl').read_bytes(), before)
+        # The app, with no reserve, can still use the rest.
+        EventLog(self.data).append(self.sample_app_event())
+
+    def test_a_loop_of_runs_stops_at_the_reserve(self):
+        self.set_workspace()
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_log.RESERVE_BYTES - 1500) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        answers = [self.run_check()[1]['eventsWritten'] for _ in range(8)]
+        self.assertIn(True, answers)
+        self.assertEqual(answers[-1], False)
+        self.assertLessEqual(len((folder / 'events.jsonl').read_bytes()), event_log.RESERVE_BYTES + 1000)
+
+    def sample_app_event(self):
+        return {'schemaVersion': '1.0', 'eventId': '11111111-1111-4111-8111-111111111111', 'time': '2026-01-01T00:00:00Z',
+                'sessionId': '22222222-2222-4222-8222-222222222222', 'moduleId': 'hello-module', 'moduleVersion': '1.0.0', 'taskId': 'task-1',
+                'source': 'app', 'skills': [], 'type': 'task_finished', 'data': {'result': 'passed'}}
 
     def test_a_damaged_log(self):
         self.set_workspace()
@@ -995,7 +1016,7 @@ class EventsRouteTests(RouteCase):
     def test_an_unexpected_fault_in_the_log_is_named(self):
         self.set_workspace()
         with mock.patch.object(event_log.EventLog, 'append', side_effect=RuntimeError('/Users/someone/secret')):
-            payload = self.assertResultKept('events_failed')
+            payload = self.assertResultKept('log_uncertain', expected_written='partial')
         self.assertNotIn('Users', json.dumps(payload))
 
     def test_the_log_comes_back_when_the_fault_is_gone(self):
@@ -1011,6 +1032,43 @@ class EventsRouteTests(RouteCase):
         self.set_workspace()
         with mock.patch.object(check_routes.check_events, 'artifact_for', side_effect=RuntimeError('boom')):
             self.assertResultKept('events_failed')
+
+    def test_an_uncertain_write_is_named_and_the_second_event_is_not_tried(self):
+        self.set_workspace()
+        calls = []
+
+        def uncertain(log, event, from_page=False):
+            calls.append(event['type'])
+            raise event_log.EventLogError('may be in the log', 'fsync_failed', details={'partialLine': False, 'maybeWritten': True})
+
+        with mock.patch.object(event_log.EventLog, 'append', uncertain):
+            self.assertResultKept('log_uncertain', expected_written='partial')
+        self.assertEqual(calls, ['attempt_submitted'])
+
+    def test_every_failure_except_not_run_leaves_one_line_on_standard_error_with_a_code_only(self):
+        self.set_workspace()
+        (self.data / '_events').write_text('x')
+        seen = io.StringIO()
+        with mock.patch.object(sys, 'stderr', seen):
+            self.assertResultKept('log_damaged')
+        self.assertEqual(seen.getvalue(), 'schola: the check events were not saved (code: log_damaged).\n')
+        self.assertNotIn(str(self.data), seen.getvalue())
+
+    def test_a_partial_write_leaves_a_line_too(self):
+        self.set_workspace()
+        with mock.patch.object(event_log.EventLog, 'append', side_effect=event_log.EventLogError('may be in the log', 'fsync_failed', details={'maybeWritten': True})):
+            seen = io.StringIO()
+            with mock.patch.object(sys, 'stderr', seen):
+                self.assertResultKept('log_uncertain', expected_written='partial')
+        self.assertIn('(code: log_uncertain)', seen.getvalue())
+
+    def test_a_run_that_wrote_its_events_or_did_not_start_leaves_no_line(self):
+        self.set_workspace()
+        seen = io.StringIO()
+        with mock.patch.object(sys, 'stderr', seen):
+            self.assertEqual(self.run_check()[1]['eventsWritten'], True)
+            self.assertEqual(self.run_check('self')[1]['eventsError'], 'not_run')
+        self.assertEqual(seen.getvalue(), '')
 
     def test_no_text_of_the_log_fault_reaches_the_response(self):
         self.set_workspace()

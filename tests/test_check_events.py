@@ -4,6 +4,7 @@ The tests use the real event log, the real check runner, and the real lesson sto
 Every event that a test reads from the log is checked again with `learning_event.validate_event`.
 """
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ import check_consent
 import check_events
 import check_runner
 import learning_event
+import event_log as event_log_module
 from event_log import EventLog, EventLogError
 from lesson_store import LessonStore
 
@@ -255,12 +257,56 @@ class ArtifactTests(EventsCase):
             with self.subTest(check=check):
                 self.assertEqual(check_events.artifact_for(check, self.work, check_runner.Limits()), check_events.Artifact(EMPTY_SHA, 0))
 
-    def test_a_link_that_leaves_the_workspace_examines_nothing(self):
+    def assertUnavailable(self, call):
+        with self.assertRaises(check_events.ArtifactError) as raised:
+            call()
+        self.assertEqual(raised.exception.code, 'artifact_unavailable')
+
+    def test_a_link_that_leaves_the_workspace_is_a_failed_read_not_an_empty_digest(self):
         outside = self.work.parent / 'outside.txt'
         outside.write_text('outside secret')
         (self.work / 'leak.txt').symlink_to(outside)
         check = {'id': 'x', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'file-exists', 'path': 'leak.txt'}}
-        self.assertEqual(check_events.artifact_for(check, self.work, check_runner.Limits()), check_events.Artifact(EMPTY_SHA, 0))
+        self.assertUnavailable(lambda: check_events.artifact_for(check, self.work, check_runner.Limits()))
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can read any file')
+    def test_a_file_the_system_will_not_open_is_a_failed_read(self):
+        path = self.work / 'README.md'
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        self.assertUnavailable(lambda: self.artifact('has-readme'))
+
+    def test_a_file_that_was_there_for_the_run_but_is_gone_at_the_digest_is_a_failed_read(self):
+        passed = {'status': 'passed', 'evidence': {}, 'log': []}
+        (self.work / 'README.md').unlink()
+        (self.work / 'data.json').unlink()
+        self.assertUnavailable(lambda: check_events.artifact_for(self.check('has-readme'), self.work, check_runner.Limits(), passed))
+        self.assertUnavailable(lambda: check_events.artifact_for(self.check('valid-json'), self.work, check_runner.Limits(), passed))
+        (self.work / 'src' / 'app.py').unlink()
+        (self.work / 'src').rmdir()
+        self.assertUnavailable(lambda: check_events.artifact_for(self.check('a-dir'), self.work, check_runner.Limits(), passed))
+
+    def test_a_file_that_was_missing_for_the_run_too_is_the_empty_manifest(self):
+        (self.work / 'README.md').unlink()
+        for status in ('failed', 'error', 'skipped'):
+            outcome = {'status': status, 'evidence': {'reason': 'not_found'}, 'log': []}
+            self.assertEqual(check_events.artifact_for(self.check('has-readme'), self.work, check_runner.Limits(), outcome), check_events.Artifact(EMPTY_SHA, 0))
+
+    def test_a_folder_that_the_run_passed_on_is_the_empty_manifest(self):
+        passed = {'status': 'passed', 'evidence': {}, 'log': []}
+        self.assertEqual(check_events.artifact_for(self.check('a-dir'), self.work, check_runner.Limits(), passed), check_events.Artifact(EMPTY_SHA, 0))
+
+    def test_a_file_swapped_for_a_link_out_of_the_workspace_after_the_run_is_a_failed_read(self):
+        passed = {'status': 'passed', 'evidence': {}, 'log': []}
+        outside = self.work.parent / 'outside.txt'
+        outside.write_text('outside secret')
+        (self.work / 'README.md').unlink()
+        (self.work / 'README.md').symlink_to(outside)
+        self.assertUnavailable(lambda: check_events.artifact_for(self.check('has-readme'), self.work, check_runner.Limits(), passed))
+
+    def test_an_unexpected_os_error_while_opening_is_a_failed_read(self):
+        with mock.patch.object(check_events.check_workspace, 'open_inside', side_effect=OSError(5, 'I/O error')):
+            self.assertUnavailable(lambda: self.artifact('has-readme'))
 
     def test_a_link_inside_the_workspace_is_read_under_the_runner_path(self):
         (self.work / 'alias.md').symlink_to(self.work / 'README.md')
@@ -273,14 +319,15 @@ class ArtifactTests(EventsCase):
                 check = {'id': 'x', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'file-exists', 'path': path}}
                 self.assertEqual(check_events.artifact_for(check, self.work, check_runner.Limits()), check_events.Artifact(EMPTY_SHA, 0))
 
-    def test_a_missing_workspace_examines_nothing(self):
-        self.assertEqual(check_events.artifact_for(self.check('has-readme'), self.work / 'nope', check_runner.Limits()), check_events.Artifact(EMPTY_SHA, 0))
-        self.assertEqual(check_events.artifact_for(self.check('has-readme'), None, check_runner.Limits()), check_events.Artifact(EMPTY_SHA, 0))
+    def test_a_missing_workspace_is_a_failed_read(self):
+        for workspace in (self.work / 'nope', None):
+            self.assertUnavailable(lambda: check_events.artifact_for(self.check('has-readme'), workspace, check_runner.Limits()))
+            self.assertUnavailable(lambda: check_events.artifact_for(self.check('script-a'), workspace, check_runner.Limits()))
 
-    def test_a_file_over_the_read_limit_of_the_runner_examines_nothing_for_text_match(self):
+    def test_a_file_over_the_read_limit_of_the_runner_is_a_failed_read_for_text_match(self):
         (self.work / 'README.md').write_bytes(b'x' * 50)
         limits = check_runner.Limits(max_file_bytes=10)
-        self.assertEqual(self.artifact('has-todo', limits=limits), check_events.Artifact(EMPTY_SHA, 0))
+        self.assertUnavailable(lambda: self.artifact('has-todo', limits=limits))
 
     def test_a_file_over_the_cap_for_a_work_digest_is_reported_not_guessed(self):
         (self.work / 'README.md').write_bytes(b'x' * 50)
@@ -325,7 +372,7 @@ class ArtifactTests(EventsCase):
                     self.artifact('has-readme')
             self.assertEqual(raised.exception.code, 'artifact_too_large')
             limits = check_runner.Limits(max_file_bytes=10)
-            self.assertEqual(self.artifact('has-todo', limits=limits), check_events.Artifact(EMPTY_SHA, 0))
+            self.assertUnavailable(lambda: self.artifact('has-todo', limits=limits))
 
     def test_a_read_error_while_hashing_is_reported_and_the_descriptor_is_closed(self):
         def open_descriptors():
@@ -369,23 +416,46 @@ class ArtifactTests(EventsCase):
         artifact = check_events.artifact_for(self.check('script-a'), empty, check_runner.Limits())
         self.assertEqual(artifact, check_events.Artifact(EMPTY_SHA, 0))
 
-    def test_a_workspace_the_runner_refuses_to_copy_examines_nothing(self):
+    def test_a_workspace_the_runner_refuses_to_copy_is_a_failed_read(self):
         outside = self.work.parent / 'outside.txt'
         outside.write_text('outside')
         (self.work / 'leak').symlink_to(outside)
-        self.assertEqual(self.artifact('script-a'), check_events.Artifact(EMPTY_SHA, 0))
+        self.assertUnavailable(lambda: self.artifact('script-a'))
 
-    def test_the_copy_limits_of_the_runner_apply(self):
-        limits = check_runner.Limits(script_copy_files=1)
-        self.assertEqual(self.artifact('script-a', limits=limits), check_events.Artifact(EMPTY_SHA, 0))
-        limits = check_runner.Limits(script_copy_bytes=5)
-        self.assertEqual(self.artifact('script-a', limits=limits), check_events.Artifact(EMPTY_SHA, 0))
+    def test_the_copy_limits_of_the_runner_apply_and_a_refused_copy_is_a_failed_read(self):
+        self.assertUnavailable(lambda: self.artifact('script-a', limits=check_runner.Limits(script_copy_files=1)))
+        self.assertUnavailable(lambda: self.artifact('script-a', limits=check_runner.Limits(script_copy_bytes=5)))
+
+    def test_a_scratch_folder_that_will_not_go_away_is_a_warning_on_standard_error_and_the_digest_stands(self):
+        warnings = io.StringIO()
+        with mock.patch.object(check_events.check_script, 'remove_scratch', return_value=False), mock.patch.object(check_events.sys, 'stderr', warnings):
+            artifact = self.artifact('script-a')
+        self.assertEqual(artifact.size, 31)
+        self.assertIn('schola-script-', warnings.getvalue())
+        self.assertNotIn(str(self.work), warnings.getvalue())
+
+    def test_a_scratch_folder_that_goes_away_says_nothing(self):
+        warnings = io.StringIO()
+        with mock.patch.object(check_events.sys, 'stderr', warnings):
+            self.artifact('script-a')
+        self.assertEqual(warnings.getvalue(), '')
 
     def test_a_copy_bigger_than_the_event_cap_is_reported(self):
         with mock.patch.object(check_events, 'MAX_ARTIFACT_BYTES', 10):
             with self.assertRaises(check_events.ArtifactError) as raised:
                 self.artifact('script-a')
         self.assertEqual(raised.exception.code, 'artifact_too_large')
+
+    def test_a_work_folder_that_cannot_be_made_is_a_failed_read(self):
+        real = os.mkdir
+
+        def fail_for_work(path, *args, **kwargs):
+            if str(path).endswith('work'):
+                raise OSError(28, 'No space left on device')
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(check_events.os, 'mkdir', fail_for_work):
+            self.assertUnavailable(lambda: self.artifact('script-a'))
 
     def test_a_scratch_folder_that_cannot_be_made_is_reported(self):
         with mock.patch.object(check_events.tempfile, 'mkdtemp', side_effect=OSError('no space')):
@@ -510,7 +580,7 @@ class WriteTests(EventsCase):
             types = ('skip-check',)
 
             def run(self, check, workspace, limits):
-                return {'status': 'skipped', 'evidence': {'reason': 'runtime_unavailable'}, 'log': []}
+                return {'status': 'skipped', 'evidence': {'reason': 'git_unavailable'}, 'log': []}
 
         registry = check_runner.Registry()
         registry.register(Skipper())
@@ -518,7 +588,7 @@ class WriteTests(EventsCase):
         outcome, report = self.record('skip', registry=registry)
         self.assertEqual((outcome['status'], report.written), ('skipped', True))
         attempt, result = self.events()
-        self.assertEqual((attempt['type'], result['data']['status'], result['data']['evidence'], result['data']['runnerType']), ('attempt_submitted', 'skipped', 'runtime_unavailable', 'skip-check'))
+        self.assertEqual((attempt['type'], result['data']['status'], result['data']['evidence'], result['data']['runnerType']), ('attempt_submitted', 'skipped', 'git_unavailable', 'skip-check'))
 
     def test_a_script_check_writes_events_with_the_workspace_digest(self):
         outcome, report = self.record('script-a', consent=self.script_consent())
@@ -678,6 +748,39 @@ class NoRunNoEventsTests(EventsCase):
                 self.assertEqual(report, check_events.EventsReport(False, 'not_run'))
         self.assertFalse((self.data / '_events').exists())
 
+    def test_an_adapter_that_refuses_to_start_writes_nothing_and_copies_and_hashes_nothing(self):
+        """busy, consent_required, runtime_unavailable, script_not_started, and script_not_defined are refusals, not runs."""
+        for reason in ('busy', 'consent_required', 'runtime_unavailable', 'script_not_started', 'script_not_defined'):
+            class Refuser:
+                types = ('refuse-check',)
+
+                def run(self, check, workspace, limits, reason=reason):
+                    return {'status': 'error', 'evidence': {'reason': reason}, 'log': []}
+
+            registry = check_runner.Registry()
+            registry.register(Refuser())
+            self.document['checks'] = [{'id': 'refuse', 'kind': 'automated', 'description': 'd', 'runner': {'type': 'refuse-check', 'path': 'README.md'}}]
+            with self.subTest(reason=reason), mock.patch.object(check_events, 'artifact_for', side_effect=AssertionError('hashed')), \
+                    mock.patch.object(check_events.check_script, 'copy_workspace', side_effect=AssertionError('copied')):
+                outcome, report = self.record('refuse', registry=registry)
+            self.assertEqual((outcome['evidence']['reason'], report), (reason, check_events.EventsReport(False, 'not_run')))
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_a_script_check_without_consent_writes_nothing_and_copies_nothing(self):
+        with mock.patch.object(check_events.check_script, 'copy_workspace', side_effect=AssertionError('copied')):
+            outcome, report = self.record('script-a')
+        self.assertEqual((outcome['evidence']['reason'], report), ('consent_required', check_events.EventsReport(False, 'not_run')))
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_the_run_result_reaches_the_digest_so_a_vanished_file_is_a_failed_read(self):
+        """The run passed on a file. The file is gone when the digest is made."""
+        (self.work / 'README.md').unlink()
+        trace = check_runner.RunTrace({'status': 'passed', 'evidence': {'path': 'README.md'}, 'log': []}, True)
+        with mock.patch.object(check_runner, 'run_traced', return_value=trace):
+            outcome, report = self.record('has-readme')
+        self.assertEqual((outcome['status'], report), ('passed', check_events.EventsReport(False, 'artifact_unavailable')))
+        self.assertFalse((self.data / '_events').exists())
+
     def test_the_result_is_returned_in_each_case(self):
         outcome, _ = self.record('self')
         self.assertEqual(outcome['evidence']['reason'], 'self_reported')
@@ -816,10 +919,10 @@ class FailureTests(EventsCase):
             self.assertEqual(self.assertResultKept(log=log), check_events.EventsReport(False, 'log_unavailable'))
 
     def test_every_store_code_maps_to_a_stable_code(self):
-        table = {'log_full': 'log_full', 'log_reserved': 'log_full', 'log_corrupt': 'log_damaged', 'log_unreadable': 'log_unavailable',
+        table = {'log_full': 'log_full', 'log_reserved': 'log_reserved', 'log_corrupt': 'log_damaged', 'log_unreadable': 'log_unavailable',
                  'lock_unavailable': 'log_unavailable', 'write_failed': 'log_unavailable', 'fsync_failed': 'log_unavailable',
                  'unsafe_path': 'log_unavailable', 'invalid_event': 'event_invalid', 'event_too_large': 'event_invalid',
-                 'unsupported_version': 'event_invalid', 'duplicate_event_id': 'events_failed', 'something_new': 'events_failed', None: 'events_failed'}
+                 'unsupported_version': 'event_invalid', 'duplicate_event_id': 'duplicate_event_id', 'something_new': 'events_failed', None: 'events_failed'}
         for store_code, ours in table.items():
             with self.subTest(store=store_code):
                 self.assertEqual(check_events.error_code(EventLogError('m', store_code)), ours)
@@ -830,7 +933,7 @@ class FailureTests(EventsCase):
         calls = []
 
         class Flaky:
-            def append(self, event):
+            def append(self, event, from_page=False):
                 calls.append(event['type'])
                 if len(calls) == 2:
                     raise EventLogError('x', 'write_failed')
@@ -839,28 +942,119 @@ class FailureTests(EventsCase):
         report = self.assertResultKept(log=Flaky())
         self.assertEqual((calls, report), (['attempt_submitted', 'check_result'], check_events.EventsReport('partial', 'log_unavailable')))
 
-    def test_a_store_that_raises_something_unexpected_is_events_failed(self):
-        class Broken:
-            def append(self, event):
-                raise RuntimeError('/Users/someone/secret exploded')
+    def uncertain(self, code='fsync_failed', **details):
+        return EventLogError('The event may be in the log.', code, details=dict({'partialLine': False, 'maybeWritten': True}, **details))
 
-        report = self.assertResultKept(log=Broken())
-        self.assertEqual(report, check_events.EventsReport(False, 'events_failed'))
-
-    def test_an_unexpected_fault_after_the_first_event_is_partial(self):
+    def recording_log(self, failures):
+        """A log that raises `failures[n]` at its n-th append (counting from 1) and records every call."""
         calls = []
 
-        class Broken:
-            def append(self, event):
-                calls.append(1)
-                if len(calls) == 2:
-                    raise ValueError('x')
+        class Recording:
+            def append(self, event, from_page=False):
+                calls.append((event['type'], from_page))
+                if len(calls) in failures:
+                    raise failures[len(calls)]
+                return {'appended': True}
 
-        self.assertEqual(self.assertResultKept(log=Broken()), check_events.EventsReport('partial', 'events_failed'))
+        return Recording(), calls
+
+    def test_an_uncertain_first_write_is_partial_and_the_second_is_not_tried(self):
+        log, calls = self.recording_log({1: self.uncertain()})
+        report = self.assertResultKept(log=log)
+        self.assertEqual(report, check_events.EventsReport('partial', 'log_uncertain'))
+        self.assertEqual([call[0] for call in calls], ['attempt_submitted'])
+
+    def test_an_uncertain_second_write_is_partial(self):
+        log, calls = self.recording_log({2: self.uncertain()})
+        report = self.assertResultKept(log=log)
+        self.assertEqual(report, check_events.EventsReport('partial', 'log_uncertain'))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_partial_line_alone_is_uncertain(self):
+        log, _ = self.recording_log({1: EventLogError('cut', 'write_failed', details={'partialLine': True, 'maybeWritten': False})})
+        self.assertEqual(self.assertResultKept(log=log), check_events.EventsReport('partial', 'log_uncertain'))
+
+    def test_a_closed_error_output_does_not_stop_the_check_or_the_report(self):
+        class Closed:
+            def write(self, text):
+                raise ValueError('I/O operation on closed file')
+
+        log, _ = self.recording_log({1: RuntimeError('x')})
+        with mock.patch.object(check_events.sys, 'stderr', Closed()):
+            report = self.assertResultKept(log=log)
+        self.assertEqual(report, check_events.EventsReport('partial', 'log_uncertain'))
+        log, _ = self.recording_log({1: RuntimeError('x')})
+        with mock.patch.object(check_events.sys, 'stderr', None):
+            self.assertEqual(self.assertResultKept(log=log), check_events.EventsReport('partial', 'log_uncertain'))
+
+    def test_a_cut_line_is_uncertain_too(self):
+        log, _ = self.recording_log({1: EventLogError('cut', 'write_failed', details={'partialLine': True, 'maybeWritten': True})})
+        self.assertEqual(self.assertResultKept(log=log), check_events.EventsReport('partial', 'log_uncertain'))
+
+    def test_only_a_store_that_says_maybe_written_is_uncertain(self):
+        cases = {
+            'maybe false': EventLogError('x', 'write_failed', details={'partialLine': False, 'maybeWritten': False}),
+            'no details': EventLogError('x', 'write_failed'),
+            'list details': EventLogError('x', 'invalid_event', 422, details=[{'pointer': '', 'message': 'm'}]),
+            'text instead of true': EventLogError('x', 'write_failed', details={'maybeWritten': 'yes'}),
+            'one instead of true': EventLogError('x', 'write_failed', details={'maybeWritten': 1}),
+        }
+        for label, failure in cases.items():
+            with self.subTest(label=label):
+                log, calls = self.recording_log({1: failure})
+                report = self.assertResultKept(log=log)
+                self.assertIs(report.written, False)
+                self.assertNotEqual(report.error, 'log_uncertain')
+
+    def test_a_flush_that_fails_after_the_write_is_uncertain_in_the_real_store(self):
+        self.assertResultKept()  # the log and its folder exist now, so the next write flushes only the file
+        with mock.patch.object(event_log_module.os, 'fsync', side_effect=OSError(5, 'I/O error')):
+            report = self.assertResultKept()
+        self.assertEqual(report, check_events.EventsReport('partial', 'log_uncertain'))
+        self.assertEqual(self.log_bytes().count(b'"attempt_submitted"'), 2)
+        self.assertEqual(self.log_bytes().count(b'"check_result"'), 1)
+
+    def test_a_store_that_raises_something_unexpected_is_uncertain_and_names_only_the_class(self):
+        log, calls = self.recording_log({1: RuntimeError('/Users/someone/secret exploded')})
+        warnings = io.StringIO()
+        with mock.patch.object(check_events.sys, 'stderr', warnings):
+            report = self.assertResultKept(log=log)
+        self.assertEqual(report, check_events.EventsReport('partial', 'log_uncertain'))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('RuntimeError', warnings.getvalue())
+        self.assertNotIn('Users', warnings.getvalue())
+
+    def test_an_unexpected_fault_after_the_first_event_is_partial_and_uncertain(self):
+        log, _ = self.recording_log({2: ValueError('x')})
+        self.assertEqual(self.assertResultKept(log=log), check_events.EventsReport('partial', 'log_uncertain'))
+
+    def test_events_are_written_with_the_reserve_rule_only_when_asked(self):
+        log, calls = self.recording_log({})
+        self.assertResultKept(log=log)
+        self.assertEqual([call[1] for call in calls], [False, False])
+        log, calls = self.recording_log({})
+        outcome, report = check_events.run_and_record(self.check('has-readme'), self.work, log=log, session_id=SESSION, module=self.document, from_page=True)
+        self.assertEqual([call[1] for call in calls], [True, True])
+        self.assertIs(report.written, True)
+
+    def test_a_log_over_the_reserve_refuses_a_page_write_with_log_reserved(self):
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'x' * (event_reserve() + 10) + b'\n')
+        os.chmod(folder / 'events.jsonl', 0o600)
+        outcome, report = check_events.run_and_record(self.check('has-readme'), self.work, log=self.log, session_id=SESSION, module=self.document, from_page=True)
+        self.assertEqual(outcome['status'], 'passed')
+        self.assertEqual(report, check_events.EventsReport(False, 'log_reserved'))
+        self.assertEqual(self.log_bytes().count(b'attempt_submitted'), 0)
+
+    def test_the_same_event_id_twice_is_named(self):
+        sources = check_events.Sources(event_id=lambda: '00000000-0000-4000-8000-000000000001')
+        report = self.assertResultKept(sources=sources)
+        self.assertEqual(report, check_events.EventsReport('partial', 'duplicate_event_id'))
 
     def test_the_report_never_carries_the_text_of_an_error(self):
         class Broken:
-            def append(self, event):
+            def append(self, event, from_page=False):
                 raise EventLogError('/Users/someone/secret path', 'write_failed', details={'path': '/Users/x'})
 
         report = self.assertResultKept(log=Broken())
@@ -890,25 +1084,57 @@ class FailureTests(EventsCase):
     def test_an_artifact_fault_is_reported_and_writes_nothing(self):
         with mock.patch.object(check_events, 'artifact_for', side_effect=check_events.ArtifactError('artifact_unavailable')):
             self.assertEqual(self.assertResultKept(), check_events.EventsReport(False, 'artifact_unavailable'))
-        with mock.patch.object(check_events, 'artifact_for', side_effect=RuntimeError('boom')):
+        warnings = io.StringIO()
+        with mock.patch.object(check_events, 'artifact_for', side_effect=RuntimeError('/Users/someone/boom')), mock.patch.object(check_events.sys, 'stderr', warnings):
             self.assertEqual(self.assertResultKept(), check_events.EventsReport(False, 'events_failed'))
+        self.assertIn('RuntimeError', warnings.getvalue())
+        self.assertNotIn('Users', warnings.getvalue())
         self.assertFalse((self.data / '_events').exists())
 
-    def test_a_clock_that_fails_is_reported_and_the_result_is_kept(self):
+    def test_a_digest_fault_in_a_real_run_writes_no_event_and_keeps_the_result(self):
+        outside = self.work.parent / 'outside.txt'
+        outside.write_text('outside')
+        (self.work / 'leak').symlink_to(outside)
+        outcome, report = self.record('script-a', consent=self.script_consent())
+        self.assertIn(outcome['status'], ('error', 'failed', 'passed'))
+        self.assertEqual(report, check_events.EventsReport(False, 'artifact_unavailable'))
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_a_clock_that_fails_is_named_and_the_result_is_kept(self):
         def broken():
             raise OverflowError('bad time')
 
-        sources = check_events.Sources(now=lambda: 1.0, monotonic=FixedSources().build().monotonic)
-        sources2 = check_events.Sources(now=broken)
-        outcome, report = self.record('has-readme', sources=sources2)
-        self.assertEqual(outcome['status'], 'passed')
-        self.assertEqual((report.written, report.error), (False, 'events_failed'))
-        outcome, report = self.record('has-readme', sources=check_events.Sources(now=lambda: 1e30, monotonic=sources.monotonic))
-        self.assertEqual((outcome['status'], report.written, report.error), ('passed', False, 'events_failed'))
+        good = FixedSources().build()
+        cases = {
+            'now raises': check_events.Sources(now=broken, monotonic=good.monotonic),
+            'now too big': check_events.Sources(now=lambda: 1e30, monotonic=FixedSources().build().monotonic),
+            'now not a number': check_events.Sources(now=lambda: 'noon', monotonic=FixedSources().build().monotonic),
+            'monotonic raises': check_events.Sources(now=lambda: 1.0, monotonic=broken),
+            'monotonic not a number': check_events.Sources(now=lambda: 1.0, monotonic=lambda: None),
+        }
+        def fails_on(call_number):
+            calls = []
+
+            def now():
+                calls.append(1)
+                if len(calls) == call_number:
+                    raise OverflowError('bad time')
+                return 1_700_000_000.0
+
+            return check_events.Sources(now=now, monotonic=FixedSources().build().monotonic)
+
+        cases['the first reading of now fails'] = fails_on(1)
+        cases['the second reading of now fails'] = fails_on(2)
+        for label, sources in cases.items():
+            with self.subTest(label=label):
+                outcome, report = self.record('has-readme', sources=sources)
+                self.assertEqual(outcome['status'], 'passed')
+                self.assertEqual(report, check_events.EventsReport(False, 'clock_unavailable'))
+        self.assertFalse((self.data / '_events').exists())
 
     def test_a_keyboard_interrupt_is_not_swallowed(self):
         class Stop:
-            def append(self, event):
+            def append(self, event, from_page=False):
                 raise KeyboardInterrupt
 
         with self.assertRaises(KeyboardInterrupt):
