@@ -520,31 +520,47 @@ def default_registry():
     return _DEFAULT
 
 
+@dataclasses.dataclass(frozen=True)
+class RunTrace:
+    """A check result, and whether an adapter was started to produce it.
+
+    `started` is False when the runner refused before any adapter ran: the check has a bad shape, the student reports it
+    by hand, no adapter handles its type, or the workspace is not a folder. Nothing was examined then.
+    """
+    result: dict
+    started: bool
+
+
+def run_traced(check, workspace, limits=None, registry=None, consent=None):
+    """Run one check like `run`, and say whether an adapter was started. Always returns a `RunTrace`. Never raises."""
+    limits = limits or Limits()
+    registry = registry or default_registry()
+    if not isinstance(check, dict):
+        return RunTrace(_failure('invalid_check', 'This check is not in a shape Schola understands.', limits), False)
+    if check.get('kind') == 'self-reported':
+        return RunTrace(result('skipped', {'reason': 'self_reported'}, ['This check is reported by you. Schola does not run it.']), False)
+    runner = check.get('runner')
+    if check.get('kind') != 'automated' or not isinstance(runner, dict) or not isinstance(runner.get('type'), str):
+        return RunTrace(_failure('invalid_check', 'This check has no runner Schola can read.', limits), False)
+    adapter = registry.adapter_for(runner['type'])
+    if adapter is None:
+        return RunTrace(result('skipped', {'reason': 'unknown_runner_type', 'runnerType': runner['type']},
+                               ['Schola cannot run this kind of check. Report the result yourself (self-report).']), False)
+    try:
+        root = check_workspace.workspace_root(workspace)
+    except WorkspaceError as error:
+        return RunTrace(workspace_result(error), False)
+    try:
+        raw = adapter.run(check, root, limits, consent=consent) if getattr(adapter, 'needs_consent', False) else adapter.run(check, root, limits)
+        return RunTrace(normalize(raw, limits), True)
+    except Exception as error:  # noqa: BLE001 - an adapter fault must become an error result, with no detail
+        return RunTrace(result('error', {'reason': 'adapter_failed'}, [f'The check stopped with an unexpected problem ({type(error).__name__}).']), True)
+
+
 def run(check, workspace, limits=None, registry=None, consent=None):
     """Run one check. Always returns a result. Never raises, and never changes the workspace.
 
     `consent` is the student's agreement to a script check, as a dict with the `checkHash` that was agreed to.
     Only an adapter that sets `needs_consent` receives it, and it checks the hash itself.
     """
-    limits = limits or Limits()
-    registry = registry or default_registry()
-    if not isinstance(check, dict):
-        return _failure('invalid_check', 'This check is not in a shape Schola understands.', limits)
-    if check.get('kind') == 'self-reported':
-        return result('skipped', {'reason': 'self_reported'}, ['This check is reported by you. Schola does not run it.'])
-    runner = check.get('runner')
-    if check.get('kind') != 'automated' or not isinstance(runner, dict) or not isinstance(runner.get('type'), str):
-        return _failure('invalid_check', 'This check has no runner Schola can read.', limits)
-    adapter = registry.adapter_for(runner['type'])
-    if adapter is None:
-        return result('skipped', {'reason': 'unknown_runner_type', 'runnerType': runner['type']},
-                      ['Schola cannot run this kind of check. Report the result yourself (self-report).'])
-    try:
-        root = check_workspace.workspace_root(workspace)
-    except WorkspaceError as error:
-        return workspace_result(error)
-    try:
-        raw = adapter.run(check, root, limits, consent=consent) if getattr(adapter, 'needs_consent', False) else adapter.run(check, root, limits)
-        return normalize(raw, limits)
-    except Exception as error:  # noqa: BLE001 - an adapter fault must become an error result, with no detail
-        return result('error', {'reason': 'adapter_failed'}, [f'The check stopped with an unexpected problem ({type(error).__name__}).'])
+    return run_traced(check, workspace, limits, registry, consent).result
