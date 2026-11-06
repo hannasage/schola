@@ -32,6 +32,7 @@ import unicodedata
 import webbrowser
 
 import check_consent
+import check_events
 import check_routes
 import check_runner
 from event_log import EventLog
@@ -422,10 +423,17 @@ def load_module(ctx, module_id, version):
     return version, store.get_module(module_id, version)
 
 
-def load_check(ctx, args):
+def load_module_check(ctx, args):
+    """(version, module document, check) for the module and check named on the command line."""
     store = LessonStore(ctx.data_dir)
     version = resolve_version(store, args.module_id, args.version)
-    return version, check_routes.find_check(store, args.module_id, version, args.check_id)
+    document, check = check_routes.find_module_check(store, args.module_id, version, args.check_id)
+    return version, document, check
+
+
+def load_check(ctx, args):
+    version, _document, check = load_module_check(ctx, args)
+    return version, check
 
 
 def passed_workspace(ctx, path):
@@ -684,6 +692,17 @@ def ask_for_consent(args, ctx, version, check, digest, real, typed):
         raise CliError('consent_declined', 'Consent was not given. Nothing was run.', EXIT_REFUSED)
 
 
+def events_text(written):
+    """The word for the `eventsWritten` value: true, false, or partial."""
+    return 'partial' if written == 'partial' else ('true' if written is True else 'false')
+
+
+def print_events(out, report):
+    say(out, f'Events written: {events_text(report.written)}')
+    if report.error is not None:
+        say(out, f'Events error: {safe_text(report.error)}')
+
+
 def print_result(out, args, version, outcome):
     say(out, f'Check: {safe_text(args.check_id)}')
     say(out, f'Module: {safe_text(args.module_id)} {safe_text(version)}')
@@ -704,7 +723,9 @@ def print_result(out, args, version, outcome):
 
 def cmd_check_run(args, ctx):
     require_data_dir(ctx)
-    version, check = load_check(ctx, args)
+    version, document, check = load_module_check(ctx, args)
+    if args.task is not None and check_events.resolve_task(document, args.task)[1] is not None:
+        raise CliError('not_found', 'That task is not in that module version.')
     workspace = passed_workspace(ctx, args.workspace)
     identity = folder_identity(workspace)
     digest = check_consent.check_hash(check)
@@ -722,14 +743,20 @@ def cmd_check_run(args, ctx):
         registry = check_consent.ConsentRegistry()  # in memory, for this command only
         granted = registry.grant(args.module_id, version, args.check_id, digest, workspace)
         consent = registry.find(args.module_id, version, args.check_id, digest, workspace, granted['consentId'])
-    outcome = check_runner.run(check, workspace, None, None, consent=consent)
+    # Each command line run is its own sitting, so it gets its own session id.
+    outcome, report = check_events.run_and_record(check, workspace, log=EventLog(ctx.data_dir), session_id=check_events.new_session_id(),
+                                                  module=document, task_id=args.task, consent=consent)
     out = ctx.streams.stdout
+    if report.error not in (None, check_events.NOT_RUN):
+        say(ctx.streams.stderr, f'schola: The result was not saved to your event log (code: {safe_text(report.error)}).')
     if ctx.as_json:
         say(out, to_json({'moduleId': args.module_id, 'version': version, 'checkId': args.check_id, 'checkHash': digest, 'tier': 2 if needs else 1,
-                          'result': outcome}))
+                          'result': outcome, **report.fields()}))
     else:
         print_result(out, args, version, outcome)
+        print_events(out, report)
     # A check that ran and reported `failed` is a result: exit 0. A check that could not run (`error`) or that Schola cannot run (`skipped`) is exit 1.
+    # The events never change the exit code.
     return EXIT_OK if dict_of(outcome).get('status') in ('passed', 'failed') else EXIT_FAILED
 
 
@@ -940,6 +967,7 @@ def _add_arguments(key, parser):
     if key == 'check-run':
         parser.add_argument('--workspace', metavar='PATH', required=True, help='Your work folder. The check reads it.')
         parser.add_argument('--consent', metavar='HASH', help='For a script check without a terminal: the full check hash from "check show".')
+        parser.add_argument('--task', metavar='TASK_ID', help='The task this check belongs to. Needed to write events when the module has more than one task.')
     if key == 'events-list':
         parser.add_argument('--limit', type=_number(1, MAX_LIST_LIMIT, 'limit'), default=DEFAULT_LIST_LIMIT,
                             help=f'How many lines to read. The most is {MAX_LIST_LIMIT}. The default is {DEFAULT_LIST_LIMIT}.')

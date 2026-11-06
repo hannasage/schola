@@ -406,6 +406,22 @@ class WriteTests(EventsCase):
         self.assertEqual(attempt['data']['attemptId'], result['data']['attemptId'])
         self.assertLessEqual(len(attempt['data']['attemptId']), 64)
 
+    def test_the_time_is_utc_whatever_the_local_zone_is(self):
+        if not hasattr(time, 'tzset'):
+            self.skipTest('this system cannot change its time zone')
+        previous = os.environ.get('TZ')
+        os.environ['TZ'] = 'Asia/Tokyo'
+        time.tzset()
+        try:
+            self.record('has-readme', sources=FixedSources().build())
+        finally:
+            if previous is None:
+                del os.environ['TZ']
+            else:
+                os.environ['TZ'] = previous
+            time.tzset()
+        self.assertEqual({event['time'] for event in self.events()}, {'2023-11-14T22:13:20Z'})
+
     def test_the_time_of_each_event_is_read_when_it_is_built(self):
         moments = iter([1_700_000_000.0, 1_700_000_005.9])
         sources = check_events.Sources(now=lambda: next(moments), monotonic=FixedSources().build().monotonic)
@@ -801,6 +817,15 @@ class FailureTests(EventsCase):
     def test_an_event_that_fails_the_contract_is_refused_before_any_write(self):
         bad = dict(self.document, id='Bad Module!')
         outcome, report = check_events.run_and_record(self.check('has-readme'), self.work, log=self.log, session_id=SESSION, module=bad)
+        self.assertEqual(report, check_events.EventsReport(False, 'event_invalid'))
+        self.assertFalse((self.data / '_events').exists())
+
+    def test_a_result_that_fails_the_contract_stops_both_events(self):
+        """The attempt is valid and the result is not. Neither one is written."""
+        trace = check_runner.RunTrace({'status': 'maybe', 'evidence': {}, 'log': []}, True)
+        with mock.patch.object(check_runner, 'run_traced', return_value=trace):
+            outcome, report = self.record('has-readme')
+        self.assertEqual(outcome['status'], 'maybe')
         self.assertEqual(report, check_events.EventsReport(False, 'event_invalid'))
         self.assertFalse((self.data / '_events').exists())
 

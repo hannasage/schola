@@ -89,6 +89,7 @@ The byte cap is 4194304 bytes at 80%. The line cap is 40000 lines at 80%. Once t
 At exactly 80% the page is refused. One byte or one line below it, the page is accepted.
 The app writes through `EventLog.append`, which has no reserve, so it can use the rest up to 100%.
 A full log gives the page `log_reserved` and the app `log_full`.
+The check events use this path. When the log is full, the check still returns its result, and the response says `eventsWritten: false` with the code `log_full`.
 
 ## Reading, exporting, and deleting
 
@@ -175,6 +176,7 @@ Any other source, or no source, gets `403 source_forbidden` and nothing is writt
 An event with the source `app` or `agent` comes only through `EventLog.append` inside the server process.
 An `agent_offer` event gets `403 type_forbidden` from the page, even with the source `student`. Only the agent writes offers.
 This keeps a page from forging a check result.
+The app itself writes two events of this kind: `attempt_submitted` and `check_result`, with the source `app`. It writes them when a check runs, through `check_events.py`, and not through these routes. `docs/check-events.md` says what they hold and what happens when the log cannot take them.
 The contract does not tell a real student event from a made-up one. A page can still send a student event of any type that the contract allows. A hint request is one example.
 
 Types for these routes are in `types/events.d.ts`.

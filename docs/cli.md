@@ -115,7 +115,7 @@ With `--workspace`, the tool checks the folder by the rules below.
 It prints the real folder after the links are followed. If you typed another path, it also prints `Typed as:` with your path.
 In JSON the keys are `workspace` (the real folder) and `workspaceTyped` (what you typed).
 
-### `schola check run MODULE_ID CHECK_ID [--version V] --workspace PATH [--consent HASH] [--json]`
+### `schola check run MODULE_ID CHECK_ID [--version V] --workspace PATH [--consent HASH] [--task TASK_ID] [--json]`
 
 Runs one check in a workspace. It prints the status, the evidence, and the log.
 The check reads your workspace. It never changes it.
@@ -172,12 +172,27 @@ The home folder comes from the `HOME` variable.
 The workspace can change while you read the question. So the tool checks the workspace again right before the run. It compares the real path and the folder itself with what you saw. If either differs, the tool refuses with exit code 3 and the code `workspace_changed`. A folder that was replaced at the same path counts as changed. The tool runs the check only in the real folder that it showed you.
 If the folder is gone, the code is `invalid_workspace`.
 
-#### Does `check run` write events?
+#### Events
 
-No. Nothing writes a `check_result` or an `attempt_submitted` event today. The page does not write them. The hub routes do not write them. The check route returns the result and writes no event.
-The contract says only the app writes those events, with the source `app`. The part of the app that writes them does not exist yet.
-So `check run` leaves the log alone. It does not invent events. The owner has to decide who writes a `check_result` event, and when. After that decision, the tool writes the same event as the page.
-A test checks that `check run` writes nothing to the data folder.
+A check run that started writes two events to the event log: `attempt_submitted` and `check_result`. Both have the source `app`.
+`docs/check-events.md` says what they hold, what they never hold, and when a run writes nothing.
+
+- Each run of the tool has its own session id. A second run is a new session and a new attempt.
+- The tool writes to the log in the data folder, the same log that the hub uses.
+- A module with several tasks needs `--task TASK_ID`. The check has no link to a task, so the tool does not guess. Without `--task`, the tool runs the check and writes no event. A module with one task needs no `--task`. A task that the module does not have is refused before the check runs, with exit code 1 and the code `not_found`.
+- A `skipped` result for a self-reported check, a check with no runner, and a check that the runner cannot start writes no event. The code is `not_run`.
+
+The result stays the same. The tool only adds the state of the events:
+
+- In text, the last lines are `Events written: true`, `Events written: false`, or `Events written: partial`. If the value is not `true`, the next line is `Events error: CODE`.
+- In `--json`, the document has the keys `eventsWritten` (`true`, `false`, or `"partial"`) and, if it is not `true`, `eventsError`.
+- If `Events written` is not `true`, the tool also prints one line on the error output. That line has the code. The code `not_run` does not print this line, because it is not a fault.
+
+The codes are `not_run`, `task_required`, `log_full`, `log_damaged`, `log_unavailable`, `artifact_too_large`, `artifact_unavailable`, `event_invalid`, and `events_failed`. A code never holds a path or the text of an error.
+A fault in the log never changes the exit code. The exit code stays the one that the check status gives.
+The value `partial` means the attempt is in the log and the result is not. The tool never removes a line from the log.
+
+Tests in `tests/test_cli.py` (`CheckRunEventsTests`) cover a full log, a damaged log, an unreadable log, a read-only data folder, and a log that takes only the first event.
 
 ### `schola events list [--limit N] [--offset N] [--json]`
 
@@ -305,13 +320,13 @@ The hub and this tool are two processes. Each process allows one script at a tim
 - It has no packaging for PyPI, no installer, and no shell completion.
 - It adds no routes and changes no part of the web page.
 - It changes no engine file except two small ones. `server.py` moves the start-up code into the function `run_server`. `check_routes.py` adds the public names `find_check` and `describe_check`. The old private names stay as aliases. It also compares folders as files, which matters on a file system that ignores case.
-- It writes no event (see "Does `check run` write events?").
+- It writes the check events only for `check run` (see "Events"). It writes no other event.
 - It cannot import modules, move a pin, or write a reflection.
 - It does not support Windows. The event log needs `fcntl`.
 
 ## What stays open
 
-- Nothing writes `check_result` or `attempt_submitted` events yet. The owner has to decide who writes them. This is an open question.
+- A check has no link to a task in the lesson module. A module with several tasks needs `--task`. The owner has to decide whether the module contract gets a task link for each check.
 - Windows is not supported.
 - When the reader closes the pipe early, `schola events list | head` gives exit code 1. The tool cannot tell a closed pipe from a lost one.
 - The tests run macOS only here. Linux continuous integration is the judge. A pass on macOS alone is not proof.

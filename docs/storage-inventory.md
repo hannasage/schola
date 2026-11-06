@@ -201,7 +201,7 @@ This page was written before any change to storage. The event log step adds one 
       <reflection-id>.json
 ```
 
-- `events.jsonl` is the learning event log. It follows `contracts/learning-events.md`. The store appends to it and never edits a line (`event_log.py`). The one way the store removes it is `DELETE /api/events` with `confirm`, which also removes every reflection.
+- `events.jsonl` is the learning event log. It follows `contracts/learning-events.md`. The store appends to it and never edits a line (`event_log.py`). When a check runs, the app appends an `attempt_submitted` event and a `check_result` event (`check_events.py`, `docs/check-events.md`). They hold a digest and a byte count of the work, never a path, a file name, or content. The one way the store removes it is `DELETE /api/events` with `confirm`, which also removes every reflection.
 - `.events.lock` is the lock file. It holds no data and the store never deletes it.
 - `reflections/<reflection-id>.json` holds one reflection. The name is a random lowercase UUID. The file holds `version`, `reflectionId`, `charCount`, and `text`. The store keeps at most 1000 of them and 16 MB in all.
 - The folder name starts with the character `_`, as `_lessons/` does. No curriculum id starts with that character.
