@@ -5,12 +5,21 @@ type HubHintLevel = 'nudge' | 'question' | 'partial-example' | 'full-answer';
 interface HubLog {
   /** False when there is no event log yet. */
   exists: boolean;
+  /** False when some line is damaged, the last line is cut, or the log cannot be read. */
   ok: boolean;
+  /** The code of the log store when the log could not be read at all, else null. Then `ok` is false and the event numbers are empty. */
+  fault: 'log_corrupt' | 'log_unreadable' | 'unsafe_path' | null;
   /** The number of valid events in the log, from every source. */
   events: number;
   /** The number of lines that are not valid events. A cut last line is counted in `truncatedTail` instead. */
   damagedLines: number;
   truncatedTail: boolean;
+  /** Valid events the hub left out because a field it reads was wrong. A valid log has none. */
+  skippedEvents: number;
+  /** Student or app events dated after today in the student's day. They count in nothing. */
+  futureEvents: number;
+  /** Check results for a pinned module whose check id the pinned version does not have. They count in nothing. */
+  unmatchedEvents: number;
 }
 
 interface HubNextTask {
@@ -26,8 +35,11 @@ interface HubFocus {
   /** Written by the lesson creator. Treat it as untrusted text and escape it. */
   title: string;
   tasksTotal: number;
+  /** Tasks whose latest finish is `passed`. */
   tasksDone: number;
-  /** The first task without a finish, or null when every task has one. */
+  /** Tasks whose latest finish is `abandoned` or `skipped`. */
+  tasksSkipped: number;
+  /** The first task without any finish, or null when every task has one. */
   nextTask: HubNextTask | null;
 }
 
@@ -61,7 +73,7 @@ interface HubCheckpoints {
   total: number;
 }
 
-/** The latest results for one skill label. Empty until lesson modules tag their checks with skills. */
+/** The latest results for one skill label. Empty until lesson modules tag their checks with skills. A `self-reported` or `skipped` result is not counted. */
 interface HubSkill {
   skillId: string;
   passed: number;
@@ -72,11 +84,13 @@ interface HubSkill {
 interface HubCheck {
   moduleId: string;
   checkId: string;
-  /** The description of the check from the lesson module, cut to 200 characters. Untrusted text. */
+  /** The description of the check from the lesson module, at most 2000 characters. Untrusted text. */
   title: string;
+  /** Results that are not a pass before the first pass. A `skipped` result is not counted. */
   retriesBeforeFirstPass: number;
-  /** True when the check has not passed yet. */
+  /** True when the check has no pass yet. A `passed` or a `self-reported` result is a pass. */
   open: boolean;
+  /** The highest hint on the task of the check before the first pass, or all hints so far if the check is open. */
   hintLevelReached: HubHintLevel | null;
 }
 
@@ -88,6 +102,7 @@ interface HubLibraryEntry {
   status: 'done' | 'focus' | 'next';
   tasksTotal: number;
   tasksDone: number;
+  tasksSkipped: number;
 }
 
 interface HubResponse {
@@ -99,8 +114,13 @@ interface HubResponse {
   focus: HubFocus | null;
   participation: HubParticipation;
   checkpoints: HubCheckpoints;
+  /** The 100 skills tried most recently, sorted by id. */
   skills: HubSkill[];
-  /** The 20 most recently active checks, newest first. */
+  /** All skills with a result, so a reader can tell when the list is cut. */
+  skillsTotal: number;
+  /** Up to 20 checks: the open ones first, then the most recent. They are listed newest first. */
   checks: HubCheck[];
+  /** All checks with a result, so a reader can tell when the list is cut. */
+  checksTotal: number;
   library: HubLibraryEntry[];
 }

@@ -1,5 +1,6 @@
 """The hub route: GET /api/hub, its guards, its query, and its answer on real stores."""
 import datetime
+import io
 import json
 import os
 from http.client import HTTPConnection
@@ -29,6 +30,14 @@ FIXTURE = ROOT / 'tests' / 'fixtures' / 'contracts' / 'valid' / 'lesson-module-m
 NOW = datetime.datetime(2026, 11, 5, 12, 0, 0, tzinfo=datetime.timezone.utc)
 SESSION = '11111111-1111-4111-8111-111111111111'
 ERROR_KEYS = {'error', 'code', 'retryable', 'field'}
+
+
+def log_block(**changes):
+    """The `log` object of a response, with the defaults of a clean log."""
+    block = {'exists': True, 'ok': True, 'fault': None, 'events': 0, 'damagedLines': 0, 'truncatedTail': False,
+             'skippedEvents': 0, 'futureEvents': 0, 'unmatchedEvents': 0}
+    block.update(changes)
+    return block
 
 
 def make_event(kind, when='2026-11-05T09:00:00Z', module='alpha', task='task-1', source=None, **data):
@@ -170,11 +179,57 @@ class QueryTests(HubCase):
         self.assertEqual(self.get('?')[0], 200)
 
 
+class ZoneQueryTests(HubCase):
+    def test_a_zone_name_sets_the_day_with_the_offset_of_each_event(self):
+        # New York left daylight time on 2026-11-01 at 06:00 UTC. The 1st is a Sunday and the 31st a Saturday.
+        self.append(make_event('task_opened', '2026-11-01T04:30:00Z'))  # 00:30 on the 1st (offset -4)
+        self.append(make_event('task_opened', '2026-11-02T04:30:00Z'))  # 23:30 on the 1st (offset -5)
+
+        def days(query):
+            status, body = self.get(query)
+            self.assertEqual(status, 200)
+            weeks = body['participation']['weeks']
+            return weeks[-2]['days'][5:] + weeks[-1]['days'][:1]  # the 31st, the 1st, the 2nd
+        self.assertEqual(days('?timeZone=America/New_York'), [0, 1, 0])
+        self.assertEqual(days('?tzOffsetMinutes=-300'), [1, 1, 0])  # the winter offset puts the first event on the 31st
+        self.assertEqual(days('?tzOffsetMinutes=0'), [0, 1, 1])
+        self.assertEqual(days(''), [0, 1, 1])
+
+    def test_an_encoded_slash_and_a_plus_sign_are_read(self):
+        self.assertEqual(self.get('?timeZone=America%2FNew_York')[0], 200)
+        self.assertEqual(self.get('?timeZone=Etc%2FGMT%2B5')[0], 200)
+        self.assertEqual(self.get('?timeZone=UTC')[0], 200)
+        self.assertEqual(self.get('?timeZone=Etc/GMT%2B5')[0], 200)
+
+    def test_a_bad_or_unknown_zone_is_a_400_with_the_stable_error_shape(self):
+        bad = ('', 'Nope/Nowhere', 'America', 'America/', '..%2F..%2Fetc%2Fpasswd', '%2Fetc%2Fpasswd', 'America/New%20York', 'America/New_York%0A',
+               'Etc/GMT+5', 'a/b/c/d', 'x' * 100, 'zone.tab', '%E2%80%AEUTC', 'america/new_york_nope')
+        for value in bad:
+            status, body = self.get(f'?timeZone={value}')
+            self.assertEqual(status, 400, value)
+            self.assertEqual((body['code'], body['field'], body['retryable']), ('invalid_request', 'timeZone', False), value)
+            self.assertEqual(set(body), ERROR_KEYS)
+
+    def test_a_zone_and_an_offset_together_are_a_400(self):
+        for query in ('?timeZone=UTC&tzOffsetMinutes=0', '?tzOffsetMinutes=60&timeZone=America/New_York'):
+            status, body = self.get(query)
+            self.assertEqual((status, body['code'], body['field']), (400, 'invalid_request', 'query'), query)
+
+    def test_a_repeated_zone_is_a_400(self):
+        status, body = self.get('?timeZone=UTC&timeZone=UTC')
+        self.assertEqual((status, body['field']), (400, 'timeZone'))
+
+    def test_a_bad_zone_reads_no_store(self):
+        with mock.patch.object(hub_data, 'build_hub') as build:
+            self.get('?timeZone=Nope/Nowhere')
+        build.assert_not_called()
+
+
 class ResponseTests(HubCase):
     def test_an_empty_data_folder_gives_zeros_and_writes_nothing(self):
         status, body = self.get()
         self.assertEqual(status, 200)
-        self.assertEqual(body['log'], {'exists': False, 'ok': True, 'events': 0, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(body['log'], log_block(exists=False, ok=True, events=0, damagedLines=0, truncatedTail=False))
         self.assertEqual((body['focus'], body['library'], body['skills'], body['checks'], body['checkpoints']), (None, [], [], [], {'done': 0, 'total': 0}))
         self.assertEqual(body['generatedAt'], '2026-11-05T12:00:00Z')
         self.assertEqual(self.tree(), [])
@@ -200,7 +255,7 @@ class ResponseTests(HubCase):
         self.append(make_event('task_opened', module='beta', task='task-1', source='agent'))
         status, body = self.get()
         self.assertEqual(status, 200)
-        self.assertEqual(body['log'], {'exists': True, 'ok': True, 'events': 5, 'damagedLines': 0, 'truncatedTail': False})
+        self.assertEqual(body['log'], log_block(exists=True, ok=True, events=5, damagedLines=0, truncatedTail=False))
         self.assertEqual((body['focus']['moduleId'], body['focus']['nextTask']), ('beta', {'taskId': 'task-1', 'text': 'Prompt 1'}))
         self.assertEqual(body['checkpoints'], {'done': 1, 'total': 2})
         self.assertEqual([(m['moduleId'], m['status']) for m in body['library']], [('alpha', 'done'), ('beta', 'focus')])
@@ -231,7 +286,7 @@ class ResponseTests(HubCase):
             handle.write(b'not json\n{"half":')
         status, body = self.get()
         self.assertEqual(status, 200)
-        self.assertEqual(body['log'], {'exists': True, 'ok': False, 'events': 1, 'damagedLines': 1, 'truncatedTail': True})
+        self.assertEqual(body['log'], log_block(exists=True, ok=False, events=1, damagedLines=1, truncatedTail=True))
         self.assertEqual(body['focus']['tasksDone'], 1)
 
     def test_a_log_over_its_limits_is_a_200_with_the_finding(self):
@@ -240,10 +295,12 @@ class ResponseTests(HubCase):
         folder.mkdir(mode=0o700)
         (folder / 'events.jsonl').write_bytes(b'\n' * 100_000)
         os.chmod(folder / 'events.jsonl', 0o600)
-        status, body = self.get()
+        with mock.patch('sys.stderr', new=io.StringIO()) as stderr:
+            status, body = self.get()
         self.assertEqual(status, 200)
-        self.assertFalse(body['log']['ok'])
+        self.assertEqual((body['log']['ok'], body['log']['fault']), (False, 'log_corrupt'))
         self.assertEqual(body['library'][0]['moduleId'], 'alpha')
+        self.assertIn('log_corrupt', stderr.getvalue())
 
     def test_a_busy_log_is_a_retryable_503_and_not_a_finding(self):
         busy = EventLogError('Another program is using the event log. Try again in a moment. Nothing was changed.', 'lock_unavailable', 503, retryable=True)
@@ -304,38 +361,115 @@ class TypeTests(HubCase):
             found[name] = re.findall(r'^\s+(\w+)\??: ([^;]+);', body, re.M)
         return found
 
-    def test_the_typescript_type_matches_a_real_response(self):
-        self.import_module('alpha')
-        self.append(make_event('check_result', module='alpha', task='task-1'))
+    @staticmethod
+    def aliases(text):
+        return {name: body.strip() for name, body in re.findall(r'^type (\w+) = ([^;]+);', text, re.M)}
+
+    @staticmethod
+    def split_top(text, mark):
+        """Split on a mark that is not inside brackets."""
+        parts, depth, start = [], 0, 0
+        for index, char in enumerate(text):
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+            if char == mark and depth == 0:
+                parts.append(text[start:index])
+                start = index + 1
+        parts.append(text[start:])
+        return [part.strip() for part in parts]
+
+    def conforms(self, type_text, value, interfaces, aliases, path='response'):
+        """True when the JSON value has the type the declaration file gives."""
+        text = type_text.strip()
+        options = self.split_top(text, '|')
+        if len(options) > 1:
+            return any(self.conforms(option, value, interfaces, aliases, path) for option in options)
+        if text == 'string':
+            return type(value) is str
+        if text == 'number':
+            return type(value) is int
+        if text == 'boolean':
+            return type(value) is bool
+        if text == 'null':
+            return value is None
+        if re.fullmatch(r"'[^']*'", text):
+            return type(value) is str and value == text[1:-1]
+        if re.fullmatch(r'[0-9]+', text):
+            return type(value) is int and value == int(text)
+        if text.endswith('[]'):
+            return type(value) is list and all(self.conforms(text[:-2], item, interfaces, aliases, path) for item in value)
+        if text.startswith('['):
+            items = self.split_top(text[1:-1], ',')
+            return type(value) is list and len(value) == len(items) and all(self.conforms(t, v, interfaces, aliases, path) for t, v in zip(items, value))
+        if text in aliases:
+            return self.conforms(aliases[text], value, interfaces, aliases, path)
+        if text in interfaces:
+            fields = interfaces[text]
+            if type(value) is not dict or list(value) != [name for name, _ in fields]:
+                return False
+            return all(self.conforms(kind, value[name], interfaces, aliases, f'{path}.{name}') for name, kind in fields)
+        raise AssertionError(f'the declaration file uses a type this test does not know: {text}')
+
+    def declared(self):
+        text = (ROOT / 'types' / 'hub.d.ts').read_text(encoding='utf-8')
+        return self.interfaces(text), self.aliases(text)
+
+    def rich_body(self):
+        self.import_module('alpha', tasks=3, checks=2)
         self.append(make_event('hint_requested', module='alpha', task='task-1', level='question'))
-        body = self.get()[1]
-        declared = self.interfaces((ROOT / 'types' / 'hub.d.ts').read_text(encoding='utf-8'))
+        self.append(make_event('check_result', module='alpha', task='task-1'))
+        self.append(make_event('task_finished', module='alpha', task='task-2', result='abandoned'))
+        self.append(make_event('task_finished', module='alpha', task='task-1'))
+        return self.get()[1]
 
-        def keys(name):
-            return [field for field, _ in declared[name]]
+    def test_the_checker_itself_tells_a_match_from_a_mismatch(self):
+        interfaces, aliases = {'Box': [('size', 'number'), ('tag', "'a' | 'b' | null"), ('rows', 'Box[]')]}, {}
+        self.assertTrue(self.conforms('Box', {'size': 1, 'tag': None, 'rows': [{'size': 2, 'tag': 'a', 'rows': []}]}, interfaces, aliases))
+        for bad in ({'size': True, 'tag': None, 'rows': []}, {'size': 1.5, 'tag': None, 'rows': []}, {'size': 1, 'tag': 'c', 'rows': []},
+                    {'size': 1, 'tag': None}, {'size': 1, 'tag': None, 'rows': [], 'extra': 1}, {'tag': None, 'size': 1, 'rows': []},
+                    {'size': 1, 'tag': None, 'rows': [1]}):
+            self.assertFalse(self.conforms('Box', bad, interfaces, aliases), bad)
 
-        def kind(name, field):
-            return dict(declared[name])[field]
-        self.assertEqual(keys('HubResponse'), list(body))
-        self.assertEqual(keys('HubLog'), list(body['log']))
-        self.assertEqual(keys('HubFocus'), list(body['focus']))
-        self.assertEqual(keys('HubNextTask'), list(body['focus']['nextTask']))
-        self.assertEqual(keys('HubParticipation'), list(body['participation']))
-        self.assertEqual(keys('HubWeek'), list(body['participation']['weeks'][0]))
-        self.assertEqual(keys('HubTotals'), list(body['participation']['totals']))
-        self.assertEqual(keys('HubCheckpoints'), list(body['checkpoints']))
-        self.assertEqual(keys('HubSkill'), ['skillId', 'passed', 'tried', 'window'])
-        self.assertEqual(keys('HubCheck'), list(body['checks'][0]))
-        self.assertEqual(keys('HubLibraryEntry'), list(body['library'][0]))
-        self.assertEqual(kind('HubResponse', 'schemaVersion'), "'1.0'")
-        self.assertEqual(kind('HubResponse', 'focus'), 'HubFocus | null')
-        self.assertEqual(kind('HubFocus', 'nextTask'), 'HubNextTask | null')
-        self.assertEqual(kind('HubWeek', 'days'), '[HubDay, HubDay, HubDay, HubDay, HubDay, HubDay, HubDay]')
-        self.assertEqual(kind('HubCheck', 'hintLevelReached'), 'HubHintLevel | null')
-        self.assertEqual(kind('HubLibraryEntry', 'status'), "'done' | 'focus' | 'next'")
-        self.assertEqual(kind('HubSkill', 'window'), '5')
-        self.assertEqual(kind('HubParticipation', 'windowWeeks'), '8')
+    def test_the_typescript_type_matches_a_real_response_in_keys_and_values(self):
+        body = self.rich_body()
+        interfaces, aliases = self.declared()
+        for name in ('focus', 'skills', 'checks', 'library'):
+            self.assertTrue(body[name], name)  # the sample must reach every part of the type
         self.assertEqual(body['checks'][0]['hintLevelReached'], 'question')
+        self.assertTrue(self.conforms('HubResponse', body, interfaces, aliases))
+
+    def test_the_type_matches_the_quiet_and_the_faulty_responses_too(self):
+        interfaces, aliases = self.declared()
+        quiet = self.get()[1]
+        self.assertIsNone(quiet['focus'])
+        self.assertTrue(self.conforms('HubResponse', quiet, interfaces, aliases))
+        self.import_module('alpha')
+        folder = self.data / '_events'
+        folder.mkdir(mode=0o700)
+        (folder / 'events.jsonl').write_bytes(b'\n' * 100_000)
+        os.chmod(folder / 'events.jsonl', 0o600)
+        with mock.patch('sys.stderr', new=io.StringIO()):
+            faulty = self.get()[1]
+        self.assertEqual(faulty['log']['fault'], 'log_corrupt')
+        self.assertTrue(self.conforms('HubResponse', faulty, interfaces, aliases))
+
+    def test_a_value_the_type_does_not_allow_is_caught(self):
+        interfaces, aliases = self.declared()
+        body = self.rich_body()
+        for change in (lambda b: b['log'].update(fault='made_up'), lambda b: b['focus'].update(tasksDone='1'), lambda b: b['skills'][0].update(window=6),
+                       lambda b: b['library'][0].update(status='late'), lambda b: b.update(schemaVersion='1.1'),
+                       lambda b: b['participation']['weeks'][0]['days'].append(0), lambda b: b['checks'][0].update(open=1),
+                       lambda b: b.pop('checksTotal')):
+            broken = json.loads(json.dumps(body))
+            change(broken)
+            self.assertFalse(self.conforms('HubResponse', broken, interfaces, aliases))
+
+    def test_the_declared_fault_codes_are_the_ones_the_code_can_give(self):
+        interfaces, aliases = self.declared()
+        text = dict(interfaces['HubLog'])['fault']
+        self.assertEqual(sorted(re.findall(r"'([a-z_]+)'", text)), sorted(hub_data.UNREADABLE_CODES))
 
     def test_the_type_names_the_same_ladder_as_the_code(self):
         text = (ROOT / 'types' / 'hub.d.ts').read_text(encoding='utf-8')
