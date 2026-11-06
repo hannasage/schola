@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from local_store import LocalStore, StoreError, finite_json, strict_keys, validate_origin
 import check_routes
 import event_routes
+import hub_routes
 import lesson_routes
 from lesson_store import LessonStore
 
@@ -272,6 +273,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in event_routes.GET_ROUTES or event_routes.is_reflection_path(path):
                 return self.event_response("GET", path, lambda: event_routes.handle_get(self.server, self.events(), path, self.headers, self.query()))
+            if path in hub_routes.GET_ROUTES:
+                return self.lesson_response(lambda: hub_routes.handle_get(self.server, self.lessons(), self.events(), path, self.headers, self.query()),
+                                            "Schola hit an unexpected problem and could not build the hub. Your lessons and your event log were not changed.")
             if path in check_routes.GET_ROUTES:
                 return self.lesson_response(lambda: check_routes.handle_get(self.server, self.lessons(), path, self.headers))
             if path in lesson_routes.GET_ROUTES:
