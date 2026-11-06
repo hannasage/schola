@@ -375,16 +375,28 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, TypeError, RecursionError) as error:
             return self.fail(error)
 
+def announce_ready(address):
+    print(f"Schola is ready at {address}", flush=True)
+
+
+def run_server(port, data_dir, announce=announce_ready):
+    """Start the hub on 127.0.0.1 and serve until Control-C. `announce` gets the address once the server listens.
+
+    `python3 server.py` and the `schola hub` command both call this function.
+    """
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    server.data_dir = data_dir
+    check_routes.session_for(server)  # the check token is made when the server starts
+    announce(f"http://127.0.0.1:{server.server_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
     args = parser.parse_args()
-    server = HTTPServer(("127.0.0.1", args.port), Handler)
-    server.data_dir = args.data_dir
-    check_routes.session_for(server)  # the check token is made when the server starts
-    print(f"Schola is ready at http://127.0.0.1:{args.port}", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        server.server_close()
+    run_server(args.port, args.data_dir)
