@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "project": "schola",
+  "description": "Scripts for the repeatable steps of Schola work. Each entry names its safety class. An agent never runs a human-only entry.",
+  "safety_classes": {
+    "read-only": "Reads files, git, or the network. Changes nothing.",
+    "local-write": "Changes files in the working tree, a clone tree, or the temporary folder.",
+    "remote-write": "Pushes, comments, labels, or opens a pull request.",
+    "human-only": "Publish, deploy, spend, login, or secrets. An agent never runs it."
+  },
+  "exit_codes": {
+    "0": "pass",
+    "1": "a check failed",
+    "2": "wrong use of the script"
+  },
+  "tools": [
+    {
+      "name": "gate_matrix",
+      "path": "tools/gate_matrix.py",
+      "subcommand": null,
+      "description": "Run the Python unit and server suites on each supported Python version, one gate at a time, and print one line per suite. A suite that runs no tests fails.",
+      "safety_class": "local-write",
+      "writes": ["a new schola-gate-* folder in the temporary folder (logs)", "a lock folder in the temporary folder, removed at the end"],
+      "arguments": [
+        {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
+        {"name": "--versions", "type": "string", "required": false, "default": "3.10,3.11,3.12,3.13,3.14", "description": "Comma-separated Python versions."},
+        {"name": "--suites", "type": "string", "required": false, "default": "unit,server", "description": "Comma-separated suites: unit, server."},
+        {"name": "--timeout", "type": "integer", "required": false, "default": 900, "description": "Seconds one suite may run before it is killed."},
+        {"name": "--python", "type": "string", "required": false, "default": null, "description": "VERSION=PATH. Use this interpreter for a version. Repeat for more."},
+        {"name": "--allow-missing", "type": "flag", "required": false, "default": false, "description": "Skip a version with no interpreter instead of failing."},
+        {"name": "--list", "type": "flag", "required": false, "default": false, "description": "Print the plan and run nothing."},
+        {"name": "--json", "type": "flag", "required": false, "default": false, "description": "Print one JSON object."},
+        {"name": "--lock-dir", "type": "path", "required": false, "default": "the temporary folder", "description": "The folder that holds the one-gate-at-a-time lock."}
+      ],
+      "output": {
+        "format": "text, or one JSON object with --json",
+        "shape": {
+          "ok": "boolean",
+          "log_dir": "string, the folder with one log file per suite",
+          "results": "array of {version, suite, status (pass|fail|timeout|missing|wrong_version|skip), tests, skipped, seconds, first_failure, log, python}"
+        }
+      }
+    },
+    {
+      "name": "smoke",
+      "path": "tools/smoke.py",
+      "subcommand": null,
+      "description": "Run the command line and the local server on a new data folder and compare each answer with what it must be, including the refusal of the hub route without a token.",
+      "safety_class": "local-write",
+      "writes": ["a new schola-smoke-* data folder in the temporary folder, removed at the end", "a server on a free loopback port, stopped at the end"],
+      "arguments": [
+        {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
+        {"name": "--seed", "type": "path", "required": false, "default": null, "description": "A folder to copy into the new data folder first."},
+        {"name": "--wait", "type": "integer", "required": false, "default": 20, "description": "Seconds to wait for the server to say it is ready."},
+        {"name": "--json", "type": "flag", "required": false, "default": false, "description": "Print one JSON object."}
+      ],
+      "output": {
+        "format": "text, or one JSON object with --json",
+        "shape": {
+          "ok": "boolean",
+          "steps": "array of {step, ok, detail}"
+        }
+      }
+    },
+    {
+      "name": "pr_body.scaffold",
+      "path": "tools/pr_body.py",
+      "subcommand": "scaffold",
+      "description": "Print a pull request body with the changed files and the gate result filled in. The agent replaces each TODO line.",
+      "safety_class": "read-only",
+      "writes": [],
+      "arguments": [
+        {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
+        {"name": "--base", "type": "string", "required": false, "default": "origin/main", "description": "The base branch to compare with."},
+        {"name": "--gate-json", "type": "path", "required": false, "default": null, "description": "A file with the output of gate_matrix.py --json."}
+      ],
+      "output": {
+        "format": "Markdown on standard output",
+        "shape": {"body": "headings What changed, How it was verified, Limits; the attribution line last"}
+      }
+    },
+    {
+      "name": "pr_body.check",
+      "path": "tools/pr_body.py",
+      "subcommand": "check",
+      "description": "Check a pull request body against the rules that need no judgment: 300 words, required headings, no bare numbers, no tables, no dash characters, no session links, known callouts, the attribution line last.",
+      "safety_class": "read-only",
+      "writes": [],
+      "arguments": [
+        {"name": "file", "type": "path", "required": true, "default": null, "description": "The body file, or - for standard input."},
+        {"name": "--json", "type": "flag", "required": false, "default": false, "description": "Print one JSON object."}
+      ],
+      "output": {
+        "format": "text (problem lines, then OK or FAIL), or one JSON object with --json",
+        "shape": {"ok": "boolean", "words": "integer", "problems": "array of strings"}
+      }
+    }
+  ]
+}
