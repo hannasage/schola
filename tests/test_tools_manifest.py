@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 import subprocess
@@ -9,6 +10,81 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = json.loads((ROOT / "tools" / "manifest.json").read_text(encoding="utf-8"))
 CLASSES = {"read-only", "local-write", "remote-write", "human-only"}
 ARGUMENT_FIELDS = {"name", "type", "required", "default", "description"}
+
+
+# COPY-START exposure check. Copy everything between COPY-START and COPY-END into
+# another repository. It needs only the standard library.
+
+EXPOSURE_VALUES = ("expose", "hidden")
+SAFETY_CLASS_NAMES = ("read-only", "local-write", "remote-write", "human-only")
+MAX_TOOLS = 1000
+
+
+def exposure_problems(manifest) -> list:
+    """Problems with the exposure field. An empty list means the manifest is sound.
+    This function never raises on a malformed manifest. It reports a problem instead."""
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("tools"), list) or not manifest["tools"]:
+        return ["the manifest needs a non-empty tools list"]
+    if len(manifest["tools"]) > MAX_TOOLS:
+        return [f"the manifest has more than {MAX_TOOLS} tools"]
+    problems = []
+    if "exposure_default" in manifest and manifest["exposure_default"] != "hidden":
+        problems.append("exposure_default must be hidden")
+    names = []
+    for index, tool in enumerate(manifest["tools"]):
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"tool #{index}: needs a name")
+        else:
+            names.append(name)
+    for name in sorted({n for n in names if names.count(n) > 1}):
+        problems.append(f"{name}: the name appears more than once")
+    held = manifest.get("held_back", [])
+    held_names = []
+    if not isinstance(held, list):
+        problems.append("held_back must be a list")
+    else:
+        for entry in held:
+            if isinstance(entry, dict) and isinstance(entry.get("tool"), str):
+                held_names.append(entry["tool"])
+                if entry["tool"] not in names:
+                    problems.append(f"held_back names {entry['tool']}, which is not a tool")
+            else:
+                problems.append("held_back entries need a tool name")
+    for tool in manifest["tools"]:
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            continue
+        exposed = tool.get("mcp_exposure") == "expose"
+        if "mcp_exposure" in tool:
+            value = tool["mcp_exposure"]
+            if not (isinstance(value, str) and value in EXPOSURE_VALUES):
+                problems.append(f"{name}: mcp_exposure must be expose or hidden")
+        safety = tool.get("safety_class")
+        if safety not in SAFETY_CLASS_NAMES:
+            problems.append(f"{name}: safety_class must be one of {', '.join(SAFETY_CLASS_NAMES)}")
+        if safety == "human-only" and exposed:
+            problems.append(f"{name}: a human-only tool must be hidden")
+        if "destructive" in tool and not isinstance(tool["destructive"], bool):
+            problems.append(f"{name}: destructive must be true or false")
+        elif tool.get("destructive") is True and exposed:
+            problems.append(f"{name}: a destructive tool must be hidden")
+        elif exposed and tool.get("destructive") is not False:
+            problems.append(f"{name}: an exposed tool must say destructive: false")
+        if name in held_names and exposed:
+            problems.append(f"{name}: a held-back tool must be hidden")
+    return problems
+
+
+def exposed_tools(manifest) -> list:
+    """The one loader. It lists a tool only when the whole manifest passes exposure_problems
+    and the tool's mcp_exposure is exactly "expose". Anything else lists nothing."""
+    if exposure_problems(manifest):
+        return []
+    return [t for t in manifest["tools"] if t.get("mcp_exposure") == "expose"]
+
+
+# COPY-END
 
 
 def help_text(tool):
@@ -66,6 +142,52 @@ class ToolsManifestTest(unittest.TestCase):
             options = set(re.findall(r"(?m)^\s+(--[a-z][a-z-]*)", help_text(tool))) - {"--help"}
             listed = {a["name"] for a in tool["arguments"]}
             self.assertEqual(options - listed, set(), f"{tool['name']} has options the manifest does not list")
+
+
+    def test_the_exposure_fields_pass_the_shared_check(self):
+        self.assertEqual(exposure_problems(MANIFEST), [])
+
+    def test_only_the_read_only_tools_are_exposed(self):
+        exposed = {tool["name"] for tool in exposed_tools(MANIFEST)}
+        self.assertEqual(exposed, {"pr_body.scaffold", "pr_body.check"})
+        for tool in MANIFEST["tools"]:
+            expected = "expose" if tool["safety_class"] == "read-only" else "hidden"
+            self.assertEqual(tool["mcp_exposure"], expected, tool["name"])
+            self.assertIs(tool["destructive"], False, tool["name"])
+
+    def test_the_shared_check_rejects_an_exposed_tool_that_is_not_safe(self):
+        cases = {
+            "a human-only tool": lambda t: t.update(safety_class="human-only", mcp_exposure="expose", destructive=False),
+            "a destructive tool": lambda t: t.update(mcp_exposure="expose", destructive=True),
+            "an exposed tool with no destructive field": lambda t: (t.pop("destructive"), t.update(mcp_exposure="expose")),
+            "an unknown exposure value": lambda t: t.update(mcp_exposure="yes"),
+        }
+        for label, mutate in cases.items():
+            broken = copy.deepcopy(MANIFEST)
+            mutate(broken["tools"][2])
+            self.assertNotEqual(exposure_problems(broken), [], label)
+            self.assertEqual(exposed_tools(broken), [], f"{label}: the loader must list nothing")
+
+    def test_the_shared_check_rejects_a_default_other_than_hidden_and_a_held_back_exposed_tool(self):
+        broken = copy.deepcopy(MANIFEST)
+        broken["exposure_default"] = "expose"
+        self.assertNotEqual(exposure_problems(broken), [])
+        broken = copy.deepcopy(MANIFEST)
+        broken["held_back"] = [{"tool": "pr_body.check"}]
+        self.assertNotEqual(exposure_problems(broken), [])
+        self.assertEqual(exposed_tools(broken), [])
+
+    def test_a_missing_exposure_field_means_hidden(self):
+        trimmed = copy.deepcopy(MANIFEST)
+        for tool in trimmed["tools"]:
+            tool.pop("mcp_exposure")
+        self.assertEqual(exposure_problems(trimmed), [])
+        self.assertEqual(exposed_tools(trimmed), [])
+
+    def test_the_shared_check_does_not_raise_on_a_malformed_manifest(self):
+        for bad in (None, [], {}, {"tools": []}, {"tools": [None]}, {"tools": "x"}):
+            self.assertNotEqual(exposure_problems(bad), [], repr(bad))
+            self.assertEqual(exposed_tools(bad), [], repr(bad))
 
 
 if __name__ == "__main__":

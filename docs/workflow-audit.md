@@ -54,6 +54,8 @@ Three scripts in `tools/`, each with tests in `tests/`:
 `tools/manifest.json` lists them with their arguments, output shape, and safety class.
 If the manifest and the scripts disagree, `tests/test_tools_manifest.py` fails.
 
+Each tool carries `mcp_exposure`: `expose` or `hidden`. A missing field means `hidden`. A later MCP server lists only the `expose` tools. The two `pr_body` tools are read-only and exposed. `gate_matrix` and `smoke` write files, so they are hidden. A human-only or destructive tool must be hidden, and `tests/test_tools_manifest.py` holds the shared check for this rule.
+
 No script here pushes, comments, or opens a pull request, and none is `human-only`.
 
 ## What the scripts do not do

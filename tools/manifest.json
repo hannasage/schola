@@ -8,6 +8,11 @@
     "remote-write": "Pushes, comments, labels, or opens a pull request.",
     "human-only": "Publish, deploy, spend, login, or secrets. An agent never runs it."
   },
+  "exposure_default": "hidden",
+  "mcp_exposure": {
+    "expose": "The MCP server lists the tool.",
+    "hidden": "The MCP server never lists the tool. This is the default when the field is missing, so a new tool stays out of the server until someone marks it. A human-only tool must be hidden."
+  },
   "exit_codes": {
     "0": "pass",
     "1": "a check failed",
@@ -21,6 +26,8 @@
       "subcommand": null,
       "description": "Run the Python unit and server suites on each supported Python version, one gate at a time, and print one line per suite. A suite that runs no tests, or skips every test, fails.",
       "safety_class": "local-write",
+      "destructive": false,
+      "mcp_exposure": "hidden",
       "writes": ["a new schola-gate-* folder in the temporary folder (logs)", "a lock file in the temporary folder (a kernel lock; the file stays and holds the last owner's pid)"],
       "arguments": [
         {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
@@ -48,6 +55,8 @@
       "subcommand": null,
       "description": "Run the command line and the local server on a new data folder and compare each answer with what it must be, including the refusal of the hub route without a token.",
       "safety_class": "local-write",
+      "destructive": false,
+      "mcp_exposure": "hidden",
       "writes": ["a new schola-smoke-* data folder in the temporary folder, removed at the end", "a server on a free loopback port, stopped at the end"],
       "arguments": [
         {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
@@ -69,6 +78,8 @@
       "subcommand": "scaffold",
       "description": "Print a pull request body with the changed files and the gate result filled in. The agent replaces each TODO line.",
       "safety_class": "read-only",
+      "destructive": false,
+      "mcp_exposure": "expose",
       "writes": [],
       "arguments": [
         {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
@@ -86,6 +97,8 @@
       "subcommand": "check",
       "description": "Check a pull request body against the rules that need no judgment: 300 words, required headings, no bare numbers, no tables, no dash characters, no session links, no TODO placeholder, known callouts, the attribution line last.",
       "safety_class": "read-only",
+      "destructive": false,
+      "mcp_exposure": "expose",
       "writes": [],
       "arguments": [
         {"name": "file", "type": "path", "required": true, "default": null, "description": "The body file, or - for standard input."},
