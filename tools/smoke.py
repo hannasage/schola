@@ -10,7 +10,7 @@ same short list of calls and the same expected answers. This script runs
 that list. An agent reads the failures and decides what they mean.
 
 Exit code: 0 every step passes, 1 a step failed, 2 wrong use of the script,
-130 interrupted.
+130 interrupted (SIGINT, SIGTERM, or SIGHUP unless it is ignored).
 """
 
 import argparse
@@ -101,12 +101,13 @@ def start_server(root, data_dir, wait):
         deadline = time.monotonic() + wait
         text = ""
         while time.monotonic() < deadline:
+            exited = proc.poll() is not None  # ask first, then read: the last lines are not lost
             out.seek(0)
             text = out.read().decode("utf-8", "replace")
             match = READY.search(text)
             if match:
                 return proc, f"http://127.0.0.1:{match.group(1)}"
-            if proc.poll() is not None:
+            if exited:
                 break
             time.sleep(0.1)
     except BaseException:
@@ -121,17 +122,18 @@ def start_server(root, data_dir, wait):
 
 
 def stop_server(proc):
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        proc.wait(timeout=TERM_GRACE)
-    except subprocess.TimeoutExpired:
-        pass
+    if proc.poll() is None:  # signal the group by name only while its leader is alive
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
     try:
         os.killpg(proc.pid, signal.SIGKILL)  # also reaches children that outlive the leader
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     proc.wait(timeout=10)
 
@@ -207,7 +209,8 @@ def main(argv=None, out=None):
     def on_term(_signum, _frame):
         raise KeyboardInterrupt  # runs the cleanup in run_smoke
 
-    previous = {sig: signal.signal(sig, on_term) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    hooked = [sig for sig in (signal.SIGTERM, signal.SIGHUP) if signal.getsignal(sig) != signal.SIG_IGN]
+    previous = {sig: signal.signal(sig, on_term) for sig in hooked}
     try:
         steps = run_smoke(root, seed, args.wait, say)
     except KeyboardInterrupt:

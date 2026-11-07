@@ -8,9 +8,10 @@ Why a script: the same suites run on the same versions in the same order
 before every pull request. The result is pass or fail. An agent reads the
 summary and decides what to do about a failure.
 
-Exit code: 0 all suites pass, 1 a suite failed, ran no tests, timed out, or
-has no matching interpreter, 2 wrong use of the script or another gate is
-running, 130 interrupted.
+Exit code: 0 all suites pass, 1 a suite failed, ran no tests, skipped every
+test, timed out, or has no matching interpreter, 2 wrong use of the script,
+a refused lock file, or another gate running, 130 interrupted (SIGINT,
+SIGTERM, or SIGHUP unless it is ignored).
 """
 
 import argparse
@@ -36,7 +37,9 @@ SUITES = {
 DEFAULT_SUITES = ["unit", "server"]
 LOCK_NAME = "schola-gate-matrix.lock"  # a file, not a folder
 RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s", re.M)
+RESULT_LINE = re.compile(r"^(?:OK|FAILED) \((.*)\)\s*$", re.M)
 SKIPPED = re.compile(r"skipped=(\d+)")
+EXPECTED_FAILURES = re.compile(r"expected failures=(\d+)")
 FIRST_FAILURE = re.compile(r"^(?:FAIL|ERROR): .+$", re.M)
 
 
@@ -120,7 +123,7 @@ class Lock:
 def kill_group(proc):
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     proc.wait()
 
@@ -155,13 +158,16 @@ def run_suite(python, suite, root, timeout, log_path):
         else:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)  # a test may leave a child behind
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
     seconds = round(time.monotonic() - started, 1)
     text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     ran = RAN.findall(text)
     tests = int(ran[-1][0]) if ran else None
-    skipped = SKIPPED.search(text)
+    results = RESULT_LINE.findall(text)
+    detail = results[-1] if results else ""  # only the final result line counts, not a test's own output
+    skipped = SKIPPED.search(detail)
+    expected = EXPECTED_FAILURES.search(detail)
     if status != "timeout" and code != 0:
         status = "fail"
     first = None
@@ -169,9 +175,10 @@ def run_suite(python, suite, root, timeout, log_path):
         status = "fail"
         first = "no tests ran"
     skipped_count = int(skipped.group(1)) if skipped else 0
-    if status == "pass" and tests and skipped_count >= tests:
+    expected_count = int(expected.group(1)) if expected else 0
+    if status == "pass" and tests and skipped_count + expected_count >= tests:
         status = "fail"
-        first = "all tests skipped"
+        first = "all tests skipped or expected to fail"
     if status == "fail" and first is None:
         match = FIRST_FAILURE.search(text)
         if match:
@@ -263,7 +270,9 @@ def main(argv=None, out=None):
     def on_term(_signum, _frame):
         raise KeyboardInterrupt
 
-    previous = {sig: signal.signal(sig, on_term) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    # Leave SIGHUP alone when it is ignored on purpose (nohup): closing a terminal must not stop the gate.
+    hooked = [sig for sig in (signal.SIGTERM, signal.SIGHUP) if signal.getsignal(sig) != signal.SIG_IGN]
+    previous = {sig: signal.signal(sig, on_term) for sig in hooked}
     try:
         log_dir = tempfile.mkdtemp(prefix="schola-gate-")
         results = run_matrix(root, versions, suites, args.timeout, overrides, args.allow_missing, log_dir, say)

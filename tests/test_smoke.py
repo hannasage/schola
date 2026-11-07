@@ -217,6 +217,33 @@ class SmokeTest(unittest.TestCase):
             os.kill(server_pid, 9)
             self.fail("the server kept running after a signal")
 
+    def test_an_ignored_hangup_stays_ignored(self):
+        pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
+        self.addCleanup(shutil.rmtree, pid_file.parent, True)
+        root = self.fixture(server_source="import os, time\nopen(os.environ['SMOKE_PID_FILE'], 'w').write(str(os.getpid()))\ntime.sleep(120)\n")
+        env = dict(os.environ, SMOKE_PID_FILE=str(pid_file))
+        proc = subprocess.Popen([sys.executable, str(ROOT / "tools" / "smoke.py"), "--root", str(root), "--wait", "60"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text():
+                break
+            time.sleep(0.1)
+        server_pid = int(pid_file.read_text())
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        self.assertIsNone(proc.poll(), "an ignored SIGHUP must not stop smoke")
+        proc.send_signal(signal.SIGTERM)
+        _out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertTrue(self.pid_gone(server_pid))
+
+    def test_the_last_lines_of_a_server_that_exits_are_kept(self):
+        root = self.fixture(server_source="import sys, time\ntime.sleep(0.3)\nprint('boom at the end')\nsys.exit(4)\n")
+        code, data = self.run_main("--root", str(root))
+        self.assertEqual(code, 1)
+        self.assertIn("boom at the end", data["steps"][-1]["detail"])
+
     def test_a_failed_step_still_stops_the_server(self):
         pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
         self.addCleanup(shutil.rmtree, pid_file.parent, True)

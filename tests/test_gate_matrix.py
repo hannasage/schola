@@ -38,6 +38,11 @@ def make_project(tests_source):
 
 class GateMatrixTest(unittest.TestCase):
     def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate-test-")  # logs, fixtures, and locks all live here
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.object(tempfile, "tempdir", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.lock_dir = Path(tempfile.mkdtemp(prefix="gate-lock-"))
         self.addCleanup(shutil.rmtree, self.lock_dir, True)
 
@@ -241,7 +246,7 @@ class GateMatrixTest(unittest.TestCase):
         stub = self.stub_python("Ran 3 tests in 0.001s\n\nOK (skipped=3)")
         code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
         self.assertEqual(code, 1)
-        self.assertEqual(data["results"][0]["first_failure"], "all tests skipped")
+        self.assertEqual(data["results"][0]["first_failure"], "all tests skipped or expected to fail")
 
     def test_a_child_a_test_leaves_behind_is_killed_when_the_suite_ends(self):
         pid_file = self.lock_dir / "child.pid"
@@ -264,10 +269,49 @@ class GateMatrixTest(unittest.TestCase):
             os.kill(child, 9)
             self.fail("a child of the suite kept running")
 
-    def test_a_fifo_in_place_of_the_lock_file_is_refused_not_hung(self):
+    def test_a_fifo_in_place_of_the_lock_file_is_refused_as_not_regular(self):
         os.mkfifo(self.lock_dir / gate_matrix.LOCK_NAME)
+        with self.assertRaises(gate_matrix.UsageError) as caught:
+            gate_matrix.Lock(self.lock_dir).acquire()
+        self.assertIn("not a regular file of this user", str(caught.exception))
+
+    def test_a_lock_file_owned_by_another_user_is_refused(self):
+        from types import SimpleNamespace
+        fake = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=os.geteuid() + 1)
+        with mock.patch.object(gate_matrix.os, "fstat", return_value=fake):
+            with self.assertRaises(gate_matrix.UsageError) as caught:
+                gate_matrix.Lock(self.lock_dir).acquire()
+        self.assertIn("not a regular file of this user", str(caught.exception))
+
+    def test_a_refused_acquire_closes_its_descriptor(self):
+        first = gate_matrix.Lock(self.lock_dir)
+        first.acquire()
+        self.addCleanup(first.release)
+        before = len(os.listdir("/dev/fd"))
         with self.assertRaises(gate_matrix.UsageError):
             gate_matrix.Lock(self.lock_dir).acquire()
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
+
+    def test_main_restores_the_signal_handlers_it_replaced(self):
+        root = self.project(PASSING)
+        before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+        self.run_main(root, "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
+        self.assertEqual((signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)), before)
+
+    def test_skip_counts_come_from_the_result_line_only(self):
+        root = self.project(PASSING)
+        cases = {
+            "Ran 3 tests in 0.1s\n\nOK (skipped=3)": "fail",
+            "a test said skipped=0 here\nRan 3 tests in 0.1s\n\nOK (skipped=3)": "fail",
+            "Ran 3 tests in 0.1s\n\nOK (skipped=1, expected failures=2)": "fail",
+            "a test said skipped=3 here\nRan 3 tests in 0.1s\n\nOK": "pass",
+            "Ran 3 tests in 0.1s\n\nOK (skipped=1)": "pass",
+        }
+        for output, want in cases.items():
+            with self.subTest(output=output):
+                stub = self.stub_python(output)
+                _code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+                self.assertEqual(data["results"][0]["status"], want)
 
     def test_a_longer_old_pid_in_the_lock_file_is_cut_off(self):
         (self.lock_dir / gate_matrix.LOCK_NAME).write_text("9" * 20, encoding="utf-8")
@@ -301,7 +345,7 @@ class GateMatrixTest(unittest.TestCase):
         root = self.project(SLOW_WITH_PID)
         pid_file = self.lock_dir / "suite.pid"
         pid_file.unlink(missing_ok=True)  # a second case must wait for its own suite
-        env = dict(os.environ, GATE_PID_FILE=str(pid_file))
+        env = dict(os.environ, GATE_PID_FILE=str(pid_file), TMPDIR=self.tmp)
         proc = subprocess.Popen([sys.executable, str(ROOT / "tools" / "gate_matrix.py"), "--root", str(root),
                                  "--lock-dir", str(self.lock_dir), "--versions", VERSION, "--suites", "unit",
                                  "--python", f"{VERSION}={sys.executable}"],
@@ -323,6 +367,31 @@ class GateMatrixTest(unittest.TestCase):
         else:
             os.kill(suite_pid, 9)
             self.fail("the suite process kept running")
+
+    def test_an_ignored_hangup_stays_ignored(self):
+        root = self.project(SLOW_WITH_PID)
+        pid_file = self.lock_dir / "hup.pid"
+        env = dict(os.environ, GATE_PID_FILE=str(pid_file), TMPDIR=self.tmp)
+        proc = subprocess.Popen([sys.executable, str(ROOT / "tools" / "gate_matrix.py"), "--root", str(root),
+                                 "--lock-dir", str(self.lock_dir), "--versions", VERSION, "--suites", "unit",
+                                 "--python", f"{VERSION}={sys.executable}"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text():
+                break
+            time.sleep(0.1)
+        suite_pid = int(pid_file.read_text())
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        self.assertIsNone(proc.poll(), "an ignored SIGHUP must not stop the gate")
+        proc.send_signal(signal.SIGTERM)
+        _out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 130, err)
+        try:
+            os.kill(suite_pid, 9)
+        except ProcessLookupError:
+            pass
 
     def test_find_python_ignores_a_file_that_cannot_run(self):
         not_executable = self.lock_dir / "python3.10"
