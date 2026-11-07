@@ -190,5 +190,35 @@ class ToolsManifestTest(unittest.TestCase):
             self.assertEqual(exposed_tools(bad), [], repr(bad))
 
 
+    def test_schola_exposes_only_read_only_tools_that_write_nothing(self):
+        # Schola's own rule, stricter than the shared check: the shared block alone would let a
+        # tool that writes files be exposed by one field. The block is a copy and stays as it is.
+        for tool in exposed_tools(MANIFEST):
+            self.assertEqual(tool["safety_class"], "read-only", tool["name"])
+            self.assertEqual(tool["writes"], [], tool["name"])
+
+    def test_every_rule_of_the_shared_check_fails_on_its_own_broken_manifest(self):
+        def broken(mutate):
+            manifest = copy.deepcopy(MANIFEST)
+            mutate(manifest)
+            return manifest
+
+        cases = {
+            "a duplicate name": lambda m: m["tools"][1].update(name=m["tools"][0]["name"]),
+            "an unknown held_back tool": lambda m: m.update(held_back=[{"tool": "no-such-tool"}]),
+            "a held_back list that is not a list": lambda m: m.update(held_back="x"),
+            "a bad safety class": lambda m: m["tools"][0].update(safety_class="read_only"),
+            "a destructive field that is not a boolean": lambda m: m["tools"][0].update(destructive="no"),
+            "a tool with no name": lambda m: m["tools"][0].pop("name"),
+            "too many tools": lambda m: m.update(tools=[copy.deepcopy(m["tools"][0]) | {"name": f"t{i}"}
+                                                        for i in range(MAX_TOOLS + 1)]),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label):
+                manifest = broken(mutate)
+                self.assertNotEqual(exposure_problems(manifest), [])
+                self.assertEqual(exposed_tools(manifest), [])
+
+
 if __name__ == "__main__":
     unittest.main()

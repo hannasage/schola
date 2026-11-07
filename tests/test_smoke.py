@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -239,10 +240,40 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(self.pid_gone(server_pid))
 
     def test_the_last_lines_of_a_server_that_exits_are_kept(self):
-        root = self.fixture(server_source="import sys, time\ntime.sleep(0.3)\nprint('boom at the end')\nsys.exit(4)\n")
-        code, data = self.run_main("--root", str(root))
-        self.assertEqual(code, 1)
-        self.assertIn("boom at the end", data["steps"][-1]["detail"])
+        # The server writes its last line and exits in the gap between two reads. A fake process makes that
+        # gap certain: the line appears when poll() is first called. Poll first, then read, keeps the line.
+        class Fake:
+            pid = 999999999
+
+            def __init__(self, command, stdout=None, **_kwargs):
+                self.out = stdout
+                self.written = False
+
+            def poll(self):
+                if not self.written:
+                    self.written = True
+                    self.out.write(b"boom at the end\n")
+                    self.out.flush()
+                return 4
+
+            def wait(self, timeout=None):
+                return 4
+
+        with mock.patch.object(smoke.subprocess, "Popen", Fake), mock.patch.object(smoke, "signal_group"):
+            with self.assertRaises(RuntimeError) as caught:
+                smoke.start_server(ROOT, Path(tempfile.gettempdir()), 5)
+        self.assertIn("boom at the end", str(caught.exception))
+
+    def test_a_refused_group_signal_is_reported(self):
+        proc = mock.Mock(pid=424242)
+        err = io.StringIO()
+        with mock.patch.object(smoke.os, "killpg", side_effect=PermissionError("denied")), \
+                mock.patch.object(smoke.sys, "stderr", err):
+            smoke.signal_group(proc, signal.SIGKILL)
+        self.assertIn("could not signal the process group of pid 424242", err.getvalue())
+        with mock.patch.object(smoke.os, "killpg", side_effect=ProcessLookupError), \
+                mock.patch.object(smoke.sys, "stderr", err):
+            smoke.signal_group(proc, signal.SIGKILL)  # a group that is gone is silent
 
     def test_a_failed_step_still_stops_the_server(self):
         pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"

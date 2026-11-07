@@ -37,7 +37,9 @@ SUITES = {
 DEFAULT_SUITES = ["unit", "server"]
 LOCK_NAME = "schola-gate-matrix.lock"  # a file, not a folder
 RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s", re.M)
-RESULT_LINE = re.compile(r"^(?:OK|FAILED) \((.*)\)\s*$", re.M)
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# The result line is the one right after "Ran N tests in Ns". A line a test prints cannot match.
+RESULT_LINE = re.compile(r"^Ran \d+ tests? in [0-9.]+s[ \t]*\n[ \t]*\n(?:OK|FAILED)(?: \((.*?)\))?[ \t]*$", re.M)
 SKIPPED = re.compile(r"skipped=(\d+)")
 EXPECTED_FAILURES = re.compile(r"expected failures=(\d+)")
 FIRST_FAILURE = re.compile(r"^(?:FAIL|ERROR): .+$", re.M)
@@ -120,18 +122,25 @@ class Lock:
             self.fd = None
 
 
-def kill_group(proc):
+def signal_group(proc):
+    """Kill the process group of proc. A group that is already gone is fine. A refusal is reported."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass
+    except PermissionError as error:
+        print(f"gate_matrix: could not stop the process group of pid {proc.pid}: {error}", file=sys.stderr)
+
+
+def kill_group(proc):
+    signal_group(proc)
     proc.wait()
 
 
 def interpreter_version(python):
     """Return the 'major.minor' the interpreter reports, or None."""
     try:
-        done = subprocess.run([python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+        done = subprocess.run([python, "-I", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
                               capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -141,7 +150,9 @@ def interpreter_version(python):
 def run_suite(python, suite, root, timeout, log_path):
     """Run one suite. Return a result dict. The full output goes to log_path."""
     command = [python, *SUITES[suite]]
-    env = dict(os.environ, LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1")
+    # Python 3.14 colours the result line when FORCE_COLOR is set. The parser needs plain text.
+    env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "CLICOLOR_FORCE")}
+    env.update(LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", PYTHON_COLORS="0")
     started = time.monotonic()
     status = "pass"
     with open(log_path, "wb") as log:
@@ -156,16 +167,13 @@ def run_suite(python, suite, root, timeout, log_path):
             kill_group(proc)  # the suite has its own session: a signal to this script never reaches it
             raise
         else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)  # a test may leave a child behind
-            except (ProcessLookupError, PermissionError):
-                pass
+            signal_group(proc)  # a test may leave a child behind
     seconds = round(time.monotonic() - started, 1)
-    text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    text = ANSI.sub("", Path(log_path).read_text(encoding="utf-8", errors="replace"))
     ran = RAN.findall(text)
     tests = int(ran[-1][0]) if ran else None
     results = RESULT_LINE.findall(text)
-    detail = results[-1] if results else ""  # only the final result line counts, not a test's own output
+    detail = results[-1] if results else ""  # only the line after the last "Ran N tests" counts
     skipped = SKIPPED.search(detail)
     expected = EXPECTED_FAILURES.search(detail)
     if status != "timeout" and code != 0:
@@ -174,6 +182,9 @@ def run_suite(python, suite, root, timeout, log_path):
     if status != "timeout" and (("NO TESTS RAN" in text) or (code == 0 and not tests)):
         status = "fail"
         first = "no tests ran"
+    elif status != "timeout" and code == 0 and tests and not results:
+        status = "fail"
+        first = "result line not found"
     skipped_count = int(skipped.group(1)) if skipped else 0
     expected_count = int(expected.group(1)) if expected else 0
     if status == "pass" and tests and skipped_count + expected_count >= tests:

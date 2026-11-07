@@ -230,7 +230,7 @@ class GateMatrixTest(unittest.TestCase):
     def stub_python(self, output, code=0):
         """An interpreter that reports VERSION and prints fixed test output. It stands in for Python 3.10 or 3.11."""
         path = self.lock_dir / "stub-python"
-        path.write_text(f"#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo {VERSION}; exit 0; fi\ncat <<'EOF'\n{output}\nEOF\nexit {code}\n", encoding="utf-8")
+        path.write_text(f"#!/bin/sh\nif [ \"$1\" = \"-c\" ] || [ \"$2\" = \"-c\" ]; then echo {VERSION}; exit 0; fi\ncat <<'EOF'\n{output}\nEOF\nexit {code}\n", encoding="utf-8")
         path.chmod(0o755)
         return str(path)
 
@@ -312,6 +312,55 @@ class GateMatrixTest(unittest.TestCase):
                 stub = self.stub_python(output)
                 _code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
                 self.assertEqual(data["results"][0]["status"], want)
+
+    def test_a_coloured_result_line_is_still_read(self):
+        # Python 3.14 prints ESC[32mOKESC[0m (ESC[33mskipped=3ESC[0m) when colour is forced.
+        root = self.project(PASSING)
+        esc = "\x1b"
+        cases = {
+            f"Ran 3 tests in 0.1s\n\n{esc}[32mOK{esc}[0m ({esc}[33mskipped=3{esc}[0m)": "fail",
+            f"Ran 3 tests in 0.1s\n\n{esc}[32mOK{esc}[0m": "pass",
+        }
+        for output, want in cases.items():
+            with self.subTest(want=want):
+                stub = self.stub_python(output)
+                _code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+                self.assertEqual(data["results"][0]["status"], want)
+
+    def test_a_line_a_test_prints_cannot_stand_in_for_the_result_line(self):
+        root = self.project(PASSING)
+        stub = self.stub_python("OK (skipped=3)\nRan 3 tests in 0.1s\n\nOK")
+        _code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+        self.assertEqual(data["results"][0]["status"], "pass")
+        self.assertEqual(data["results"][0]["skipped"], 0)
+
+    def test_a_zero_exit_with_no_result_line_fails(self):
+        root = self.project(PASSING)
+        stub = self.stub_python("Ran 3 tests in 0.1s\n\nsomething else")
+        code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+        self.assertEqual(code, 1)
+        self.assertEqual(data["results"][0]["first_failure"], "result line not found")
+
+    def test_the_suite_runs_without_forced_colour(self):
+        source = ("import os, unittest\n\nclass T(unittest.TestCase):\n    def test_env(self):\n"
+                  "        self.assertNotIn('FORCE_COLOR', os.environ)\n"
+                  "        self.assertEqual(os.environ.get('NO_COLOR'), '1')\n"
+                  "        self.assertEqual(os.environ.get('PYTHON_COLORS'), '0')\n")
+        root = self.project(source)
+        with mock.patch.dict(os.environ, {"FORCE_COLOR": "1"}):
+            code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
+        self.assertEqual(code, 0, data)
+
+    def test_a_refused_group_kill_is_reported(self):
+        proc = mock.Mock(pid=424242)
+        err = io.StringIO()
+        with mock.patch.object(gate_matrix.os, "killpg", side_effect=PermissionError("denied")), \
+                mock.patch.object(gate_matrix.sys, "stderr", err):
+            gate_matrix.signal_group(proc)
+        self.assertIn("could not stop the process group of pid 424242", err.getvalue())
+        with mock.patch.object(gate_matrix.os, "killpg", side_effect=ProcessLookupError), \
+                mock.patch.object(gate_matrix.sys, "stderr", err):
+            gate_matrix.signal_group(proc)  # a group that is gone is silent
 
     def test_a_longer_old_pid_in_the_lock_file_is_cut_off(self):
         (self.lock_dir / gate_matrix.LOCK_NAME).write_text("9" * 20, encoding="utf-8")

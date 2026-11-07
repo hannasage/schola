@@ -121,20 +121,24 @@ def start_server(root, data_dir, wait):
     raise RuntimeError("server not ready: " + (lines[-1] if lines else "no output"))
 
 
+def signal_group(proc, number):
+    """Send a signal to the process group of proc. A group that is gone is fine. A refusal is reported."""
+    try:
+        os.killpg(proc.pid, number)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        print(f"smoke: could not signal the process group of pid {proc.pid}: {error}", file=sys.stderr)
+
+
 def stop_server(proc):
     if proc.poll() is None:  # signal the group by name only while its leader is alive
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        signal_group(proc, signal.SIGTERM)
         try:
             proc.wait(timeout=TERM_GRACE)
         except subprocess.TimeoutExpired:
             pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)  # also reaches children that outlive the leader
-    except (ProcessLookupError, PermissionError):
-        pass
+    signal_group(proc, signal.SIGKILL)  # also reaches children that outlive the leader
     proc.wait(timeout=10)
 
 

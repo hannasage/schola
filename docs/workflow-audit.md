@@ -56,6 +56,8 @@ If the manifest and the scripts disagree, `tests/test_tools_manifest.py` fails.
 
 Each tool carries `mcp_exposure`: `expose` or `hidden`. A missing field means `hidden`. A later MCP server lists only the `expose` tools. The two `pr_body` tools are read-only and exposed. `gate_matrix` and `smoke` write files, so they are hidden. A human-only or destructive tool must be hidden, and `tests/test_tools_manifest.py` holds the shared check for this rule.
 
+Schola applies a stricter rule than the shared check: an exposed tool must be read-only and write nothing. `--root`, `--file`, and `--gate-json` take any local path, so a server that exposes these tools must limit the paths first. `gate_matrix` runs the interpreter and the repository code that its arguments name. That is why it stays hidden.
+
 No script here pushes, comments, or opens a pull request, and none is `human-only`.
 
 ## What the scripts do not do

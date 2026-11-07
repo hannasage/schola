@@ -17,7 +17,9 @@ Exit code: 0 the body is good, 1 the body breaks a rule, 2 wrong use.
 
 import argparse
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -74,11 +76,26 @@ def check_body(text):
     return problems
 
 
+MAX_BYTES = 1_000_000
+
+
+def read_capped(path):
+    """Read a regular file of at most MAX_BYTES as UTF-8. Anything else raises ValueError or OSError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)  # a FIFO must not block the open
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("not a regular file")
+        data = handle.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError(f"larger than {MAX_BYTES} bytes")
+    return data.decode("utf-8")
+
+
 def git_files(root, base):
     if base.startswith("-"):
         raise UsageError(f"--base {base!r} looks like an option")
     try:
-        done = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only", f"{base}...HEAD"],
+        done = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only", "--end-of-options", f"{base}...HEAD"],
                               cwd=root, capture_output=True, text=True)
     except OSError as error:
         raise UsageError(f"cannot run git in {root}: {error}")
@@ -93,22 +110,23 @@ def git_files(root, base):
 def gate_lines(path):
     """Turn a gate_matrix.py --json result into one line per Python version."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(read_capped(path))
         by_version = {}
         for item in data["results"]:
             skipped = item.get("skipped", 0)
             tests = item.get("tests")
             counted = tests - skipped if isinstance(tests, int) and isinstance(skipped, int) else None
-            by_version.setdefault(item["version"], []).append((item["status"], counted))
+            by_version.setdefault(item["version"], []).append((item["status"], counted, str(item.get("suite", "?"))))
         if not by_version:
             raise ValueError("the results list is empty")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise UsageError(f"--gate-json is not a gate_matrix.py --json result: {error!r}")
     lines = []
     for version, items in by_version.items():
-        statuses = [status for status, _tests in items]
-        tests = sum(count for _status, count in items if isinstance(count, int))
-        empty = any(status == "pass" and not (isinstance(count, int) and count > 0) for status, count in items)
+        statuses = [status for status, _tests, _suite in items]
+        tests = sum(count for _status, count, _suite in items if isinstance(count, int))
+        empty = any(status == "pass" and not (isinstance(count, int) and count > 0) for status, count, _suite in items)
+        suites = ", ".join(dict.fromkeys(suite for _status, _count, suite in items))
         if any(status not in ("pass", "skip") for status in statuses):
             lines.append(f"- Python {version}: fail")
         elif all(status == "skip" for status in statuses):
@@ -116,7 +134,7 @@ def gate_lines(path):
         elif empty or tests == 0:
             lines.append(f"- Python {version}: no tests counted")
         else:
-            lines.append(f"- Python {version}: pass ({tests} tests)")
+            lines.append(f"- Python {version}: pass ({tests} tests; suites: {suites})")
     return lines
 
 
@@ -161,7 +179,7 @@ def main(argv=None, out=None, stdin=None):
                 raise UsageError(f"cannot read standard input: {error}")
         else:
             try:
-                text = Path(args.file).read_text(encoding="utf-8")
+                text = read_capped(args.file)
             except (OSError, ValueError) as error:
                 raise UsageError(f"cannot read {args.file}: {error}")
         problems = check_body(text)

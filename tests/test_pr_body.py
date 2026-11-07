@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -130,7 +131,7 @@ class CommandTest(unittest.TestCase):
         self.assertIn("- `b.txt`: TODO", text)
         self.assertIn("- `c.txt`: TODO", text)
         self.assertNotIn("a.txt", text)
-        self.assertIn("- Python 3.10: pass (8 tests)", text)
+        self.assertIn("- Python 3.10: pass (8 tests; suites: unit, server)", text)
         self.assertIn("- Python 3.11: fail", text)
         self.assertTrue(text.rstrip().endswith(pr_body.FOOTER))
 
@@ -152,6 +153,39 @@ class CommandTest(unittest.TestCase):
             sys.stderr = real
         self.assertEqual(code, 2)
         self.assertIn("git diff failed", err.getvalue())
+
+    def test_a_base_that_looks_like_an_option_is_refused_and_writes_nothing(self):
+        root = self.make_repo()
+        target = root / "x"
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        try:
+            code = pr_body.main(["scaffold", "--root", str(root), f"--base=--output={target}"], out=io.StringIO())
+        finally:
+            sys.stderr = real
+        self.assertEqual(code, 2)
+        self.assertIn("looks like an option", err.getvalue())
+        self.assertFalse(target.exists())
+
+    def test_check_refuses_a_file_that_is_not_regular_or_is_too_large(self):
+        folder = Path(tempfile.mkdtemp(prefix="prbody-read-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        fifo = folder / "fifo"
+        os.mkfifo(fifo)
+        big = folder / "big.md"
+        big.write_bytes(b"a " * (pr_body.MAX_BYTES // 2 + 10))
+        for path, word in ((fifo, "not a regular file"), (big, "larger than")):
+            with self.subTest(path=path.name):
+                err = io.StringIO()
+                real = sys.stderr
+                sys.stderr = err
+                try:
+                    code = pr_body.main(["check", str(path)], out=io.StringIO())
+                finally:
+                    sys.stderr = real
+                self.assertEqual(code, 2)
+                self.assertIn(word, err.getvalue())
 
     def test_scaffold_with_a_bad_gate_file_exits_two(self):
         root = self.make_repo()
