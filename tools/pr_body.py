@@ -67,6 +67,8 @@ def check_body(text):
         match = CALLOUT_LINE.match(line)
         if match and match.group(1).upper() not in CALLOUTS:
             problems.append(f"unknown callout [!{match.group(1)}]")
+    if re.search(r"\bTODO\b", strip_code(text)):
+        problems.append("a TODO placeholder remains")
     if text.rstrip().splitlines()[-1:] != [FOOTER]:
         problems.append("the last line is not the attribution line")
     return problems
@@ -82,7 +84,10 @@ def git_files(root, base):
         raise UsageError(f"cannot run git in {root}: {error}")
     if done.returncode != 0:
         raise UsageError(f"git diff failed: {done.stderr.strip()[:200]}")
-    return [line for line in done.stdout.splitlines() if line]
+    files = [line for line in done.stdout.splitlines() if line]
+    if not files:
+        raise UsageError(f"no changed files between {base} and HEAD; check --base")
+    return files
 
 
 def gate_lines(path):
@@ -91,7 +96,12 @@ def gate_lines(path):
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         by_version = {}
         for item in data["results"]:
-            by_version.setdefault(item["version"], []).append((item["status"], item.get("tests")))
+            skipped = item.get("skipped", 0)
+            tests = item.get("tests")
+            counted = tests - skipped if isinstance(tests, int) and isinstance(skipped, int) else None
+            by_version.setdefault(item["version"], []).append((item["status"], counted))
+        if not by_version:
+            raise ValueError("the results list is empty")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise UsageError(f"--gate-json is not a gate_matrix.py --json result: {error!r}")
     lines = []
@@ -142,8 +152,11 @@ def main(argv=None, out=None, stdin=None):
             print(scaffold(git_files(root, args.base), gate), end="", file=out)
             return 0
         if args.file == "-":
+            source = stdin or sys.stdin
+            if source is None:
+                raise UsageError("standard input is closed")
             try:
-                text = (stdin or sys.stdin).read()
+                text = source.read()
             except (OSError, ValueError) as error:
                 raise UsageError(f"cannot read standard input: {error}")
         else:

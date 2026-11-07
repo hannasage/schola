@@ -17,14 +17,12 @@ import argparse
 import http.client
 import json
 import os
-import queue
 import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -86,51 +84,56 @@ def http_step(name, base, path, want_status, want_json=False, timeout=10):
     return {"step": name, "ok": problem is None, "detail": problem or "ok"}
 
 
+TERM_GRACE = 5  # seconds the server has to stop after SIGTERM
+
+
 def start_server(root, data_dir, wait):
-    """Start server.py on a free port. Return (process, base_url). Raise RuntimeError when it is not ready."""
+    """Start server.py on a free port. Return (process, base_url). Raise RuntimeError when it is not ready.
+
+    The server writes to a temporary file, not a pipe, so a stray grandchild can never hold this script up.
+    """
     env = dict(os.environ, LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
-    proc = subprocess.Popen([sys.executable, str(root / "server.py"), "--port", "0", "--data-dir", str(data_dir)],
-                            cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)
-    lines = queue.Queue()
-    threading.Thread(target=lambda: [lines.put(line) for line in proc.stdout], daemon=True).start()
-    deadline = time.monotonic() + wait
-    seen = []
+    proc = None
+    out = tempfile.TemporaryFile()
     try:
+        proc = subprocess.Popen([sys.executable, str(root / "server.py"), "--port", "0", "--data-dir", str(data_dir)],
+                                cwd=root, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + wait
+        text = ""
         while time.monotonic() < deadline:
-            try:
-                line = lines.get(timeout=0.2)
-            except queue.Empty:
-                if proc.poll() is not None and lines.empty():
-                    break
-                continue
-            seen.append(line.strip())
-            match = READY.search(line)
+            out.seek(0)
+            text = out.read().decode("utf-8", "replace")
+            match = READY.search(text)
             if match:
                 return proc, f"http://127.0.0.1:{match.group(1)}"
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
     except BaseException:
-        stop_server(proc)  # a signal while waiting must not leave the server running
+        if proc is not None:
+            stop_server(proc)  # a signal while waiting must not leave the server running
         raise
+    finally:
+        out.close()
     stop_server(proc)
-    raise RuntimeError("server not ready: " + (seen[-1] if seen else "no output"))
+    lines = [line for line in text.splitlines() if line.strip()]
+    raise RuntimeError("server not ready: " + (lines[-1] if lines else "no output"))
 
 
 def stop_server(proc):
-    if proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                proc.kill()
-            proc.wait(timeout=10)
-    if proc.stdout:
-        proc.stdout.close()
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=TERM_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # also reaches children that outlive the leader
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=10)
 
 
 def run_smoke(root, seed, wait, say):
@@ -148,12 +151,13 @@ def run_smoke(root, seed, wait, say):
         for name, args, expect in calls:
             say("run: schola " + " ".join(args))
             steps.append(cli_step(name, root, data_dir, args, **expect))
+        proc = None
         try:
-            proc, base = start_server(root, data_dir, wait)
-        except RuntimeError as error:
-            steps.append({"step": "server start", "ok": False, "detail": str(error)})
-            return steps
-        try:
+            try:
+                proc, base = start_server(root, data_dir, wait)
+            except RuntimeError as error:
+                steps.append({"step": "server start", "ok": False, "detail": str(error)})
+                return steps
             steps.append({"step": "server start", "ok": True, "detail": base})
             for name, path, status, as_json in [
                 ("GET /", "/", 200, False),
@@ -165,7 +169,8 @@ def run_smoke(root, seed, wait, say):
                 say(f"run: GET {path}")
                 steps.append(http_step(name, base, path, status, as_json))
         finally:
-            stop_server(proc)
+            if proc is not None:
+                stop_server(proc)
         return steps
     finally:
         shutil.rmtree(data_dir, ignore_errors=True)  # the folder this call made
@@ -202,14 +207,15 @@ def main(argv=None, out=None):
     def on_term(_signum, _frame):
         raise KeyboardInterrupt  # runs the cleanup in run_smoke
 
-    previous = signal.signal(signal.SIGTERM, on_term)
+    previous = {sig: signal.signal(sig, on_term) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         steps = run_smoke(root, seed, args.wait, say)
     except KeyboardInterrupt:
         print("smoke: interrupted; the server was stopped", file=sys.stderr)
         return 130
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
     ok = all(step["ok"] for step in steps)
     if args.json:
         print(json.dumps({"ok": ok, "steps": steps}), file=out)

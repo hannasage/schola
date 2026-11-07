@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,20 +86,29 @@ class Lock:
 
     def acquire(self):
         try:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         except OSError as error:
             raise UsageError(f"cannot take the lock {self.path}: {error}")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise UsageError(f"{self.path} is not a regular file of this user")
             try:
-                owner = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                owner = "unknown"
+                try:
+                    owner = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
+                except OSError:
+                    owner = "unknown"
+                raise UsageError(f"another gate runs (pid {owner}, lock {self.path})")
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+            except OSError as error:
+                raise UsageError(f"cannot write the lock {self.path}: {error}")
+        except BaseException:
             os.close(fd)
-            raise UsageError(f"another gate runs (pid {owner}, lock {self.path})")
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode("ascii"))
+            raise
         self.fd = fd
 
     def release(self):
@@ -142,6 +152,11 @@ def run_suite(python, suite, root, timeout, log_path):
         except BaseException:
             kill_group(proc)  # the suite has its own session: a signal to this script never reaches it
             raise
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # a test may leave a child behind
+            except ProcessLookupError:
+                pass
     seconds = round(time.monotonic() - started, 1)
     text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     ran = RAN.findall(text)
@@ -153,6 +168,10 @@ def run_suite(python, suite, root, timeout, log_path):
     if status != "timeout" and (("NO TESTS RAN" in text) or (code == 0 and not tests)):
         status = "fail"
         first = "no tests ran"
+    skipped_count = int(skipped.group(1)) if skipped else 0
+    if status == "pass" and tests and skipped_count >= tests:
+        status = "fail"
+        first = "all tests skipped"
     if status == "fail" and first is None:
         match = FIRST_FAILURE.search(text)
         if match:
@@ -160,7 +179,7 @@ def run_suite(python, suite, root, timeout, log_path):
         else:
             lines = [line for line in text.splitlines() if line.strip()]
             first = lines[-1] if lines else f"exit code {code}"
-    return {"suite": suite, "status": status, "tests": tests, "skipped": int(skipped.group(1)) if skipped else 0,
+    return {"suite": suite, "status": status, "tests": tests, "skipped": skipped_count,
             "seconds": seconds, "first_failure": first, "command": command}
 
 
@@ -244,7 +263,7 @@ def main(argv=None, out=None):
     def on_term(_signum, _frame):
         raise KeyboardInterrupt
 
-    previous = signal.signal(signal.SIGTERM, on_term)
+    previous = {sig: signal.signal(sig, on_term) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         log_dir = tempfile.mkdtemp(prefix="schola-gate-")
         results = run_matrix(root, versions, suites, args.timeout, overrides, args.allow_missing, log_dir, say)
@@ -252,7 +271,8 @@ def main(argv=None, out=None):
         print("gate_matrix: interrupted; the running suite was stopped", file=sys.stderr)
         return 130
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
         lock.release()
 
     ok = all(r["status"] in ("pass", "skip") for r in results) and any(r["status"] == "pass" for r in results)

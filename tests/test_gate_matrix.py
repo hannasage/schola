@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import signal
+import stat
 import shutil
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -219,9 +222,85 @@ class GateMatrixTest(unittest.TestCase):
             gate_matrix.Lock(self.lock_dir).acquire()
         self.assertEqual(target.read_text(encoding="utf-8"), "keep")
 
-    def test_a_signal_stops_the_suite_and_releases_the_lock(self):
+    def stub_python(self, output, code=0):
+        """An interpreter that reports VERSION and prints fixed test output. It stands in for Python 3.10 or 3.11."""
+        path = self.lock_dir / "stub-python"
+        path.write_text(f"#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo {VERSION}; exit 0; fi\ncat <<'EOF'\n{output}\nEOF\nexit {code}\n", encoding="utf-8")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_zero_tests_with_exit_zero_fails_as_python_3_10_and_3_11_report_it(self):
+        root = self.project(PASSING)
+        stub = self.stub_python("\n----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nOK")
+        code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+        self.assertEqual(code, 1)
+        self.assertEqual(data["results"][0]["first_failure"], "no tests ran")
+
+    def test_a_suite_where_every_test_is_skipped_fails(self):
+        root = self.project(PASSING)
+        stub = self.stub_python("Ran 3 tests in 0.001s\n\nOK (skipped=3)")
+        code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={stub}")
+        self.assertEqual(code, 1)
+        self.assertEqual(data["results"][0]["first_failure"], "all tests skipped")
+
+    def test_a_child_a_test_leaves_behind_is_killed_when_the_suite_ends(self):
+        pid_file = self.lock_dir / "child.pid"
+        source = ("import os, subprocess, unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+                  "        child = subprocess.Popen(['sleep', '300'])\n"
+                  "        open(os.environ['GATE_CHILD_PID'], 'w').write(str(child.pid))\n")
+        root = self.project(source)
+        os.environ["GATE_CHILD_PID"] = str(pid_file)
+        self.addCleanup(os.environ.pop, "GATE_CHILD_PID", None)
+        code, _data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
+        self.assertEqual(code, 0)
+        child = int(pid_file.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(child, 9)
+            self.fail("a child of the suite kept running")
+
+    def test_a_fifo_in_place_of_the_lock_file_is_refused_not_hung(self):
+        os.mkfifo(self.lock_dir / gate_matrix.LOCK_NAME)
+        with self.assertRaises(gate_matrix.UsageError):
+            gate_matrix.Lock(self.lock_dir).acquire()
+
+    def test_a_longer_old_pid_in_the_lock_file_is_cut_off(self):
+        (self.lock_dir / gate_matrix.LOCK_NAME).write_text("9" * 20, encoding="utf-8")
+        lock = gate_matrix.Lock(self.lock_dir)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertEqual((self.lock_dir / gate_matrix.LOCK_NAME).read_text(), str(os.getpid()))
+
+    def test_an_interrupt_in_process_exits_130_and_frees_the_lock(self):
+        root = self.project(PASSING)
+        with mock.patch.object(gate_matrix, "run_matrix", side_effect=KeyboardInterrupt):
+            err = io.StringIO()
+            real = sys.stderr
+            sys.stderr = err
+            try:
+                code = gate_matrix.main(["--root", str(root), "--lock-dir", str(self.lock_dir), "--versions", VERSION,
+                                         "--python", f"{VERSION}={sys.executable}"], out=io.StringIO())
+            finally:
+                sys.stderr = real
+        self.assertEqual(code, 130)
+        lock = gate_matrix.Lock(self.lock_dir)
+        lock.acquire()  # a lock that was not released would refuse
+        lock.release()
+
+    def test_a_signal_stops_the_suite_and_exits_130(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                self.signal_case(signum)
+
+    def signal_case(self, signum):
         root = self.project(SLOW_WITH_PID)
         pid_file = self.lock_dir / "suite.pid"
+        pid_file.unlink(missing_ok=True)  # a second case must wait for its own suite
         env = dict(os.environ, GATE_PID_FILE=str(pid_file))
         proc = subprocess.Popen([sys.executable, str(ROOT / "tools" / "gate_matrix.py"), "--root", str(root),
                                  "--lock-dir", str(self.lock_dir), "--versions", VERSION, "--suites", "unit",
@@ -232,7 +311,7 @@ class GateMatrixTest(unittest.TestCase):
                 break
             time.sleep(0.1)
         suite_pid = int(pid_file.read_text())
-        proc.terminate()
+        proc.send_signal(signum)
         _out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 130, err)
         for _ in range(50):
@@ -244,9 +323,6 @@ class GateMatrixTest(unittest.TestCase):
         else:
             os.kill(suite_pid, 9)
             self.fail("the suite process kept running")
-        lock = gate_matrix.Lock(self.lock_dir)
-        lock.acquire()  # the signalled gate must have released it
-        lock.release()
 
     def test_find_python_ignores_a_file_that_cannot_run(self):
         not_executable = self.lock_dir / "python3.10"

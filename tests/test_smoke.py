@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import signal
 import tempfile
 import time
 import unittest
@@ -97,12 +98,51 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual([s["step"] for s in failed], ["GET /api/hub without token"])
         self.assertIn("status 200, expected 403", failed[0]["detail"])
 
-    def test_a_server_that_never_says_ready_fails_the_start_step(self):
-        root = self.fixture(server_source="import time\ntime.sleep(60)\n")
+    def test_a_server_that_never_says_ready_fails_the_start_step_and_is_stopped(self):
+        pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
+        self.addCleanup(shutil.rmtree, pid_file.parent, True)
+        os.environ["SMOKE_PID_FILE"] = str(pid_file)
+        self.addCleanup(os.environ.pop, "SMOKE_PID_FILE", None)
+        root = self.fixture(server_source="import os, time\nopen(os.environ['SMOKE_PID_FILE'], 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
         code, data = self.run_main("--root", str(root), "--wait", "1")
         self.assertEqual(code, 1)
         self.assertEqual(data["steps"][-1]["step"], "server start")
         self.assertFalse(data["steps"][-1]["ok"])
+        self.assertTrue(self.pid_gone(int(pid_file.read_text())))
+
+    def test_a_server_that_ignores_sigterm_is_killed(self):
+        pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
+        self.addCleanup(shutil.rmtree, pid_file.parent, True)
+        os.environ["SMOKE_PID_FILE"] = str(pid_file)
+        self.addCleanup(os.environ.pop, "SMOKE_PID_FILE", None)
+        source = FAKE_SERVER % {"hub": 403}
+        source = "import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" + source
+        real_grace = smoke.TERM_GRACE
+        smoke.TERM_GRACE = 1
+        self.addCleanup(setattr, smoke, "TERM_GRACE", real_grace)
+        code, _data = self.run_main("--root", str(self.fixture(server_source=source)))
+        self.assertEqual(code, 0)
+        self.assertTrue(self.pid_gone(int(pid_file.read_text())), "SIGKILL must follow an ignored SIGTERM")
+
+    def test_a_body_that_is_not_json_fails_its_step(self):
+        source = (FAKE_SERVER % {"hub": 403}).replace("body = json.dumps({\"ok\": True}).encode()", "body = b'not json'")
+        code, data = self.run_main("--root", str(self.fixture(server_source=source)))
+        self.assertEqual(code, 1)
+        failed = [s["step"] for s in data["steps"] if not s["ok"]]
+        self.assertEqual(failed, ["GET /api/state", "GET /api/library"])
+
+    def test_cli_output_that_is_not_json_or_the_wrong_error_fails_its_step(self):
+        root = self.fixture()
+        cli = (root / "schola_cli.py").read_text()
+        (root / "schola_cli.py").write_text(cli.replace('print("{}")', 'print("nope")'), encoding="utf-8")
+        code, data = self.run_main("--root", str(root))
+        failed = [s["step"] for s in data["steps"] if not s["ok"]]
+        self.assertEqual(failed, ["cli modules", "cli events list"])
+        root2 = self.fixture()
+        cli = (root2 / "schola_cli.py").read_text()
+        (root2 / "schola_cli.py").write_text(cli.replace("log_missing", "something_else"), encoding="utf-8")
+        code, data = self.run_main("--root", str(root2))
+        self.assertEqual([s["step"] for s in data["steps"] if not s["ok"]], ["cli events export, no log"])
 
     def test_a_server_that_exits_at_once_fails_the_start_step(self):
         root = self.fixture(server_source="import sys\nprint('boom')\nsys.exit(4)\n")
@@ -154,6 +194,11 @@ class SmokeTest(unittest.TestCase):
             self.fail("a child of the server kept running")
 
     def test_a_signal_while_waiting_for_the_server_stops_it(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                self.wait_signal_case(signum)
+
+    def wait_signal_case(self, signum):
         pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
         self.addCleanup(shutil.rmtree, pid_file.parent, True)
         root = self.fixture(server_source="import os, time\nopen(os.environ['SMOKE_PID_FILE'], 'w').write(str(os.getpid()))\ntime.sleep(120)\n")
@@ -165,7 +210,7 @@ class SmokeTest(unittest.TestCase):
                 break
             time.sleep(0.1)
         server_pid = int(pid_file.read_text())
-        proc.terminate()
+        proc.send_signal(signum)
         _out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 130, err)
         if not self.pid_gone(server_pid):

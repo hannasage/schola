@@ -88,6 +88,10 @@ class CheckBodyTest(unittest.TestCase):
         text = GOOD.replace("pick the default timeout.", "see [#33](https://github.com/hannasage/schola/pull/33).")
         self.assertEqual(problems_for(text), [])
 
+    def test_a_todo_placeholder_is_a_problem_outside_code(self):
+        self.assertEqual(problems_for(GOOD.replace("pick the default timeout.", "TODO pick one.")), ["a TODO placeholder remains"])
+        self.assertEqual(problems_for(GOOD.replace("pick the default timeout.", "use `TODO` markers.")), [])
+
     def test_an_empty_body_does_not_crash(self):
         self.assertTrue(problems_for(""))
 
@@ -134,7 +138,7 @@ class CommandTest(unittest.TestCase):
         root = self.make_repo()
         out = io.StringIO()
         pr_body.main(["scaffold", "--root", str(root), "--base", "main"], out=out)
-        self.assertEqual(problems_for(out.getvalue()), [])
+        self.assertEqual(problems_for(out.getvalue()), ["a TODO placeholder remains"])
         self.assertIn("TODO", out.getvalue())
 
     def test_scaffold_with_a_bad_base_exits_two(self):
@@ -200,6 +204,38 @@ class CommandTest(unittest.TestCase):
             code = pr_body.main(["check", "-"], out=io.StringIO(), stdin=Broken())
         finally:
             sys.stderr = real
+        self.assertEqual(code, 2)
+
+    def test_an_empty_diff_and_an_empty_results_list_exit_two(self):
+        root = self.make_repo()
+        gate = root / "gate.json"
+        gate.write_text('{"results": []}', encoding="utf-8")
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        try:
+            self.assertEqual(pr_body.main(["scaffold", "--root", str(root), "--base", "HEAD"], out=io.StringIO()), 2)
+            self.assertIn("no changed files", err.getvalue())
+            self.assertEqual(pr_body.main(["scaffold", "--root", str(root), "--base", "main", "--gate-json", str(gate)], out=io.StringIO()), 2)
+        finally:
+            sys.stderr = real
+
+    def test_a_version_where_every_test_was_skipped_has_no_tests_counted(self):
+        root = self.make_repo()
+        gate = root / "gate.json"
+        gate.write_text(json.dumps({"results": [
+            {"version": "3.10", "suite": "unit", "status": "pass", "tests": 5, "skipped": 5}]}), encoding="utf-8")
+        out = io.StringIO()
+        pr_body.main(["scaffold", "--root", str(root), "--base", "main", "--gate-json", str(gate)], out=out)
+        self.assertIn("- Python 3.10: no tests counted", out.getvalue())
+
+    def test_closed_standard_input_exits_two(self):
+        real_stdin, real_stderr = sys.stdin, sys.stderr
+        sys.stdin, sys.stderr = None, io.StringIO()
+        try:
+            code = pr_body.main(["check", "-"], out=io.StringIO())
+        finally:
+            sys.stdin, sys.stderr = real_stdin, real_stderr
         self.assertEqual(code, 2)
 
     def test_wrong_input_exits_two_not_one(self):
