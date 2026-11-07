@@ -230,7 +230,7 @@ class GateMatrixTest(unittest.TestCase):
     def stub_python(self, output, code=0):
         """An interpreter that reports VERSION and prints fixed test output. It stands in for Python 3.10 or 3.11."""
         path = self.lock_dir / "stub-python"
-        path.write_text(f"#!/bin/sh\nif [ \"$1\" = \"-c\" ] || [ \"$2\" = \"-c\" ]; then echo {VERSION}; exit 0; fi\ncat <<'EOF'\n{output}\nEOF\nexit {code}\n", encoding="utf-8")
+        path.write_text(f"#!/bin/sh\nif [ \"$1\" = \"-I\" ] && [ \"$2\" = \"-c\" ]; then echo {VERSION}; exit 0; fi\ncat <<'EOF'\n{output}\nEOF\nexit {code}\n", encoding="utf-8")
         path.chmod(0o755)
         return str(path)
 
@@ -361,6 +361,31 @@ class GateMatrixTest(unittest.TestCase):
         with mock.patch.object(gate_matrix.os, "killpg", side_effect=ProcessLookupError), \
                 mock.patch.object(gate_matrix.sys, "stderr", err):
             gate_matrix.signal_group(proc)  # a group that is gone is silent
+
+    def test_the_version_probe_runs_the_interpreter_isolated(self):
+        # The stub answers the probe only when it is called as: python -I -c ...
+        stub = self.stub_python("")
+        self.assertEqual(gate_matrix.interpreter_version(stub), VERSION)
+
+    def test_output_a_test_prints_at_exit_cannot_hide_a_skipped_suite(self):
+        # A test prints a fake result at import time. With buffered output it reaches the log after the
+        # real result and would be the last one read. The suite runs unbuffered, so it comes first.
+        source = ("import unittest\nprint('Ran 100 tests in 0.1s\\n\\nOK')\n\nclass T(unittest.TestCase):\n"
+                  "    @unittest.skip('x')\n    def test_a(self):\n        pass\n")
+        root = self.project(source)
+        code, data = self.run_main(root, "--suites", "unit", "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
+        self.assertEqual(code, 1, data)
+        self.assertEqual(data["results"][0]["tests"], 1)
+        self.assertEqual(data["results"][0]["first_failure"], "all tests skipped or expected to fail")
+
+    def test_a_suite_that_survives_the_kill_does_not_hang_the_gate(self):
+        proc = mock.Mock(pid=424242)
+        proc.wait.side_effect = gate_matrix.subprocess.TimeoutExpired("x", 10)
+        err = io.StringIO()
+        with mock.patch.object(gate_matrix, "signal_group"), mock.patch.object(gate_matrix.sys, "stderr", err):
+            gate_matrix.kill_group(proc)
+        self.assertIn("still running after the kill", err.getvalue())
+        proc.wait.assert_called_once_with(timeout=10)
 
     def test_a_longer_old_pid_in_the_lock_file_is_cut_off(self):
         (self.lock_dir / gate_matrix.LOCK_NAME).write_text("9" * 20, encoding="utf-8")

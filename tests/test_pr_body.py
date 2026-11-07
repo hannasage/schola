@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -168,7 +169,13 @@ class CommandTest(unittest.TestCase):
         self.assertIn("looks like an option", err.getvalue())
         self.assertFalse(target.exists())
 
-    def test_check_refuses_a_file_that_is_not_regular_or_is_too_large(self):
+    def run_tool(self, *args, stdin=None):
+        """Run the script in its own process with a time limit, so a blocking open fails the test."""
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "pr_body.py"), *args], input=stdin,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a_file_that_is_not_regular_or_is_too_large_is_refused_by_check_and_by_gate_json(self):
+        root = self.make_repo()
         folder = Path(tempfile.mkdtemp(prefix="prbody-read-"))
         self.addCleanup(shutil.rmtree, folder, True)
         fifo = folder / "fifo"
@@ -176,16 +183,31 @@ class CommandTest(unittest.TestCase):
         big = folder / "big.md"
         big.write_bytes(b"a " * (pr_body.MAX_BYTES // 2 + 10))
         for path, word in ((fifo, "not a regular file"), (big, "larger than")):
-            with self.subTest(path=path.name):
-                err = io.StringIO()
-                real = sys.stderr
-                sys.stderr = err
-                try:
-                    code = pr_body.main(["check", str(path)], out=io.StringIO())
-                finally:
-                    sys.stderr = real
-                self.assertEqual(code, 2)
-                self.assertIn(word, err.getvalue())
+            for label, args in (("check", ["check", str(path)]),
+                                ("gate-json", ["scaffold", "--root", str(root), "--base", "main", "--gate-json", str(path)])):
+                with self.subTest(path=path.name, tool=label):
+                    done = self.run_tool(*args)
+                    self.assertEqual(done.returncode, 2, done.stderr)
+                    self.assertIn(word, done.stderr)
+
+    def test_standard_input_is_capped_like_a_file(self):
+        done = self.run_tool("check", "-", stdin="a " * (pr_body.MAX_BYTES // 2 + 10))
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("larger than", done.stderr)
+
+    def test_a_long_run_of_brackets_does_not_stall_the_check(self):
+        started = time.monotonic()
+        problems = pr_body.check_body("[" * (pr_body.MAX_BYTES - 10))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(problems)
+
+    def test_a_bare_number_problem_names_the_line_and_never_repeats_the_text(self):
+        text = "## What changed\n\nSecret words here #12 more secret words\n"
+        problems = pr_body.check_body(text)
+        bare = [p for p in problems if "bare issue" in p]
+        self.assertEqual(len(bare), 1)
+        self.assertIn("line 3", bare[0])
+        self.assertNotIn("Secret", bare[0])
 
     def test_scaffold_with_a_bad_gate_file_exits_two(self):
         root = self.make_repo()
@@ -229,7 +251,7 @@ class CommandTest(unittest.TestCase):
 
     def test_non_utf8_standard_input_exits_two(self):
         class Broken:
-            def read(self):
+            def read(self, size=-1):
                 raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
         err = io.StringIO()
         real = sys.stderr

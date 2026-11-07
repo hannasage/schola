@@ -207,6 +207,8 @@ class ToolsManifestTest(unittest.TestCase):
             "a duplicate name": lambda m: m["tools"][1].update(name=m["tools"][0]["name"]),
             "an unknown held_back tool": lambda m: m.update(held_back=[{"tool": "no-such-tool"}]),
             "a held_back list that is not a list": lambda m: m.update(held_back="x"),
+            "a held_back entry with no tool name": lambda m: m.update(held_back=[{}]),
+            "a held_back entry that is not an object": lambda m: m.update(held_back=["x"]),
             "a bad safety class": lambda m: m["tools"][0].update(safety_class="read_only"),
             "a destructive field that is not a boolean": lambda m: m["tools"][0].update(destructive="no"),
             "a tool with no name": lambda m: m["tools"][0].pop("name"),

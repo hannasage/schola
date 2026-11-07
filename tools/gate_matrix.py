@@ -39,7 +39,7 @@ LOCK_NAME = "schola-gate-matrix.lock"  # a file, not a folder
 RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s", re.M)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # The result line is the one right after "Ran N tests in Ns". A line a test prints cannot match.
-RESULT_LINE = re.compile(r"^Ran \d+ tests? in [0-9.]+s[ \t]*\n[ \t]*\n(?:OK|FAILED)(?: \((.*?)\))?[ \t]*$", re.M)
+RESULT_LINE = re.compile(r"^Ran (\d+) tests? in [0-9.]+s[ \t]*\n[ \t]*\n(?:OK|FAILED)(?: \((.*?)\))?[ \t]*$", re.M)
 SKIPPED = re.compile(r"skipped=(\d+)")
 EXPECTED_FAILURES = re.compile(r"expected failures=(\d+)")
 FIRST_FAILURE = re.compile(r"^(?:FAIL|ERROR): .+$", re.M)
@@ -134,7 +134,10 @@ def signal_group(proc):
 
 def kill_group(proc):
     signal_group(proc)
-    proc.wait()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print(f"gate_matrix: the suite (pid {proc.pid}) is still running after the kill", file=sys.stderr)
 
 
 def interpreter_version(python):
@@ -152,7 +155,7 @@ def run_suite(python, suite, root, timeout, log_path):
     command = [python, *SUITES[suite]]
     # Python 3.14 colours the result line when FORCE_COLOR is set. The parser needs plain text.
     env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "CLICOLOR_FORCE")}
-    env.update(LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", PYTHON_COLORS="0")
+    env.update(LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1", NO_COLOR="1", PYTHON_COLORS="0")
     started = time.monotonic()
     status = "pass"
     with open(log_path, "wb") as log:
@@ -171,9 +174,10 @@ def run_suite(python, suite, root, timeout, log_path):
     seconds = round(time.monotonic() - started, 1)
     text = ANSI.sub("", Path(log_path).read_text(encoding="utf-8", errors="replace"))
     ran = RAN.findall(text)
-    tests = int(ran[-1][0]) if ran else None
     results = RESULT_LINE.findall(text)
-    detail = results[-1] if results else ""  # only the line after the last "Ran N tests" counts
+    # The count and the detail come from the same block: "Ran N tests", a blank line, then the result.
+    tests = int(results[-1][0]) if results else (int(ran[-1][0]) if ran else None)
+    detail = results[-1][1] if results else ""
     skipped = SKIPPED.search(detail)
     expected = EXPECTED_FAILURES.search(detail)
     if status != "timeout" and code != 0:

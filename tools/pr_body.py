@@ -41,7 +41,7 @@ def strip_code(text):
     """Remove code and links. A number inside either is not a bare reference."""
     text = re.sub(r"```.*?```", "", text, flags=re.S)
     text = re.sub(r"`[^`\n]*`", "", text)
-    return re.sub(r"\[[^\]]*\]\([^)]*\)", "", text)  # a link: its text and address are not bare numbers
+    return re.sub(r"\[[^\]\n]{0,200}\]\([^)\n]{0,500}\)", "", text)  # a link; the bounds keep a long run of [ linear
 
 
 def check_body(text):
@@ -55,9 +55,10 @@ def check_body(text):
         if heading.lower() not in headings:
             problems.append(f"missing heading: {heading}")
     prose = strip_code(text)
-    for line in prose.splitlines():
+    for number, line in enumerate(prose.splitlines(), 1):
         if BARE_NUMBER.search(line):
-            problems.append(f"bare issue or pull request number (write the full link): {line.strip()[:80]}")
+            # the line number, not the text: this tool can be pointed at any readable file
+            problems.append(f"bare issue or pull request number on line {number} of the text without code and links (write the full link)")
             break
     if any(line.lstrip().startswith("|") for line in text.splitlines()):
         problems.append("a table; use a list")
@@ -76,7 +77,7 @@ def check_body(text):
     return problems
 
 
-MAX_BYTES = 1_000_000
+MAX_BYTES = 65_536  # a body has 300 words at most; a gate result is a few KB
 
 
 def read_capped(path):
@@ -95,7 +96,7 @@ def git_files(root, base):
     if base.startswith("-"):
         raise UsageError(f"--base {base!r} looks like an option")
     try:
-        done = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only", "--end-of-options", f"{base}...HEAD"],
+        done = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only", "--no-renames", f"{base}...HEAD", "--"],
                               cwd=root, capture_output=True, text=True)
     except OSError as error:
         raise UsageError(f"cannot run git in {root}: {error}")
@@ -174,9 +175,11 @@ def main(argv=None, out=None, stdin=None):
             if source is None:
                 raise UsageError("standard input is closed")
             try:
-                text = source.read()
+                text = source.read(MAX_BYTES + 1)
             except (OSError, ValueError) as error:
                 raise UsageError(f"cannot read standard input: {error}")
+            if len(text.encode("utf-8", "replace")) > MAX_BYTES:
+                raise UsageError(f"standard input is larger than {MAX_BYTES} bytes")
         else:
             try:
                 text = read_capped(args.file)
