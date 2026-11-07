@@ -110,34 +110,6 @@ class GateMatrixTest(unittest.TestCase):
             self.assertEqual(code, 2, argv)
             self.assertIn("gate_matrix:", err.getvalue())
 
-    def test_a_live_lock_refuses_a_second_gate(self):
-        root = self.project(PASSING)
-        lock = self.lock_dir / gate_matrix.LOCK_NAME
-        lock.mkdir()
-        (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
-        err = io.StringIO()
-        real = sys.stderr
-        sys.stderr = err
-        try:
-            code = gate_matrix.main(["--root", str(root), "--lock-dir", str(self.lock_dir), "--versions", VERSION,
-                                     "--python", f"{VERSION}={sys.executable}"], out=io.StringIO())
-        finally:
-            sys.stderr = real
-        self.assertEqual(code, 2)
-        self.assertIn("another gate runs", err.getvalue())
-        self.assertTrue(lock.is_dir(), "the live lock must stay")
-
-    def test_a_stale_lock_is_replaced_and_the_lock_is_released(self):
-        root = self.project(PASSING)
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead.wait()
-        lock = self.lock_dir / gate_matrix.LOCK_NAME
-        lock.mkdir()
-        (lock / "pid").write_text(str(dead.pid), encoding="utf-8")
-        code, _data = self.run_main(root, "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
-        self.assertEqual(code, 0)
-        self.assertFalse(lock.exists(), "the lock must be released after the run")
-
     def test_list_runs_nothing_and_takes_no_lock(self):
         root = self.project(FAILING)
         code, data = self.run_main(root, "--list", "--versions", f"{VERSION},9.99", "--python", f"{VERSION}={sys.executable}")
@@ -197,22 +169,55 @@ class GateMatrixTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot take the lock", err.getvalue())
 
-    def test_a_new_lock_folder_without_a_pid_file_counts_as_live(self):
-        lock = gate_matrix.Lock(self.lock_dir)
-        (self.lock_dir / gate_matrix.LOCK_NAME).mkdir()
+    def test_a_held_lock_refuses_a_second_gate_and_names_the_owner(self):
+        root = self.project(PASSING)
+        first = gate_matrix.Lock(self.lock_dir)
+        first.acquire()
+        self.addCleanup(first.release)
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        try:
+            code = gate_matrix.main(["--root", str(root), "--lock-dir", str(self.lock_dir), "--versions", VERSION,
+                                     "--python", f"{VERSION}={sys.executable}"], out=io.StringIO())
+        finally:
+            sys.stderr = real
+        self.assertEqual(code, 2)
+        self.assertIn(f"another gate runs (pid {os.getpid()}", err.getvalue())
+
+    def test_two_locks_cannot_both_be_held_and_release_frees_it(self):
+        first, second = gate_matrix.Lock(self.lock_dir), gate_matrix.Lock(self.lock_dir)
+        first.acquire()
         with self.assertRaises(gate_matrix.UsageError):
-            lock.acquire()
+            second.acquire()
+        self.assertFalse(second.held)
+        first.release()
+        second.acquire()
+        self.assertTrue(second.held)
+        second.release()
 
-    def test_a_pid_of_zero_or_less_is_not_alive(self):
-        self.assertFalse(gate_matrix.pid_alive(0))
-        self.assertFalse(gate_matrix.pid_alive(-1))
+    def test_a_lock_file_left_by_a_dead_process_does_not_block(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (self.lock_dir / gate_matrix.LOCK_NAME).write_text(str(dead.pid), encoding="utf-8")
+        root = self.project(PASSING)
+        code, _data = self.run_main(root, "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
+        self.assertEqual(code, 0)
 
-    def test_release_does_not_remove_a_lock_another_process_owns(self):
+    def test_the_lock_is_free_again_after_a_run(self):
+        root = self.project(PASSING)
+        self.run_main(root, "--versions", VERSION, "--python", f"{VERSION}={sys.executable}")
         lock = gate_matrix.Lock(self.lock_dir)
         lock.acquire()
-        (lock.path / "pid").write_text("1", encoding="utf-8")  # another owner took it
         lock.release()
-        self.assertTrue(lock.path.is_dir())
+
+    def test_a_symlink_in_place_of_the_lock_file_is_refused(self):
+        target = self.lock_dir / "elsewhere"
+        target.write_text("keep", encoding="utf-8")
+        (self.lock_dir / gate_matrix.LOCK_NAME).symlink_to(target)
+        with self.assertRaises(gate_matrix.UsageError):
+            gate_matrix.Lock(self.lock_dir).acquire()
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep")
 
     def test_a_signal_stops_the_suite_and_releases_the_lock(self):
         root = self.project(SLOW_WITH_PID)
@@ -239,7 +244,9 @@ class GateMatrixTest(unittest.TestCase):
         else:
             os.kill(suite_pid, 9)
             self.fail("the suite process kept running")
-        self.assertFalse((self.lock_dir / gate_matrix.LOCK_NAME).exists())
+        lock = gate_matrix.Lock(self.lock_dir)
+        lock.acquire()  # the signalled gate must have released it
+        lock.release()
 
     def test_find_python_ignores_a_file_that_cannot_run(self):
         not_executable = self.lock_dir / "python3.10"

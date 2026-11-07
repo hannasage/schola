@@ -97,12 +97,13 @@ def gate_lines(path):
     lines = []
     for version, items in by_version.items():
         statuses = [status for status, _tests in items]
-        tests = sum(count or 0 for _status, count in items if isinstance(count, int))
+        tests = sum(count for _status, count in items if isinstance(count, int))
+        empty = any(status == "pass" and not (isinstance(count, int) and count > 0) for status, count in items)
         if any(status not in ("pass", "skip") for status in statuses):
             lines.append(f"- Python {version}: fail")
         elif all(status == "skip" for status in statuses):
             lines.append(f"- Python {version}: skip (not run)")
-        elif tests == 0:
+        elif empty or tests == 0:
             lines.append(f"- Python {version}: no tests counted")
         else:
             lines.append(f"- Python {version}: pass ({tests} tests)")
@@ -141,7 +142,10 @@ def main(argv=None, out=None, stdin=None):
             print(scaffold(git_files(root, args.base), gate), end="", file=out)
             return 0
         if args.file == "-":
-            text = (stdin or sys.stdin).read()
+            try:
+                text = (stdin or sys.stdin).read()
+            except (OSError, ValueError) as error:
+                raise UsageError(f"cannot read standard input: {error}")
         else:
             try:
                 text = Path(args.file).read_text(encoding="utf-8")

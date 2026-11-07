@@ -96,17 +96,21 @@ def start_server(root, data_dir, wait):
     threading.Thread(target=lambda: [lines.put(line) for line in proc.stdout], daemon=True).start()
     deadline = time.monotonic() + wait
     seen = []
-    while time.monotonic() < deadline:
-        try:
-            line = lines.get(timeout=0.2)
-        except queue.Empty:
-            if proc.poll() is not None and lines.empty():
-                break
-            continue
-        seen.append(line.strip())
-        match = READY.search(line)
-        if match:
-            return proc, f"http://127.0.0.1:{match.group(1)}"
+    try:
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                if proc.poll() is not None and lines.empty():
+                    break
+                continue
+            seen.append(line.strip())
+            match = READY.search(line)
+            if match:
+                return proc, f"http://127.0.0.1:{match.group(1)}"
+    except BaseException:
+        stop_server(proc)  # a signal while waiting must not leave the server running
+        raise
     stop_server(proc)
     raise RuntimeError("server not ready: " + (seen[-1] if seen else "no output"))
 
@@ -123,8 +127,8 @@ def stop_server(proc):
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass
-            proc.wait()
+                proc.kill()
+            proc.wait(timeout=10)
     if proc.stdout:
         proc.stdout.close()
 

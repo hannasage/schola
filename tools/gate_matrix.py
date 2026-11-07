@@ -14,6 +14,7 @@ running, 130 interrupted.
 """
 
 import argparse
+import fcntl
 import glob
 import json
 import os
@@ -32,7 +33,7 @@ SUITES = {
     "server": ["-m", "unittest", "test_server.py"],
 }
 DEFAULT_SUITES = ["unit", "server"]
-LOCK_NAME = "schola-gate-matrix.lock"
+LOCK_NAME = "schola-gate-matrix.lock"  # a file, not a folder
 RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s", re.M)
 SKIPPED = re.compile(r"skipped=(\d+)")
 FIRST_FAILURE = re.compile(r"^(?:FAIL|ERROR): .+$", re.M)
@@ -67,62 +68,43 @@ def parse_overrides(items):
     return overrides
 
 
-def pid_alive(pid):
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 class Lock:
-    """One gate at a time. Two full gates share the temporary folder and disturb each other."""
+    """One gate at a time. Two full gates share the temporary folder and disturb each other.
 
-    GRACE_SECONDS = 5  # a new lock folder may not hold its pid file yet
+    The lock is a kernel file lock. The system drops it when the process ends,
+    so a crash leaves no stale lock and two gates cannot both take it.
+    """
 
     def __init__(self, base):
         self.path = Path(base) / LOCK_NAME
-        self.held = False
+        self.fd = None
+
+    @property
+    def held(self):
+        return self.fd is not None
 
     def acquire(self):
-        for _ in range(2):
-            try:
-                self.path.mkdir()
-            except FileExistsError:
-                if self._is_live():
-                    raise UsageError(f"another gate runs (pid {self._owner()}, lock {self.path})")
-                shutil.rmtree(self.path, ignore_errors=True)  # the owner is gone: stale lock
-                continue
-            except OSError as error:
-                raise UsageError(f"cannot take the lock {self.path}: {error}")
-            (self.path / "pid").write_text(str(os.getpid()), encoding="utf-8")
-            self.held = True
-            return
-        raise UsageError(f"cannot take the lock {self.path}")
-
-    def _owner(self):
         try:
-            return int((self.path / "pid").read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            return None
-
-    def _is_live(self):
-        owner = self._owner()
-        if owner is None:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            raise UsageError(f"cannot take the lock {self.path}: {error}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
             try:
-                return time.time() - self.path.stat().st_mtime < self.GRACE_SECONDS
+                owner = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
             except OSError:
-                return False
-        return pid_alive(owner)
+                owner = "unknown"
+            os.close(fd)
+            raise UsageError(f"another gate runs (pid {owner}, lock {self.path})")
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        self.fd = fd
 
     def release(self):
-        if self.held and self._owner() == os.getpid():
-            shutil.rmtree(self.path, ignore_errors=True)
-        self.held = False
+        if self.fd is not None:
+            os.close(self.fd)  # closing the file drops the lock; the file stays, so no unlink race
+            self.fd = None
 
 
 def kill_group(proc):

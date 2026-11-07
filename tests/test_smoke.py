@@ -1,5 +1,6 @@
 import http.client
 import io
+import subprocess
 import json
 import os
 import shutil
@@ -52,6 +53,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 server = http.server.HTTPServer(("127.0.0.1", args.port), Handler)
 import os
+if os.environ.get("SMOKE_CHILD_PID_FILE"):
+    import subprocess
+    child = subprocess.Popen(["sleep", "300"])
+    open(os.environ["SMOKE_CHILD_PID_FILE"], "w").write(str(child.pid))
 if os.environ.get("SMOKE_PID_FILE"):
     open(os.environ["SMOKE_PID_FILE"], "w").write(str(os.getpid()))
 print("Schola is ready at http://127.0.0.1:%%d" %% server.server_port, flush=True)
@@ -135,6 +140,37 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(after - before, set())
         pid = int(pid_file.read_text())
         self.assertTrue(self.pid_gone(pid), "the server process must be gone")
+
+    def test_the_whole_process_group_of_the_server_is_stopped(self):
+        child_file = Path(tempfile.mkdtemp(prefix="smoke-child-")) / "pid"
+        self.addCleanup(shutil.rmtree, child_file.parent, True)
+        os.environ["SMOKE_CHILD_PID_FILE"] = str(child_file)
+        self.addCleanup(os.environ.pop, "SMOKE_CHILD_PID_FILE", None)
+        code, _data = self.run_main("--root", str(self.fixture()))
+        self.assertEqual(code, 0)
+        child = int(child_file.read_text())
+        if not self.pid_gone(child):
+            os.kill(child, 9)
+            self.fail("a child of the server kept running")
+
+    def test_a_signal_while_waiting_for_the_server_stops_it(self):
+        pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"
+        self.addCleanup(shutil.rmtree, pid_file.parent, True)
+        root = self.fixture(server_source="import os, time\nopen(os.environ['SMOKE_PID_FILE'], 'w').write(str(os.getpid()))\ntime.sleep(120)\n")
+        env = dict(os.environ, SMOKE_PID_FILE=str(pid_file))
+        proc = subprocess.Popen([sys.executable, str(ROOT / "tools" / "smoke.py"), "--root", str(root), "--wait", "60"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text():
+                break
+            time.sleep(0.1)
+        server_pid = int(pid_file.read_text())
+        proc.terminate()
+        _out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 130, err)
+        if not self.pid_gone(server_pid):
+            os.kill(server_pid, 9)
+            self.fail("the server kept running after a signal")
 
     def test_a_failed_step_still_stops_the_server(self):
         pid_file = Path(tempfile.mkdtemp(prefix="smoke-pid-")) / "pid"

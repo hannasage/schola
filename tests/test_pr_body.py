@@ -179,6 +179,29 @@ class CommandTest(unittest.TestCase):
         self.assertIn("- Python 3.13: fail", text)
         self.assertNotIn(": pass", text)
 
+    def test_one_empty_suite_in_a_version_is_not_reported_as_pass(self):
+        root = self.make_repo()
+        gate = root / "gate.json"
+        gate.write_text(json.dumps({"results": [
+            {"version": "3.10", "suite": "unit", "status": "pass", "tests": 100},
+            {"version": "3.10", "suite": "server", "status": "pass", "tests": None}]}), encoding="utf-8")
+        out = io.StringIO()
+        pr_body.main(["scaffold", "--root", str(root), "--base", "main", "--gate-json", str(gate)], out=out)
+        self.assertIn("- Python 3.10: no tests counted", out.getvalue())
+
+    def test_non_utf8_standard_input_exits_two(self):
+        class Broken:
+            def read(self):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        try:
+            code = pr_body.main(["check", "-"], out=io.StringIO(), stdin=Broken())
+        finally:
+            sys.stderr = real
+        self.assertEqual(code, 2)
+
     def test_wrong_input_exits_two_not_one(self):
         root = self.make_repo()
         cases = {"list.json": "[]", "nokey.json": '{"results":[{"status":"pass"}]}', "dict.json": '{"results":{"a":1}}'}

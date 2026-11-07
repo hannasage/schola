@@ -20,7 +20,7 @@
       "subcommand": null,
       "description": "Run the Python unit and server suites on each supported Python version, one gate at a time, and print one line per suite. A suite that runs no tests fails.",
       "safety_class": "local-write",
-      "writes": ["a new schola-gate-* folder in the temporary folder (logs)", "a lock folder in the temporary folder, removed at the end"],
+      "writes": ["a new schola-gate-* folder in the temporary folder (logs)", "a lock file in the temporary folder (a kernel lock; it stays, empty of meaning once the run ends)"],
       "arguments": [
         {"name": "--root", "type": "path", "required": false, "default": ".", "description": "The repository folder."},
         {"name": "--versions", "type": "string", "required": false, "default": "3.10,3.11,3.12,3.13,3.14", "description": "Comma-separated Python versions."},
@@ -30,7 +30,7 @@
         {"name": "--allow-missing", "type": "flag", "required": false, "default": false, "description": "Skip a version with no interpreter instead of failing."},
         {"name": "--list", "type": "flag", "required": false, "default": false, "description": "Print the plan and run nothing."},
         {"name": "--json", "type": "flag", "required": false, "default": false, "description": "Print one JSON object."},
-        {"name": "--lock-dir", "type": "path", "required": false, "default": "the temporary folder", "description": "The folder that holds the one-gate-at-a-time lock."}
+        {"name": "--lock-dir", "type": "path", "required": false, "default": "the temporary folder", "description": "The folder that holds the one-gate-at-a-time lock file."}
       ],
       "output": {
         "format": "text, or one JSON object with --json",
