@@ -148,11 +148,14 @@ def run_smoke(root, seed, wait, say):
     try:
         if seed:
             shutil.copytree(seed, data_dir, dirs_exist_ok=True, symlinks=True)
+        has_log = (data_dir / "_events" / "events.jsonl").is_file()  # only a seed can put a log there
         calls = [
             ("cli version", ["version"], {"want_text": "schola "}),
             ("cli modules", ["modules", "--json"], {"want_json": True}),
             ("cli events list", ["events", "list", "--json"], {"want_json": True}),
-            ("cli events export, no log", ["events", "export"], {"want_code": 1, "want_error": "log_missing"}),
+            (("cli events export, with the seeded log", ["events", "export"], {})
+             if has_log else
+             ("cli events export, no log", ["events", "export"], {"want_code": 1, "want_error": "log_missing"})),
         ]
         for name, args, expect in calls:
             say("run: schola " + " ".join(args))

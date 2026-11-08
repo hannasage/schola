@@ -82,13 +82,30 @@ class GateMatrixTest(unittest.TestCase):
         self.assertEqual(data["results"][1]["status"], "pass")  # the server suite still runs
 
     def test_timeout_kills_the_suite_and_fails(self):
-        root = self.project(SLOW)
+        root = self.project(SLOW_WITH_PID)
+        pid_file = self.lock_dir / "timeout.pid"
         started = time.monotonic()
-        code, data = self.run_main(root, "--versions", VERSION, "--suites", "unit", "--timeout", "2",
-                                   "--python", f"{VERSION}={sys.executable}")
+        with mock.patch.dict(os.environ, {"GATE_PID_FILE": str(pid_file)}):
+            code, data = self.run_main(root, "--versions", VERSION, "--suites", "unit", "--timeout", "2",
+                                       "--python", f"{VERSION}={sys.executable}")
         self.assertLess(time.monotonic() - started, 30)
         self.assertEqual(code, 1)
         self.assertEqual(data["results"][0]["status"], "timeout")
+        suite_pid = int(pid_file.read_text())  # the suite wrote it before it slept
+        try:
+            for _ in range(50):
+                try:
+                    os.kill(suite_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("the suite process kept running after the timeout")
+        finally:
+            try:
+                os.kill(suite_pid, signal.SIGKILL)  # a failing run must not leave a sleeper behind
+            except ProcessLookupError:
+                pass
 
     def test_missing_interpreter_fails_unless_allowed(self):
         root = self.project(PASSING)

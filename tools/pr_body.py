@@ -121,7 +121,8 @@ def gate_lines(path):
         if not by_version:
             raise ValueError("the results list is empty")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise UsageError(f"--gate-json is not a gate_matrix.py --json result: {error!r}")
+        # str(), not repr(): the repr of a decode error holds the bytes of the file, and this tool reads any path
+        raise UsageError(f"--gate-json is not a gate_matrix.py --json result: {type(error).__name__}: {error}")
     lines = []
     for version, items in by_version.items():
         statuses = [status for status, _tests, _suite in items]

@@ -312,6 +312,26 @@ class SmokeTest(unittest.TestCase):
         code, data = self.run_main("--root", str(root), "--seed", str(seed))
         self.assertEqual(code, 0, data)
 
+    def test_a_seed_that_holds_an_event_log_does_not_fail_the_export_step(self):
+        # The no-log step expects exit 1. With a log in the seed, export succeeds, and that is correct.
+        root = self.fixture()
+        seed = Path(tempfile.mkdtemp(prefix="smoke-seed-"))
+        self.addCleanup(shutil.rmtree, seed, True)
+        (seed / "_events").mkdir()
+        (seed / "_events" / "events.jsonl").write_text("{}\n", encoding="utf-8")
+        (root / "schola_cli.py").write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "d = Path(sys.argv[2])\n"
+            "args = sys.argv[3:]\n"
+            "if args == ['version']:\n    print('schola 0.0.0')\n"
+            "elif args[:1] == ['modules'] or args[:2] == ['events', 'list']:\n    print('{}')\n"
+            "elif args[:2] == ['events', 'export'] and (d / '_events' / 'events.jsonl').is_file():\n    print('{}')\n"
+            "else:\n    print('schola: log_missing', file=sys.stderr)\n    sys.exit(1)\n",
+            encoding="utf-8")
+        code, data = self.run_main("--root", str(root), "--seed", str(seed))
+        self.assertEqual(code, 0, data)
+        self.assertIn("cli events export, with the seeded log", [s["step"] for s in data["steps"]])
+
     def test_the_seed_folder_is_copied_in(self):
         root = self.fixture()
         seed = Path(tempfile.mkdtemp(prefix="smoke-seed-"))

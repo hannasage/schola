@@ -222,6 +222,38 @@ class CommandTest(unittest.TestCase):
             sys.stderr = real
         self.assertEqual(code, 2)
 
+    def test_the_gate_json_error_never_repeats_the_bytes_of_the_file(self):
+        root = self.make_repo()
+        bad = root / "gate.json"
+        bad.write_bytes(b"secret-token-abc\xff\xfe")  # not UTF-8, so the decoder fails and names the file
+        err = io.StringIO()
+        real = sys.stderr
+        sys.stderr = err
+        try:
+            code = pr_body.main(["scaffold", "--root", str(root), "--base", "main", "--gate-json", str(bad)], out=io.StringIO())
+        finally:
+            sys.stderr = real
+        self.assertEqual(code, 2)
+        self.assertIn("UnicodeDecodeError", err.getvalue())
+        self.assertNotIn("secret-token", err.getvalue())
+
+    def test_the_bare_number_rule_flags_only_a_number_that_stands_alone(self):
+        # Each case is one line of prose. "flag" means the rule reports a bare number.
+        cases = [
+            ("see #12.", True),
+            ("fixed (#12)", True),
+            ("##12", False),             # the # guard: a second # directly before
+            ("&#39;", False),            # the & guard: an HTML character reference
+            ("/pull/#12", False),        # the / guard: part of a path
+            ("owner/repo#12", False),    # the word guard: a qualified reference
+            ("version#12", False),       # the word guard
+            ("#12abc", False),           # \b after the digits
+        ]
+        for line, flagged in cases:
+            with self.subTest(line=line):
+                found = any("bare issue" in p for p in problems_for(GOOD.replace("pick the default timeout.", line)))
+                self.assertEqual(found, flagged)
+
     def test_a_skipped_or_empty_version_is_never_reported_as_pass(self):
         root = self.make_repo()
         gate = root / "gate.json"
